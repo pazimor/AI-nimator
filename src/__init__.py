@@ -1,0 +1,1 @@
+"""AI-nimator core package."""

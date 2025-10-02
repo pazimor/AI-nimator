@@ -1,0 +1,14 @@
+.venv/
+.idea/
+test/*
+.DS_Store
+
+# coverages
+.coverage
+htmlcov/
+
+# documentation
+doc/build/*
+
+# tests
+.pytest_cache
