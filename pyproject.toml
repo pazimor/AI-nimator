@@ -7,7 +7,7 @@ name = "AI-nimator"
 version = "0.0.1"
 description = "Prompt-to-animation diffusion toolkit with shared training and inference pipelines."
 readme = "AGENT.md"
-requires-python = ">=3.12,<3.14"
+requires-python = "^3.12"
 authors = [{ name = "pazimor" }]
 dependencies = [
   "numpy>=1.25",

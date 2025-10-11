@@ -8,6 +8,39 @@ from typing import List
 
 from src.features.inferance import Prompt2AnimDiffusionSampler
 from src.features.training import Prompt2AnimDiffusionTrainer
+from src.shared.constants.training import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_CACHE_ON_DEVICE,
+    DEFAULT_CHECKPOINT_INTERVAL,
+    DEFAULT_CONTEXT_HISTORY,
+    DEFAULT_CONTEXT_JSON_LIST,
+    DEFAULT_CONTEXT_TRAIN_MODE,
+    DEFAULT_CONTEXT_TRAIN_RATIO,
+    DEFAULT_DEVICE_BACKEND,
+    DEFAULT_EPOCH_COUNT,
+    DEFAULT_EXPERIMENT_NAME,
+    DEFAULT_LAYER_COUNT,
+    DEFAULT_LEARNING_RATE,
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_MAX_VALIDATION_SAMPLES,
+    DEFAULT_MODEL_DIMENSION,
+    DEFAULT_MOE_EXPERTS,
+    DEFAULT_MOE_TOPK,
+    DEFAULT_QAT_READY,
+    DEFAULT_RANDOM_SEED,
+    DEFAULT_RECACHE_EVERY_EPOCH,
+    DEFAULT_SAMPLING_FRAME_COUNT,
+    DEFAULT_SAMPLING_GUIDANCE,
+    DEFAULT_SAMPLING_STEPS,
+    DEFAULT_SAMPLING_TEXT_MODEL,
+    DEFAULT_SAVE_DIRECTORY,
+    DEFAULT_SEQUENCE_FRAMES,
+    DEFAULT_SUCCESS_DEGREES,
+    DEFAULT_TARGET_SUCCESS_RATE,
+    DEFAULT_TEXT_MODEL_NAME,
+    DEFAULT_VALIDATION_INTERVAL,
+    DEFAULT_VALIDATION_SPLIT,
+)
 from src.shared.types import (
     DeviceSelectionOptions,
     SamplingConfiguration,
@@ -16,6 +49,14 @@ from src.shared.types import (
 
 
 def buildArgumentParser() -> argparse.ArgumentParser:
+    """Construct the root parser for training and sampling commands.
+
+    Returns
+    -------
+    argparse.ArgumentParser
+        Configured parser exposing ``train`` and ``sample`` sub-commands.
+    """
+
     parser = argparse.ArgumentParser(
         description="Prompt-to-animation diffusion training and inference",
     )
@@ -23,49 +64,61 @@ def buildArgumentParser() -> argparse.ArgumentParser:
 
     trainParser = subParsers.add_parser("train", help="Entraîner le modèle")
     trainParser.add_argument("--data-dir", type=Path, required=True)
-    trainParser.add_argument("--save-dir", type=Path, default=Path("./ckpts"))
-    trainParser.add_argument("--exp-name", type=str, default="exp")
-    trainParser.add_argument("--epochs", type=int, default=5)
-    trainParser.add_argument("--batch-size", type=int, default=2)
-    trainParser.add_argument("--lr", type=float, default=1e-4)
-    trainParser.add_argument("--seq-frames", type=int, default=240)
-    trainParser.add_argument("--context-last", type=int, default=0)
+    trainParser.add_argument("--save-dir", type=Path, default=DEFAULT_SAVE_DIRECTORY)
+    trainParser.add_argument("--exp-name", type=str, default=DEFAULT_EXPERIMENT_NAME)
+    trainParser.add_argument("--epochs", type=int, default=DEFAULT_EPOCH_COUNT)
+    trainParser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    trainParser.add_argument("--lr", type=float, default=DEFAULT_LEARNING_RATE)
+    trainParser.add_argument("--seq-frames", type=int, default=DEFAULT_SEQUENCE_FRAMES)
+    trainParser.add_argument("--context-last", type=int, default=DEFAULT_CONTEXT_HISTORY)
     trainParser.add_argument(
         "--context-train-mode",
         type=str,
-        default="alt",
+        default=DEFAULT_CONTEXT_TRAIN_MODE,
         choices=["off", "alt", "ratio"],
         help="off: jamais; alt: une époque sur deux; ratio: probabilité",
     )
     trainParser.add_argument(
         "--context-train-ratio",
         type=float,
-        default=0.5,
+        default=DEFAULT_CONTEXT_TRAIN_RATIO,
         help="Si mode=ratio, probabilité d'utiliser le contexte",
     )
-    trainParser.add_argument("--d-model", type=int, default=256)
-    trainParser.add_argument("--layers", type=int, default=6)
-    trainParser.add_argument("--moe-experts", type=int, default=8)
-    trainParser.add_argument("--moe-topk", type=int, default=2)
-    trainParser.add_argument("--ckpt-every", type=int, default=500)
+    trainParser.add_argument("--d-model", type=int, default=DEFAULT_MODEL_DIMENSION)
+    trainParser.add_argument("--layers", type=int, default=DEFAULT_LAYER_COUNT)
+    trainParser.add_argument("--moe-experts", type=int, default=DEFAULT_MOE_EXPERTS)
+    trainParser.add_argument("--moe-topk", type=int, default=DEFAULT_MOE_TOPK)
+    trainParser.add_argument("--ckpt-every", type=int, default=DEFAULT_CHECKPOINT_INTERVAL)
     trainParser.add_argument("--resume", type=Path, default=None)
-    trainParser.add_argument("--max-tokens", type=int, default=128)
+    trainParser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     trainParser.add_argument(
         "--text-model",
         type=str,
-        default="sentence-transformers/all-MiniLM-L6-v2",
+        default=DEFAULT_TEXT_MODEL_NAME,
         help="Nom du modèle HuggingFace pour les embeddings",
     )
-    trainParser.add_argument("--qat-ready", action="store_true")
-    trainParser.add_argument("--seed", type=int, default=42)
-    trainParser.add_argument("--val-split", type=float, default=0.1)
-    trainParser.add_argument("--val-every", type=int, default=1000)
-    trainParser.add_argument("--success-deg", type=float, default=5.0)
-    trainParser.add_argument("--target-success", type=float, default=0.90)
-    trainParser.add_argument("--cache-on-device", action="store_true")
-    trainParser.add_argument("--max-val-samples", type=int, default=256)
-    trainParser.add_argument("--recache-every-epoch", action="store_true")
-    trainParser.add_argument("--device", type=str, default="auto")
+    trainParser.add_argument("--qat-ready", action="store_true", default=DEFAULT_QAT_READY)
+    trainParser.add_argument("--seed", type=int, default=DEFAULT_RANDOM_SEED)
+    trainParser.add_argument("--val-split", type=float, default=DEFAULT_VALIDATION_SPLIT)
+    trainParser.add_argument("--val-every", type=int, default=DEFAULT_VALIDATION_INTERVAL)
+    trainParser.add_argument("--success-deg", type=float, default=DEFAULT_SUCCESS_DEGREES)
+    trainParser.add_argument("--target-success", type=float, default=DEFAULT_TARGET_SUCCESS_RATE)
+    trainParser.add_argument(
+        "--cache-on-device",
+        action="store_true",
+        default=DEFAULT_CACHE_ON_DEVICE,
+    )
+    trainParser.add_argument(
+        "--max-val-samples",
+        type=int,
+        default=DEFAULT_MAX_VALIDATION_SAMPLES,
+    )
+    trainParser.add_argument(
+        "--recache-every-epoch",
+        action="store_true",
+        default=DEFAULT_RECACHE_EVERY_EPOCH,
+    )
+    trainParser.add_argument("--device", type=str, default=DEFAULT_DEVICE_BACKEND)
     trainParser.add_argument("--no-cuda", action="store_true")
     trainParser.add_argument("--no-dml", action="store_true")
     trainParser.add_argument("--no-mps", action="store_true")
@@ -75,13 +128,17 @@ def buildArgumentParser() -> argparse.ArgumentParser:
     sampleParser.add_argument("--ckpt", type=Path, required=True)
     sampleParser.add_argument("--prompts", type=Path, required=True)
     sampleParser.add_argument("--out-json", type=Path, required=True)
-    sampleParser.add_argument("--frames", type=int, default=240)
-    sampleParser.add_argument("--steps", type=int, default=12)
-    sampleParser.add_argument("--guidance", type=float, default=2.0)
+    sampleParser.add_argument("--frames", type=int, default=DEFAULT_SAMPLING_FRAME_COUNT)
+    sampleParser.add_argument("--steps", type=int, default=DEFAULT_SAMPLING_STEPS)
+    sampleParser.add_argument(
+        "--guidance",
+        type=float,
+        default=DEFAULT_SAMPLING_GUIDANCE,
+    )
     sampleParser.add_argument(
         "--context-jsons",
         type=str,
-        default="",
+        default=DEFAULT_CONTEXT_JSON_LIST,
         help=(
             "Fichiers animation.json permettant de fournir du contexte "
             "(séparés par des virgules)"
@@ -94,8 +151,8 @@ def buildArgumentParser() -> argparse.ArgumentParser:
         help="Liste ordonnée des bones lorsque aucun contexte n'est fourni",
     )
     sampleParser.add_argument("--omit-meta", action="store_true")
-    sampleParser.add_argument("--text-model", type=str, default=None)
-    sampleParser.add_argument("--device", type=str, default="auto")
+    sampleParser.add_argument("--text-model", type=str, default=DEFAULT_SAMPLING_TEXT_MODEL)
+    sampleParser.add_argument("--device", type=str, default=DEFAULT_DEVICE_BACKEND)
     sampleParser.add_argument("--no-cuda", action="store_true")
     sampleParser.add_argument("--no-dml", action="store_true")
     sampleParser.add_argument("--no-mps", action="store_true")
@@ -104,6 +161,8 @@ def buildArgumentParser() -> argparse.ArgumentParser:
 
 
 def parseDeviceOptions(args: argparse.Namespace) -> DeviceSelectionOptions:
+    """Translate CLI flags to :class:`DeviceSelectionOptions`."""
+
     return DeviceSelectionOptions(
         requestedBackend=args.device,
         allowCuda=not args.no_cuda,
@@ -114,6 +173,8 @@ def parseDeviceOptions(args: argparse.Namespace) -> DeviceSelectionOptions:
 
 
 def buildTrainingConfiguration(args: argparse.Namespace) -> TrainingConfiguration:
+    """Create :class:`TrainingConfiguration` from CLI arguments."""
+
     deviceOptions = parseDeviceOptions(args)
     resumePath = args.resume if args.resume else None
     return TrainingConfiguration(
@@ -149,6 +210,8 @@ def buildTrainingConfiguration(args: argparse.Namespace) -> TrainingConfiguratio
 
 
 def buildSamplingConfiguration(args: argparse.Namespace) -> SamplingConfiguration:
+    """Materialise :class:`SamplingConfiguration` from CLI arguments."""
+
     deviceOptions = parseDeviceOptions(args)
     contextJsons: List[Path] = [
         Path(item)
@@ -171,6 +234,8 @@ def buildSamplingConfiguration(args: argparse.Namespace) -> SamplingConfiguratio
 
 
 def main() -> None:
+    """Entry point executed by the prompt-to-animation CLI."""
+
     parser = buildArgumentParser()
     args = parser.parse_args()
     if args.command == "train":

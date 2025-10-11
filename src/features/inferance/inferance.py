@@ -13,11 +13,14 @@ from src.shared.animation_io import convertRotationsToTensor, loadAnimationFile,
 from src.shared.quaternion import QuaternionConverter
 from src.shared.temporal_diffusion import CausalDiffusion, TemporalUNetMoE
 from src.shared.text import PretrainedTextEncoder
-from src.shared.types import DeviceSelectionOptions, SamplingConfiguration
+from src.shared.types import SamplingConfiguration
+
 class Prompt2AnimDiffusionSampler:
     """Run inference sampling using a trained checkpoint."""
 
     def __init__(self, configuration: SamplingConfiguration) -> None:
+        """Initialise the sampler with the runtime configuration."""
+
         self.configuration = configuration
         self.device: Optional[torch.device] = None
         self.deviceLabel: Optional[str] = None
@@ -28,6 +31,8 @@ class Prompt2AnimDiffusionSampler:
         self.boneNames: List[str] = []
 
     def runSampling(self) -> None:
+        """Execute the full sampling pipeline."""
+
         self._selectDevice()
         self._loadCheckpointMetadata()
         self._buildTextEncoder()
@@ -45,6 +50,8 @@ class Prompt2AnimDiffusionSampler:
         self._writeOutput(promptEntry, rotation6d)
 
     def _selectDevice(self) -> None:
+        """Select an execution device based on configuration."""
+
         options = self.configuration.deviceOptions
         device, label = DeviceSelector.selectDevice(options)
         self.device = device
@@ -52,12 +59,16 @@ class Prompt2AnimDiffusionSampler:
         print(f"[device] backend={label}")
 
     def _loadCheckpointMetadata(self) -> None:
+        """Load the checkpoint dictionary from disk."""
+
         self.checkpoint = torch.load(
             self.configuration.checkpointPath,
             map_location=self.device or "cpu",
         )
 
     def _buildTextEncoder(self) -> None:
+        """Instantiate the pretrained text encoder for inference."""
+
         assert self.device is not None
         assert self.checkpoint is not None
         checkpointConfig = self.checkpoint.get("configuration", {})
@@ -72,6 +83,8 @@ class Prompt2AnimDiffusionSampler:
         )
 
     def _determineBoneNames(self) -> None:
+        """Determine the bone ordering used for generation."""
+
         boneNames = list(self.configuration.boneNames)
         if boneNames:
             self.boneNames = boneNames
@@ -94,6 +107,8 @@ class Prompt2AnimDiffusionSampler:
         )
 
     def _buildModelAndDiffusion(self) -> None:
+        """Create the model and diffusion process for inference."""
+
         assert self.checkpoint is not None
         assert self.textEncoder is not None
         assert self.device is not None
@@ -118,6 +133,8 @@ class Prompt2AnimDiffusionSampler:
         self.diffusion = CausalDiffusion(self.model)
 
     def _loadModelWeights(self) -> None:
+        """Load model and text encoder weights from checkpoint."""
+
         assert self.model is not None
         assert self.textEncoder is not None
         assert self.checkpoint is not None
@@ -127,6 +144,8 @@ class Prompt2AnimDiffusionSampler:
         self.textEncoder.eval()
 
     def _loadPromptEntry(self) -> Dict[str, str]:
+        """Load the first prompt entry from the prompts file."""
+
         prompts = loadPromptsFile(self.configuration.promptsPath)
         return prompts[0]
 
@@ -134,6 +153,19 @@ class Prompt2AnimDiffusionSampler:
         self,
         promptEntry: Dict[str, str],
     ) -> Tuple[Tensor, Tensor]:
+        """Encode textual prompt and tag using the text encoder.
+
+        Parameters
+        ----------
+        promptEntry : Dict[str, str]
+            Mapping representing a single prompt description.
+
+        Returns
+        -------
+        tuple[Tensor, Tensor]
+            Pair containing text and tag embeddings on the target device.
+        """
+
         assert self.textEncoder is not None
         textPrompt = " ".join(
             [
@@ -157,6 +189,14 @@ class Prompt2AnimDiffusionSampler:
         return textEmbedding.to(self.device), tagEmbedding.to(self.device)
 
     def _loadContextSequence(self) -> Optional[Tensor]:
+        """Load optional context sequences for conditioned sampling.
+
+        Returns
+        -------
+        Optional[Tensor]
+            Context tensor matching the requested frame count when available.
+        """
+
         if not self.configuration.contextJsons:
             return None
         sequences: List[Tensor] = []
@@ -193,6 +233,23 @@ class Prompt2AnimDiffusionSampler:
         tagEmbedding: Tensor,
         contextSequence: Optional[Tensor],
     ) -> Tensor:
+        """Generate a rotation sequence using the diffusion model.
+
+        Parameters
+        ----------
+        textEmbedding : Tensor
+            Conditioning embedding derived from the prompt text.
+        tagEmbedding : Tensor
+            Conditioning embedding derived from the tag metadata.
+        contextSequence : Optional[Tensor]
+            Optional context tensor providing preceding motion.
+
+        Returns
+        -------
+        Tensor
+            Predicted rotation sequence in 6D representation.
+        """
+
         assert self.diffusion is not None
         frameCount = self.configuration.frameCount
         boneCount = len(self.boneNames)
@@ -222,6 +279,16 @@ class Prompt2AnimDiffusionSampler:
         promptEntry: Dict[str, str],
         rotation6d: Tensor,
     ) -> None:
+        """Persist generated rotations to JSON on disk.
+
+        Parameters
+        ----------
+        promptEntry : Dict[str, str]
+            Prompt metadata used for generation.
+        rotation6d : Tensor
+            Generated rotation sequence in 6D representation.
+        """
+
         quaternionSequence = QuaternionConverter.quaternionFromRotation6d(
             rotation6d[0]
         )
