@@ -528,6 +528,52 @@ class CheckpointManager:
             checkpoint.get("epoch", 0),
             configuration,
         )
+
+
+class NeuralLayerInitializer:
+    """Centralise la construction des couches du ``TemporalUNetMoE``."""
+
+    def __init__(
+        self,
+        configuration: TrainingConfiguration,
+        textEncoder: PretrainedTextEncoder,
+    ) -> None:
+        self.configuration = configuration
+        self.textEncoder = textEncoder
+
+    def createModel(
+        self,
+        boneNames: Sequence[str],
+        device: torch.device,
+    ) -> Tuple[TemporalUNetMoE, CausalDiffusion]:
+        """Instancie le modèle et son wrapper diffusion."""
+
+        rotationInputDim = self._rotationInputDim(boneNames)
+        moeConfig = {
+            "expertCount": self.configuration.expertCount,
+            "topK": self.configuration.expertTopK,
+        }
+        model = TemporalUNetMoE(
+            rotationInputDim=rotationInputDim,
+            hiddenDim=self.configuration.modelDimension,
+            layerCount=self.configuration.layerCount,
+            moeConfiguration=moeConfig,
+            textDim=self.textEncoder.outDimension,
+        ).to(device)
+        diffusion = CausalDiffusion(model)
+        return model, diffusion
+
+    def trainableParameters(self, model: TemporalUNetMoE) -> List[torch.nn.Parameter]:
+        """Retourne les paramètres à optimiser pour l'entraînement."""
+
+        parameters: List[torch.nn.Parameter] = list(model.parameters())
+        if self.textEncoder.trainable:
+            parameters += list(self.textEncoder.parameters())
+        return parameters
+
+    @staticmethod
+    def _rotationInputDim(boneNames: Sequence[str]) -> int:
+        return len(boneNames) * 6
     
 class DatasetCacheBuilder:
     """Factory responsible for building dataset caches."""
@@ -670,6 +716,7 @@ class Prompt2AnimDiffusionTrainer:
         self.diffusion: Optional[CausalDiffusion] = None
         self.optimizer: Optional[torch.optim.Optimizer] = None
         self.scaler: Optional[GradScaler] = None
+        self.modelInitializer: Optional[NeuralLayerInitializer] = None
         self.cache: Optional[DatasetCache] = None
         self.trainIndices: List[int] = []
         self.validationIndices: List[int] = []
@@ -731,28 +778,21 @@ class Prompt2AnimDiffusionTrainer:
         assert self.dataset is not None
         assert self.textEncoder is not None
         assert self.device is not None
-        rotationInputDim = len(self.dataset.boneNames) * 6
-        moeConfig = {
-            "expertCount": self.configuration.expertCount,
-            "topK": self.configuration.expertTopK,
-        }
-        self.model = TemporalUNetMoE(
-            rotationInputDim=rotationInputDim,
-            hiddenDim=self.configuration.modelDimension,
-            layerCount=self.configuration.layerCount,
-            moeConfiguration=moeConfig,
-            textDim=self.textEncoder.outDimension,
-        ).to(self.device)
-        self.diffusion = CausalDiffusion(self.model)
+        self.modelInitializer = NeuralLayerInitializer(
+            self.configuration,
+            self.textEncoder,
+        )
+        self.model, self.diffusion = self.modelInitializer.createModel(
+            self.dataset.boneNames,
+            self.device,
+        )
 
     def _buildOptimizer(self) -> None:
         """Instantiate the optimizer with model and encoder parameters."""
 
         assert self.model is not None
-        assert self.textEncoder is not None
-        parameters = list(self.model.parameters())
-        if self.textEncoder.trainable:
-            parameters += list(self.textEncoder.parameters())
+        assert self.modelInitializer is not None
+        parameters = self.modelInitializer.trainableParameters(self.model)
         self.optimizer = torch.optim.AdamW(
             parameters,
             lr=self.configuration.learningRate,
