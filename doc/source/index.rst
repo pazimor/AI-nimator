@@ -9,7 +9,11 @@ les pipelines d'entraînement et d'inférence, ainsi que l'interface CLI.
    :maxdepth: 2
    :caption: Sommaire
 
-   overview
-   cli
+   startup
+   prompt2anim
+   animation_export_cli
+   uniformizer
+   lmf_extractor
    training
    inference
+   annexe

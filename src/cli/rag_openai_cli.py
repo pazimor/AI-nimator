@@ -9,6 +9,8 @@ from src.features.rag import service
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Create the command parser for RAG OpenAI utilities."""
+
     parser = argparse.ArgumentParser(description="RAG batch utilities for OpenAI")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -46,6 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Execute the RAG OpenAI CLI entry point."""
+
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

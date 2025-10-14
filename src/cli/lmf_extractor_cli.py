@@ -11,6 +11,8 @@ from src.features.lmf.bulk import run_bulk
 
 
 def build_single_parser() -> argparse.ArgumentParser:
+    """Create the parser for single-file LMF extraction."""
+
     parser = argparse.ArgumentParser(description="Extract LMF descriptors from animation.json")
     parser.add_argument("input", help="Path to animation.json")
     parser.add_argument("-o", "--output", default=None, help="Output .lmf.json path")
@@ -19,6 +21,8 @@ def build_single_parser() -> argparse.ArgumentParser:
 
 
 def build_bulk_parser() -> argparse.ArgumentParser:
+    """Create the parser handling bulk LMF conversions."""
+
     parser = argparse.ArgumentParser(
         description="Bulk convert animation.json files into animation.lmf.json",
         prog="lmf_extractor bulk",
@@ -48,6 +52,8 @@ def build_bulk_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Execute the LMF extractor CLI entry point."""
+
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] == "bulk":
         parser = build_bulk_parser()
