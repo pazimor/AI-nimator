@@ -32,9 +32,8 @@ class DeviceSelector:
 
     @staticmethod
     def _selectForcedDevice(
-        options: DeviceSelectionOptions,
+        backend: DeviceSelectionOptions,
     ) -> Optional[Tuple[torch.device, str]]:
-        backend = _normalize(options.requestedBackend)
         if backend in (None, "auto"):
             return None
         if backend == "cuda":
@@ -47,7 +46,7 @@ class DeviceSelector:
             return torch.device("cpu"), "cpu"
         raise ValueError(
             "--device doit être parmi auto|cuda|dml|mps|cpu, reçu:"
-            f" {options.requestedBackend}"
+            f" {backend}"
         )
 
     @staticmethod

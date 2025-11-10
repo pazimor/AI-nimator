@@ -75,9 +75,6 @@
 │   └── source
 │       ├── cli.rst
 │       ├── conf.py
-│       ├── index.rst
-│       ├── inference.rst
-│       ├── overview.rst
 │       └── training.rst
 ├── pyproject.toml
 └── src
@@ -97,16 +94,17 @@
     │       └── training.py
     └── shared
         ├── __init__.py
-        ├── device.py
-        ├── io.py
-        ├── quaternion.py
-        ├── temporal_diffusion.py
-        ├── test_device.py
-        ├── test_io.py
-        ├── test_quaternion.py
-        ├── test_temporal_diffusion.py
-        ├── test_text.py
-        ├── text.py
+        ├── model
+        │   ├── clip
+        │   |   ├── __init__.py
+        |   |   ├── customlayer.py
+        |   |   └── customlayerX.py
+        |   ├── generation
+        │   |   ├── __init__.py
+        |   |   ├── customlayer.py
+        |   |   └── customlayerX.py
+        ├── reUseItem.py
+        ├── test_reUseItem.py
         └── types
             ├── __init__.py
             ├── config.py
@@ -116,6 +114,8 @@
 > **Principle**: Cli `src/cli` triggers scripts from `src/features`, shares data models from `src/shared/types`.
 >
 > every code that can be used by an other feature of the project should be in `src/shared`
+
+use model/{place}/{customlayer}.py to make customs layers so each layers may be re-used 
 
 ---
 
