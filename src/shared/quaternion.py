@@ -231,6 +231,63 @@ class QuaternionConverter:
         return torch.cat([primary, secondary], dim=-1)
 
     @staticmethod
+    def quaternionFromAxisAngle(axisAngle: Tensor, eps: float = 1e-8) -> Tensor:
+        """
+        Convert axis-angle vectors into quaternions.
+
+        Parameters
+        ----------
+        axisAngle : Tensor
+            Tensor shaped (..., 3) representing axis multiplied by angle.
+        eps : float, default=1e-8
+            Numerical stability guard near zero rotations.
+
+        Returns
+        -------
+        Tensor
+            Tensor shaped (..., 4) storing quaternions (w, x, y, z).
+        """
+
+        angle = torch.linalg.norm(axisAngle, dim=-1, keepdim=True)
+        safeAngle = torch.where(angle > eps, angle, torch.ones_like(angle))
+        normalizedAxis = axisAngle / safeAngle
+        normalizedAxis = torch.where(
+            angle > eps,
+            normalizedAxis,
+            torch.zeros_like(normalizedAxis),
+        )
+        halfAngle = angle * 0.5
+        sinHalf = torch.sin(halfAngle)
+        cosHalf = torch.cos(halfAngle)
+        quaternion = torch.cat(
+            [
+                cosHalf,
+                normalizedAxis * sinHalf,
+            ],
+            dim=-1,
+        )
+        return QuaternionConverter.normalizeQuaternion(quaternion)
+
+    @staticmethod
+    def rotation6dFromAxisAngle(axisAngle: Tensor) -> Tensor:
+        """
+        Convert axis-angle vectors directly into rotation-6d format.
+
+        Parameters
+        ----------
+        axisAngle : Tensor
+            Tensor shaped (..., 3).
+
+        Returns
+        -------
+        Tensor
+            Tensor shaped (..., 6) containing 6D rotations.
+        """
+
+        quaternions = QuaternionConverter.quaternionFromAxisAngle(axisAngle)
+        return QuaternionConverter.rotation6dFromQuaternion(quaternions)
+
+    @staticmethod
     def formatQuaternionPipeString(quaternion: Tensor) -> str:
         """Format a quaternion as the pipe-separated string used in JSON files."""
         formatted = [f"{float(component):.7f}" for component in quaternion]
