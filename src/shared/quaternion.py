@@ -1,329 +1,188 @@
-"""Quaternion conversions, metrics, and core helpers."""
+from typing import Union
 
-from __future__ import annotations
-
-import math
-from dataclasses import dataclass
-from typing import Iterable, List, Tuple
-
+import kornia.geometry.conversions as K
 import numpy as np
 import torch
 from torch import Tensor
-from torch.nn import functional as F
+import torch.nn.functional as F
 
 
-def normalizeQuaternionArray(quaternion: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    """Return a NumPy array (…×4) of unit quaternions."""
+###############################
+# Unified rotation class (Torch backend)
+###############################
 
-    arr = np.asarray(quaternion, dtype=np.float32)
-    norms = np.linalg.norm(arr, axis=-1, keepdims=True)
-    norms = np.where(np.isfinite(norms), norms, 0.0)
-    norms = np.maximum(norms, eps)
-    return arr / norms
+class Rotation:
+    """
+    Unified rotation representation backed by quaternions (x, y, z, w).
 
+    You can construct it from:
+      - Euler angles (shape (..., 3))  -> radians, order: xyz
+      - Quaternions (shape (..., 4))   -> (x, y, z, w)
+      - 6D rotation (shape (..., 6))   -> first 2 columns of 3x3 matrix
 
-def multiplyQuaternionArray(q0: np.ndarray, q1: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    """Multiply two NumPy quaternion arrays with normalization."""
+    Internal: everything is stored as normalized quaternion (Torch Tensor).
+    """
 
-    a = np.asarray(q0, dtype=np.float32)
-    b = np.asarray(q1, dtype=np.float32)
-    ax, ay, az, aw = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
-    bx, by, bz, bw = b[..., 0], b[..., 1], b[..., 2], b[..., 3]
-    result = np.stack(
-        [
-            aw * bx + ax * bw + ay * bz - az * by,
-            aw * by - ax * bz + ay * bw + az * bx,
-            aw * bz + ax * by - ay * bx + az * bw,
-            aw * bw - ax * bx - ay * by - az * bz,
-        ],
-        axis=-1,
-    )
-    return normalizeQuaternionArray(result, eps=eps)
+    def __init__(self, data: Union[np.ndarray, Tensor], kind: str = "quat") -> None:
+        kind = kind.lower()
+        t = self._to_tensor(data)
 
+        if kind == "quat":
+            quat = self._ensure_last_dim(t, 4)
+            # Kornia expects (w, x, y, z) for some ops, but let's stick to our internal storage (x, y, z, w).
+            # We will normalize it.
+            quat = self._normalize_quat(quat)
 
-def lerpQuaternionArray(q0: np.ndarray, q1: np.ndarray, alpha: float, eps: float = 1e-8) -> np.ndarray:
-    """Linearly interpolate two NumPy quaternions and normalize the result."""
+        elif kind == "euler":
+            # angles in radians, assumed xyz order
+            angles = self._ensure_last_dim(t, 3)
+            # Kornia quaternion_from_euler expects (roll, pitch, yaw) -> (x, y, z)
+            # Returns tuple (w, x, y, z)
+            w, x, y, z = K.quaternion_from_euler(angles[..., 0], angles[..., 1], angles[..., 2])
+            # Stack to (x, y, z, w)
+            quat = torch.stack((x, y, z, w), dim=-1)
 
-    a = np.asarray(q0, dtype=np.float32)
-    b = np.asarray(q1, dtype=np.float32)
-    blended = (1.0 - float(alpha)) * a + float(alpha) * b
-    return normalizeQuaternionArray(blended, eps=eps)
+        elif kind in ("rot6d", "6d"):
+            r6 = self._ensure_last_dim(t, 6)
+            # Manual 6D -> Matrix -> Quaternion
+            mat = self._rotation_6d_to_matrix(r6)
+            # Kornia rotation_matrix_to_quaternion expects (..., 3, 3)
+            # Returns (..., 4) in (w, x, y, z) order
+            quat_wxyz = K.rotation_matrix_to_quaternion(mat)
+            # Convert (w, x, y, z) -> (x, y, z, w)
+            quat = torch.cat((quat_wxyz[..., 1:], quat_wxyz[..., :1]), dim=-1)
 
-
-def slerpQuaternionArray(q0: np.ndarray, q1: np.ndarray, alpha: float, eps: float = 1e-8) -> np.ndarray:
-    """Spherical linear interpolation between two NumPy quaternions."""
-
-    qa = normalizeQuaternionArray(q0, eps=eps)
-    qb = normalizeQuaternionArray(q1, eps=eps)
-    dot = float(np.dot(qa, qb))
-    if dot < 0.0:
-        qb = -qb
-        dot = -dot
-    dot = float(np.clip(dot, -1.0, 1.0))
-    if dot > 0.9995:
-        return lerpQuaternionArray(qa, qb, alpha, eps=eps)
-    theta = math.acos(dot)
-    sin_theta = math.sin(theta)
-    if sin_theta < 1e-6:
-        return qa
-    alpha = float(alpha)
-    w0 = math.sin((1.0 - alpha) * theta) / sin_theta
-    w1 = math.sin(alpha * theta) / sin_theta
-    return w0 * qa + w1 * qb
-
-
-@dataclass(frozen=True)
-class Quaternion:
-    """Simple quaternion helper bridging NumPy and Torch backends."""
-
-    x: float
-    y: float
-    z: float
-    w: float
-
-    @staticmethod
-    def from_iterable(values: Iterable[float]) -> "Quaternion":
-        vx, vy, vz, vw = values
-        return Quaternion(float(vx), float(vy), float(vz), float(vw))
-
-    @staticmethod
-    def identity() -> "Quaternion":
-        return Quaternion(0.0, 0.0, 0.0, 1.0)
-
-    def as_tuple(self) -> Tuple[float, float, float, float]:
-        return (self.x, self.y, self.z, self.w)
-
-    def as_numpy(self) -> np.ndarray:
-        return np.array(self.as_tuple(), dtype=np.float32)
-
-    def as_tensor(self, device: torch.device | None = None, dtype: torch.dtype | None = None) -> Tensor:
-        tensor = torch.tensor(self.as_tuple(), dtype=dtype or torch.float32)
-        if device is not None:
-            tensor = tensor.to(device)
-        return tensor
-
-    def normalized(self, eps: float = 1e-8) -> "Quaternion":
-        arr = normalizeQuaternionArray(self.as_numpy(), eps=eps)
-        return Quaternion.from_iterable(arr.tolist())
-
-    def multiply(self, other: "Quaternion") -> "Quaternion":
-        result = multiplyQuaternionArray(self.as_numpy(), other.as_numpy())
-        return Quaternion.from_iterable(result.tolist())
-
-    def to_euler_xyz(self) -> Tuple[float, float, float]:
-        """Return Euler angles (radians) in XYZ order."""
-
-        x, y, z, w = self.as_tuple()
-        sinr_cosp = 2 * (w * x + y * z)
-        cosr_cosp = 1 - 2 * (x * x + y * y)
-        roll = math.atan2(sinr_cosp, cosr_cosp)
-
-        sinp = 2 * (w * y - z * x)
-        if abs(sinp) >= 1:
-            pitch = math.copysign(math.pi / 2, sinp)
         else:
-            pitch = math.asin(sinp)
+            raise ValueError(
+                f"Rotation.__init__: kind must be 'quat', 'euler' or 'rot6d', got {kind!r}"
+            )
 
-        siny_cosp = 2 * (w * z + x * y)
-        cosy_cosp = 1 - 2 * (y * y + z * z)
-        yaw = math.atan2(siny_cosp, cosy_cosp)
-        return roll, pitch, yaw
+        self._quat: Tensor = quat  # (..., 4), float32, (x, y, z, w)
 
-    def lerp(self, other: "Quaternion", alpha: float) -> "Quaternion":
-        result = lerpQuaternionArray(self.as_numpy(), other.as_numpy(), alpha)
-        return Quaternion.from_iterable(result.tolist())
+    # ------------------------------------------------------------------
+    # Public accessors
+    # ------------------------------------------------------------------
 
-    def slerp(self, other: "Quaternion", alpha: float) -> "Quaternion":
-        result = slerpQuaternionArray(self.as_numpy(), other.as_numpy(), alpha)
-        return Quaternion.from_iterable(result.tolist())
+    @property
+    def quat(self) -> Tensor:
+        """Internal quaternion, shape (..., 4), (x, y, z, w)."""
+        return self._quat
 
-class QuaternionConverter:
-    """Conversions between quaternion formats used by the project."""
-
-    @staticmethod
-    def normalizeQuaternion(quaternion: Tensor) -> Tensor:
-        """Return a unit-lengthed quaternion tensor."""
-        epsilon = 1e-8
-        norm = quaternion.norm(dim=-1, keepdim=True) + epsilon
-        return quaternion / norm
-
-    @staticmethod
-    def quaternionFromRotation6d(rotation6d: Tensor) -> Tensor:
-        """Convert 6D rotation representation into quaternions."""
-        basisPrimary = F.normalize(rotation6d[..., 0:3], dim=-1)
-        rawSecondary = rotation6d[..., 3:6]
-        projection = (basisPrimary * rawSecondary).sum(dim=-1, keepdim=True)
-        orthogonalComponent = rawSecondary - projection * basisPrimary
-        basisSecondary = F.normalize(orthogonalComponent, dim=-1)
-        basisTertiary = torch.cross(basisPrimary, basisSecondary, dim=-1)
-        rotationMatrix = torch.stack(
-            [basisPrimary, basisSecondary, basisTertiary], dim=-2
-        )
-        trace = rotationMatrix[..., 0, 0]
-        trace = trace + rotationMatrix[..., 1, 1]
-        trace = trace + rotationMatrix[..., 2, 2]
-        wComponent = torch.sqrt(torch.clamp(1.0 + trace, min=0.0)) / 2.0
-        denominator = 4.0 * wComponent + 1e-8
-        xComponent = (
-            rotationMatrix[..., 2, 1] - rotationMatrix[..., 1, 2]
-        ) / denominator
-        yComponent = (
-            rotationMatrix[..., 0, 2] - rotationMatrix[..., 2, 0]
-        ) / denominator
-        zComponent = (
-            rotationMatrix[..., 1, 0] - rotationMatrix[..., 0, 1]
-        ) / denominator
-        quaternion = torch.stack(
-            [wComponent, xComponent, yComponent, zComponent], dim=-1
-        )
-        return QuaternionConverter.normalizeQuaternion(quaternion)
-
-    @staticmethod
-    def rotation6dFromQuaternion(quaternion: Tensor) -> Tensor:
-        """Convert quaternions back to 6D rotation representation."""
-        wComponent, xComponent, yComponent, zComponent = quaternion.unbind(-1)
-        epsilon = 1e-8
-        norm = torch.sqrt(
-            wComponent * wComponent
-            + xComponent * xComponent
-            + yComponent * yComponent
-            + zComponent * zComponent
-            + epsilon
-        )
-        wComponent = wComponent / norm
-        xComponent = xComponent / norm
-        yComponent = yComponent / norm
-        zComponent = zComponent / norm
-        rotationMatrix = torch.zeros(
-            quaternion.shape[:-1] + (3, 3),
-            device=quaternion.device,
-            dtype=quaternion.dtype,
-        )
-        rotationMatrix[..., 0, 0] = 1 - 2 * (
-            yComponent * yComponent + zComponent * zComponent
-        )
-        rotationMatrix[..., 0, 1] = 2 * (
-            xComponent * yComponent - zComponent * wComponent
-        )
-        rotationMatrix[..., 0, 2] = 2 * (
-            xComponent * zComponent + yComponent * wComponent
-        )
-        rotationMatrix[..., 1, 0] = 2 * (
-            xComponent * yComponent + zComponent * wComponent
-        )
-        rotationMatrix[..., 1, 1] = 1 - 2 * (
-            xComponent * xComponent + zComponent * zComponent
-        )
-        rotationMatrix[..., 1, 2] = 2 * (
-            yComponent * zComponent - xComponent * wComponent
-        )
-        rotationMatrix[..., 2, 0] = 2 * (
-            xComponent * zComponent - yComponent * wComponent
-        )
-        rotationMatrix[..., 2, 1] = 2 * (
-            yComponent * zComponent + xComponent * wComponent
-        )
-        rotationMatrix[..., 2, 2] = 1 - 2 * (
-            xComponent * xComponent + yComponent * yComponent
-        )
-        primary = rotationMatrix[..., 0]
-        secondary = rotationMatrix[..., 1]
-        return torch.cat([primary, secondary], dim=-1)
-
-    @staticmethod
-    def quaternionFromAxisAngle(axisAngle: Tensor, eps: float = 1e-8) -> Tensor:
+    @property
+    def euler(self) -> Tensor:
         """
-        Convert axis-angle vectors into quaternions.
-
-        Parameters
-        ----------
-        axisAngle : Tensor
-            Tensor shaped (..., 3) representing axis multiplied by angle.
-        eps : float, default=1e-8
-            Numerical stability guard near zero rotations.
-
-        Returns
-        -------
-        Tensor
-            Tensor shaped (..., 4) storing quaternions (w, x, y, z).
+        Euler angles (xyz) in radians, shape (..., 3).
         """
+        # Convert (x, y, z, w) -> (w, x, y, z) for Kornia
+        w = self._quat[..., 3]
+        x = self._quat[..., 0]
+        y = self._quat[..., 1]
+        z = self._quat[..., 2]
+        
+        # Kornia euler_from_quaternion takes (w, x, y, z)
+        # Returns tuple (roll, pitch, yaw) -> (x, y, z)
+        roll, pitch, yaw = K.euler_from_quaternion(w, x, y, z)
+        return torch.stack((roll, pitch, yaw), dim=-1)
 
-        angle = torch.linalg.norm(axisAngle, dim=-1, keepdim=True)
-        safeAngle = torch.where(angle > eps, angle, torch.ones_like(angle))
-        normalizedAxis = axisAngle / safeAngle
-        normalizedAxis = torch.where(
-            angle > eps,
-            normalizedAxis,
-            torch.zeros_like(normalizedAxis),
-        )
-        halfAngle = angle * 0.5
-        sinHalf = torch.sin(halfAngle)
-        cosHalf = torch.cos(halfAngle)
-        quaternion = torch.cat(
-            [
-                cosHalf,
-                normalizedAxis * sinHalf,
-            ],
-            dim=-1,
-        )
-        return QuaternionConverter.normalizeQuaternion(quaternion)
-
-    @staticmethod
-    def rotation6dFromAxisAngle(axisAngle: Tensor) -> Tensor:
+    @property
+    def rot6d(self) -> Tensor:
         """
-        Convert axis-angle vectors directly into rotation-6d format.
-
-        Parameters
-        ----------
-        axisAngle : Tensor
-            Tensor shaped (..., 3).
-
-        Returns
-        -------
-        Tensor
-            Tensor shaped (..., 6) containing 6D rotations.
+        6D representation, shape (..., 6).
         """
+        # Convert (x, y, z, w) -> (w, x, y, z) for Kornia
+        quat_wxyz = torch.cat((self._quat[..., -1:], self._quat[..., :-1]), dim=-1)
+        mat = K.quaternion_to_rotation_matrix(quat_wxyz)  # (..., 3, 3)
+        return self._rotation_matrix_to_rotation_6d(mat)
 
-        quaternions = QuaternionConverter.quaternionFromAxisAngle(axisAngle)
-        return QuaternionConverter.rotation6dFromQuaternion(quaternions)
+    # ------------------------------------------------------------------
+    # Generic API
+    # ------------------------------------------------------------------
+
+    def as_tensor(self, kind: str = "quat") -> Tensor:
+        """Returns the requested representation as a Torch Tensor.
+
+        kind ∈ {"quat", "euler", "rot6d", "6d"}
+        """
+        kind = kind.lower()
+        if kind == "quat":
+            return self.quat
+        if kind == "euler":
+            return self.euler
+        if kind in ("rot6d", "6d"):
+            return self.rot6d
+        raise ValueError(f"Rotation.as_tensor: unknown kind {kind!r}")
+
+    def as_array(self, kind: str = "quat") -> np.ndarray:
+        """Same as as_tensor but converted to NumPy on CPU."""
+        return self.as_tensor(kind).detach().cpu().numpy()
+
+    # ------------------------------------------------------------------
+    # Constructors helpers
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_quat(cls, quat: Union[np.ndarray, Tensor]) -> "Rotation":
+        return cls(quat, kind="quat")
+
+    @classmethod
+    def from_euler(cls, angles: Union[np.ndarray, Tensor]) -> "Rotation":
+        """Angles in radians, xyz order."""
+        return cls(angles, kind="euler")
+
+    @classmethod
+    def from_rot6d(cls, r6: Union[np.ndarray, Tensor]) -> "Rotation":
+        return cls(r6, kind="rot6d")
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def formatQuaternionPipeString(quaternion: Tensor) -> str:
-        """Format a quaternion as the pipe-separated string used in JSON files."""
-        formatted = [f"{float(component):.7f}" for component in quaternion]
-        trimmed: List[str] = []
-        for value in formatted:
-            trimmed.append(value.rstrip("0").rstrip(".") if "." in value else value)
-        return "|".join(trimmed)
+    def _to_tensor(x: Union[np.ndarray, Tensor]) -> Tensor:
+        if isinstance(x, Tensor):
+            return x.float()
+        return torch.as_tensor(x, dtype=torch.float32)
 
     @staticmethod
-    def tensorFromQuaternion(quaternion: Quaternion, device: torch.device | None = None) -> Tensor:
-        return quaternion.as_tensor(device=device)
+    def _ensure_last_dim(t: Tensor, dim: int) -> Tensor:
+        if t.ndim == 1 and t.shape[0] == dim:
+            t = t.unsqueeze(0)
+        if t.shape[-1] != dim:
+            raise ValueError(
+                f"Rotation: last dimension must be {dim}, got {tuple(t.shape)}"
+            )
+        return t
 
     @staticmethod
-    def tensorSequenceFromQuaternions(quaternions: Iterable[Quaternion], device: torch.device | None = None) -> Tensor:
-        data = [q.as_tuple() for q in quaternions]
-        tensor = torch.tensor(data, dtype=torch.float32)
-        if device is not None:
-            tensor = tensor.to(device)
-        return tensor
+    def _normalize_quat(quat: Tensor) -> Tensor:
+        norm = torch.linalg.norm(quat, dim=-1, keepdim=True)
+        norm = torch.clamp(norm, min=1e-8)
+        return quat / norm
+
+    # ------------------------------------------------------------------
+    # Manual 6D Helpers (Missing in Kornia 0.x)
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def quaternionFromTensor(tensor: Tensor) -> Quaternion:
-        return Quaternion.from_iterable(tensor.tolist())
+    def _rotation_6d_to_matrix(d6: Tensor) -> Tensor:
+        """
+        Converts 6D rotation representation to 3x3 rotation matrix.
+        Based on Zhou et al., "On the Continuity of Rotation Representations in Neural Networks".
+        """
+        a1 = d6[..., 0:3]
+        a2 = d6[..., 3:6]
 
+        b1 = F.normalize(a1, dim=-1)
+        b2 = a2 - (b1 * a2).sum(-1, keepdim=True) * b1
+        b2 = F.normalize(b2, dim=-1)
+        b3 = torch.cross(b1, b2, dim=-1)
 
-class QuaternionMetrics:
-    """Metrics for quaternion quality estimates."""
+        return torch.stack((b1, b2, b3), dim=-1)
 
     @staticmethod
-    def geodesicDistanceDegrees(
-        predicted: Tensor,
-        target: Tensor,
-    ) -> Tensor:
-        """Compute the geodesic distance between unit quaternions."""
-        predicted = QuaternionConverter.normalizeQuaternion(predicted)
-        target = QuaternionConverter.normalizeQuaternion(target)
-        dotProduct = torch.clamp((predicted * target).sum(dim=-1).abs(), 0, 1)
-        angleRadians = 2.0 * torch.acos(dotProduct)
-        return angleRadians * (180.0 / math.pi)
+    def _rotation_matrix_to_rotation_6d(matrix: Tensor) -> Tensor:
+        """
+        Converts 3x3 rotation matrix to 6D representation.
+        """
+        batch_dim = matrix.shape[:-2]
+        return matrix[..., :2].clone().reshape(batch_dim + (6,))

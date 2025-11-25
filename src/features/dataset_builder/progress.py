@@ -29,29 +29,6 @@ class ProgressReporter:
         raise NotImplementedError
 
 
-@dataclass
-class SilentProgressReporter(ProgressReporter):
-    """No-op implementation used for tests or quiet mode."""
-
-    total: int
-    description: str
-
-    def advance(self, message: Optional[str] = None) -> None:  # noqa: ARG002
-        """
-        No-op implementation for compatibility with the interface.
-
-        Parameters
-        ----------
-        message : Optional[str], default=None
-            Unused textual message.
-        """
-        return
-
-    def close(self) -> None:
-        """No-op implementation for compatibility with the interface."""
-        return
-
-
 class TqdmProgressReporter(ProgressReporter):
     """`tqdm`-powered progress bar."""
 
@@ -86,32 +63,3 @@ class TqdmProgressReporter(ProgressReporter):
     def close(self) -> None:
         """Close the underlying tqdm progress bar."""
         self._bar.close()
-
-
-def createProgressReporter(
-    style: str,
-    total: int,
-    description: str,
-) -> ProgressReporter:
-    """
-    Build an appropriate progress reporter.
-
-    Parameters
-    ----------
-    style : str
-        "auto", "tqdm" or "none".
-    total : int
-        Total number of steps.
-    description : str
-        Textual description displayed with the progress indicator.
-
-    Returns
-    -------
-    ProgressReporter
-        Concrete reporter matching the requested style.
-    """
-
-    normalizedStyle = style.lower()
-    if normalizedStyle in {"auto", "tqdm"}:
-        return TqdmProgressReporter(total=total, description=description)
-    return SilentProgressReporter(total=total, description=description)

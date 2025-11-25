@@ -29,21 +29,9 @@ def buildArgumentParser() -> argparse.ArgumentParser:
         help="Path to the YAML configuration file.",
     )
     parser.add_argument(
-        "--progress",
-        choices=["tqdm", "none"],
-        default="tqdm",
-        help="Progress display strategy.",
-    )
-    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug mode (fails on first error).",
-    )
-    parser.add_argument(
-        "--max-samples",
-        type=int,
-        default=None,
-        help="Limit the number of processed samples (useful for debugging).",
     )
     return parser
 
@@ -62,8 +50,6 @@ def main() -> None:
     config = loadBuilderConfig(arguments.config)
     options = DatasetBuildOptions(
         debugMode=arguments.debug,
-        progressStyle=arguments.progress,
-        maxSamples=arguments.max_samples,
     )
     builder = DatasetBuilder(config=config, options=options)
     report = builder.buildDataset()

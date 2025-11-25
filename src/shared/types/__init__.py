@@ -13,6 +13,11 @@ from .datasets import (
     DatasetBuilderProcessing,
     DatasetPaths,
     PromptData,
+    PromptRecord,
+    PromptSegment,
+    PromptSample,
+    ConvertedPrompt,
+    AnimationSample
 )
 
 
@@ -51,4 +56,9 @@ __all__ = [
     "DatasetPaths",
     "DeviceSelectionOptions",
     "PromptData",
+    "PromptRecord",
+    "PromptSegment",
+    "PromptSample",
+    "ConvertedPrompt",
+    "AnimationSample",
 ]

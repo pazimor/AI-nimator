@@ -1,12 +1,11 @@
 paths:
   humanml3d-mapping: "/Users/pazimor/repo/HumanML3D/index.csv"
   amass-root: "/Volumes/Code assets/AMASS"
-  animation_root: "/Volumes/Code assets/AMASS"
   converted-root: "/Volumes/Code assets/converted_60"
-  prompt_sources: "/Users/pazimor/repo/HumanML3D/HumanML3D/texts/texts"
+  prompt-sources: "/Users/pazimor/repo/HumanML3D/HumanML3D/texts/texts"
   # supprimer proprement custom_prompt_files:
-  output_root: "output/dataset"
+  output-root: "output/dataset"
 processing:
-  animation_extension: ".npz"
-  prompt_text_extension: ".txt"
-  fallback_fps: 60
+  animation-extension: ".npz"
+  prompt-text-extension: ".txt"
+  fallback-fps: 60

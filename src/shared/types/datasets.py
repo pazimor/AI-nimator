@@ -41,13 +41,9 @@ class DatasetBuildOptions:
         When True the builder raises immediately on the first error.
     progressStyle : str
         Either "auto", "rich", "tqdm" or "none" to control progress display.
-    maxSamples : Optional[int]
-        Optional hard limit used for dry-runs or debugging sessions.
     """
 
     debugMode: bool = False
-    progressStyle: str = "auto"
-    maxSamples: Optional[int] = None
 
 
 @dataclass
@@ -110,10 +106,8 @@ class DatasetBuilderPaths:
     """
 
     animationRoot: Path
-    animationRoots: List[Path]
     promptRoot: Path
     promptSources: List[Path]
-    customPromptFiles: List[Path]
     indexCsv: Path
     outputRoot: Path
     convertedRoot: Optional[Path] = None
@@ -154,3 +148,51 @@ class DatasetBuilderConfig:
 
     paths: DatasetBuilderPaths
     processing: DatasetBuilderProcessing = DatasetBuilderProcessing()
+
+@dataclass(frozen=True)
+class PromptRecord:
+    """Single row from the HumanML3D index CSV."""
+
+    animationRelativePath: Path
+    startFrame: int
+    endFrame: int
+    promptFile: str
+
+
+@dataclass(frozen=True)
+class PromptSegment:
+    """Prompt slice covering a contiguous frame range."""
+
+    startFrame: int
+    endFrame: int
+    text: str
+    sourceFile: str
+
+
+@dataclass(frozen=True)
+class PromptSample:
+    """Bundled prompt records for a single animation."""
+
+    relativePath: Path
+    records: List[PromptRecord]
+
+
+@dataclass(frozen=True)
+class ConvertedPrompt:
+    """Custom prompt exported from a converted dataset sample."""
+
+    simple: str
+    advanced: str
+    tag: str
+    promptIdentifier: str
+
+
+@dataclass(frozen=True)
+class AnimationSample:
+    """Subset of fields loaded from an AMASS npz file."""
+
+    relativePath: Path
+    resolvedPath: Path
+    axisAngles: np.ndarray
+    fps: int
+    extras: Dict[str, object]
