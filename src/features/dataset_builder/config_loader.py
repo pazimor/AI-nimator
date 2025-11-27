@@ -40,7 +40,8 @@ def loadBuilderConfig(configPath: Path) -> DatasetBuilderConfig:
     indexCsvRaw = _check_value(pathsSection, "humanml3d-mapping")
     promptRootRaw = _check_value(pathsSection, "converted-root")
     # ?? what need too check
-    outputRootRaw = convertedRootRaw = _check_value(pathsSection, "converted-root" )
+    outputRootRaw = _check_value(pathsSection, "output-root")
+    convertedRootRaw = _check_value(pathsSection, "converted-root")
     # ?? same 
     animationRoot = _resolvePath(configPath, animationRootRaw)
     

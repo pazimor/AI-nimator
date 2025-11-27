@@ -3,8 +3,7 @@ paths:
   amass-root: "/Volumes/Code assets/AMASS"
   converted-root: "/Volumes/Code assets/converted_60"
   prompt-sources: "/Users/pazimor/repo/HumanML3D/HumanML3D/texts/texts"
-  # supprimer proprement custom_prompt_files:
-  output-root: "output/dataset"
+  output-root: "/Volumes/Code assets/dataset"
 processing:
   animation-extension: ".npz"
   prompt-text-extension: ".txt"

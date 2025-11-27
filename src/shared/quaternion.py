@@ -94,6 +94,15 @@ class Rotation:
         mat = K.quaternion_to_rotation_matrix(quat_wxyz)  # (..., 3, 3)
         return self._rotation_matrix_to_rotation_6d(mat)
 
+    @property
+    def axis_angle(self) -> Tensor:
+        """
+        Axis-angle representation, shape (..., 3).
+        """
+        # Convert (x, y, z, w) -> (w, x, y, z) for Kornia
+        quat_wxyz = torch.cat((self._quat[..., -1:], self._quat[..., :-1]), dim=-1)
+        return K.quaternion_to_axis_angle(quat_wxyz)
+
     # ------------------------------------------------------------------
     # Generic API
     # ------------------------------------------------------------------

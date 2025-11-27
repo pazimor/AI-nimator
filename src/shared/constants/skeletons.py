@@ -74,3 +74,57 @@ class SkeletonDefinition:
 SMPL22_SKELETON = SkeletonDefinition(name="SMPL-22", bones=SMPL22_BONE_ORDER)
 SMPL24_SKELETON = SkeletonDefinition(name="SMPL-24", bones=SMPL24_BONE_ORDER)
 
+
+# Parent-child relationships for SMPL-22
+SMPL22_HIERARCHY: Dict[str, str | None] = {
+    "pelvis": None,
+    "leftHip": "pelvis",
+    "rightHip": "pelvis",
+    "spine1": "pelvis",
+    "leftKnee": "leftHip",
+    "rightKnee": "rightHip",
+    "spine2": "spine1",
+    "leftAnkle": "leftKnee",
+    "rightAnkle": "rightKnee",
+    "spine3": "spine2",
+    "leftFoot": "leftAnkle",
+    "rightFoot": "rightAnkle",
+    "neck": "spine3",
+    "leftCollar": "spine3",
+    "rightCollar": "spine3",
+    "head": "neck",
+    "leftShoulder": "leftCollar",
+    "rightShoulder": "rightCollar",
+    "leftElbow": "leftShoulder",
+    "rightElbow": "rightShoulder",
+    "leftWrist": "leftElbow",
+    "rightWrist": "rightElbow",
+}
+
+# Approximate default offsets (in meters) for Mean SMPL shape in T-Pose.
+# These are used when exact subject shape is not available.
+SMPL22_DEFAULT_OFFSETS: Dict[str, List[float]] = {
+    "pelvis": [0.0, 0.0, 0.0],
+    "leftHip": [0.07, -0.04, 0.0],
+    "rightHip": [-0.07, -0.04, 0.0],
+    "spine1": [0.0, 0.1, 0.02],
+    "leftKnee": [0.0, -0.40, 0.0],
+    "rightKnee": [0.0, -0.40, 0.0],
+    "spine2": [0.0, 0.15, -0.02],
+    "leftAnkle": [0.0, -0.42, 0.0],
+    "rightAnkle": [0.0, -0.42, 0.0],
+    "spine3": [0.0, 0.15, 0.0],
+    "leftFoot": [0.0, -0.06, 0.12],
+    "rightFoot": [0.0, -0.06, 0.12],
+    "neck": [0.0, 0.12, 0.0],
+    "leftCollar": [0.06, 0.08, -0.02],
+    "rightCollar": [-0.06, 0.08, -0.02],
+    "head": [0.0, 0.12, 0.04],
+    "leftShoulder": [0.12, 0.0, 0.0],
+    "rightShoulder": [-0.12, 0.0, 0.0],
+    "leftElbow": [0.26, 0.0, 0.0],
+    "rightElbow": [-0.26, 0.0, 0.0],
+    "leftWrist": [0.24, 0.0, 0.0],
+    "rightWrist": [-0.24, 0.0, 0.0],
+}
+
