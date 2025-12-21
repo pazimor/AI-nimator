@@ -17,8 +17,10 @@ class Rotation:
 
     You can construct it from:
       - Euler angles (shape (..., 3))  -> radians, order: xyz
+      - Axis-angle (shape (..., 3))    -> axis * angle (radians)
       - Quaternions (shape (..., 4))   -> (x, y, z, w)
       - 6D rotation (shape (..., 6))   -> first 2 columns of 3x3 matrix
+      - Rotation matrix (shape (..., 3, 3))
 
     Internal: everything is stored as normalized quaternion (Torch Tensor).
     """
@@ -42,6 +44,11 @@ class Rotation:
             # Stack to (x, y, z, w)
             quat = torch.stack((x, y, z, w), dim=-1)
 
+        elif kind == "axis_angle":
+            axis_angle = self._ensure_last_dim(t, 3)
+            quat_wxyz = K.axis_angle_to_quaternion(axis_angle)
+            quat = torch.cat((quat_wxyz[..., 1:], quat_wxyz[..., :1]), dim=-1)
+
         elif kind in ("rot6d", "6d"):
             r6 = self._ensure_last_dim(t, 6)
             # Manual 6D -> Matrix -> Quaternion
@@ -54,7 +61,7 @@ class Rotation:
 
         else:
             raise ValueError(
-                f"Rotation.__init__: kind must be 'quat', 'euler' or 'rot6d', got {kind!r}"
+                f"Rotation.__init__: kind must be 'quat', 'euler', 'axis_angle' or 'rot6d', got {kind!r}"
             )
 
         self._quat: Tensor = quat  # (..., 4), float32, (x, y, z, w)
@@ -95,6 +102,14 @@ class Rotation:
         return self._rotation_matrix_to_rotation_6d(mat)
 
     @property
+    def matrix(self) -> Tensor:
+        """
+        Rotation matrix representation, shape (..., 3, 3).
+        """
+        quat_wxyz = torch.cat((self._quat[..., -1:], self._quat[..., :-1]), dim=-1)
+        return K.quaternion_to_rotation_matrix(quat_wxyz)
+
+    @property
     def axis_angle(self) -> Tensor:
         """
         Axis-angle representation, shape (..., 3).
@@ -110,15 +125,19 @@ class Rotation:
     def as_tensor(self, kind: str = "quat") -> Tensor:
         """Returns the requested representation as a Torch Tensor.
 
-        kind ∈ {"quat", "euler", "rot6d", "6d"}
+        kind ∈ {"quat", "euler", "axis_angle", "rot6d", "6d", "matrix"}
         """
         kind = kind.lower()
         if kind == "quat":
             return self.quat
         if kind == "euler":
             return self.euler
+        if kind == "axis_angle":
+            return self.axis_angle
         if kind in ("rot6d", "6d"):
             return self.rot6d
+        if kind == "matrix":
+            return self.matrix
         raise ValueError(f"Rotation.as_tensor: unknown kind {kind!r}")
 
     def as_array(self, kind: str = "quat") -> np.ndarray:

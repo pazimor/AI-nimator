@@ -5,6 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+from .clip import (
+    AnimationFileDescriptor,
+    ClipDatasetRecord,
+    ClipPromptSegment,
+    ClipTrainingConfig,
+    ClipTrainingHyperparameters,
+    ClipTrainingPaths,
+    ClipTrainingResult,
+    MotionTextSample,
+    PromptFileDescriptor,
+)
 from .datasets import (
     DatasetBuildOptions,
     DatasetBuildReport,
@@ -12,12 +23,21 @@ from .datasets import (
     DatasetBuilderPaths,
     DatasetBuilderProcessing,
     DatasetPaths,
+    AnimationSample,
+    ConvertedPrompt,
     PromptData,
     PromptRecord,
     PromptSegment,
     PromptSample,
-    ConvertedPrompt,
-    AnimationSample
+)
+from .generation import (
+    VALID_TAGS,
+    GenerationInferenceConfig,
+    GenerationTrainingConfig,
+    GenerationTrainingHyperparameters,
+    GenerationTrainingPaths,
+    GenerationTrainingResult,
+    validateTag,
 )
 
 
@@ -54,6 +74,15 @@ __all__ = [
     "DatasetBuilderPaths",
     "DatasetBuilderProcessing",
     "DatasetPaths",
+    "AnimationFileDescriptor",
+    "ClipDatasetRecord",
+    "ClipPromptSegment",
+    "ClipTrainingConfig",
+    "ClipTrainingHyperparameters",
+    "ClipTrainingPaths",
+    "ClipTrainingResult",
+    "MotionTextSample",
+    "PromptFileDescriptor",
     "DeviceSelectionOptions",
     "PromptData",
     "PromptRecord",
@@ -61,4 +90,11 @@ __all__ = [
     "PromptSample",
     "ConvertedPrompt",
     "AnimationSample",
+    "VALID_TAGS",
+    "GenerationInferenceConfig",
+    "GenerationTrainingConfig",
+    "GenerationTrainingHyperparameters",
+    "GenerationTrainingPaths",
+    "GenerationTrainingResult",
+    "validateTag",
 ]

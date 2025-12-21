@@ -29,7 +29,9 @@ class AnimationRebuilder:
             boneName: index
             for index, boneName in enumerate(self.sourceBoneOrder)
         }
-        self.animationRoots = [config.paths.animationRoot.resolve()] ##TODO: might simplify array
+        self.animationRoots = [
+            config.paths.animationRoot.resolve(),
+        ]  # TODO: might simplify array
         LOGGER.info("animations roots: %s", self.animationRoots)
 
     def loadSample(self, relativePath: Path) -> AnimationSample:
@@ -66,7 +68,10 @@ class AnimationRebuilder:
         for candidate in self._animationCandidates(relativePath):
             if candidate.exists():
                 return candidate
-        raise FileNotFoundError(f"Animation file not found: {relativePath} in {self._animationCandidates(relativePath)}")
+        raise FileNotFoundError(
+            f"Animation file not found: {relativePath} "
+            f"in {self._animationCandidates(relativePath)}"
+        )
 
     def _animationCandidates(self, relativePath: Path) -> List[Path]:
         bases: List[Path] = []
@@ -123,7 +128,35 @@ class AnimationRebuilder:
                 bones.append(self._emptyBone(boneName, frames))
                 continue
             angles = reshaped[:, sourceIndex, :]
-            rotations6d = Rotation(angles, kind="euler").rot6d
+            if np.allclose(angles, 0.0):
+                LOGGER.warning(
+                    "Bone %s has zero rotation across %s frames.",
+                    boneName,
+                    frames,
+                )
+            rotations6d = Rotation(angles, kind="axis_angle").rot6d
+            # Warn if animation is static between consecutive frames
+            if frames > 1:
+                identical = np.all(
+                    np.isclose(angles[1:], angles[:-1]),
+                    axis=1,
+                )
+                if identical.any():
+                    idxs = np.nonzero(identical)[0][:5].tolist()
+                    LOGGER.warning(
+                        "Bone %s: %s identical consecutive frames; first %s.",
+                        boneName,
+                        int(identical.sum()),
+                        idxs,
+                    )
+            magnitudes = np.linalg.norm(angles, axis=1)
+            LOGGER.debug(
+                "Bone %s norm min=%.4f max=%.4f mean=%.4f",
+                boneName,
+                float(np.min(magnitudes)),
+                float(np.max(magnitudes)),
+                float(np.mean(magnitudes)),
+            )
 
             bones.append(self._boneWithFrames(boneName, rotations6d.tolist()))
 
@@ -163,9 +196,32 @@ class AnimationRebuilder:
             "frames": frameEntries,
         }
 
-    def exportCollada(self, sample: AnimationSample, outputPath: Path) -> None:
-        """Export the animation sample to a Collada (.dae) file."""
-        root = ET.Element("COLLADA", xmlns="http://www.collada.org/2005/11/COLLADASchema", version="1.4.1")
+    def exportCollada(
+        self,
+        sample: AnimationSample,
+        outputPath: Path,
+        zeroRootTranslation: bool = False,
+        anchorRootTranslation: bool = False,
+    ) -> None:
+        """
+        Export the animation sample to a Collada (.dae) file.
+
+        Parameters
+        ----------
+        sample : AnimationSample
+            Animation data with SMPL axis-angles and extras.
+        outputPath : Path
+            Destination path for the .dae file.
+        zeroRootTranslation : bool, optional
+            When True, forces pelvis translation to zero for all frames.
+        anchorRootTranslation : bool, optional
+            When True, subtracts the first frame translation from the rest.
+        """
+        root = ET.Element(
+            "COLLADA",
+            xmlns="http://www.collada.org/2005/11/COLLADASchema",
+            version="1.4.1",
+        )
         
         # Asset metadata
         asset = ET.SubElement(root, "asset")
@@ -176,38 +232,68 @@ class AnimationRebuilder:
 
         # Library Visual Scenes
         lib_scenes = ET.SubElement(root, "library_visual_scenes")
-        visual_scene = ET.SubElement(lib_scenes, "visual_scene", id="Scene", name="Scene")
+        visual_scene = ET.SubElement(
+            lib_scenes,
+            "visual_scene",
+            id="Scene",
+            name="Scene",
+        )
         
         # Build hierarchy
-        # We need to map bone names to their XML elements to nest them correctly
+        # We need to map bone names to their XML elements to nest them
+        # correctly.
         bone_elements: Dict[str, ET.Element] = {}
         
-        # Create nodes. Since dictionary is unordered, we must ensure parents exist.
-        # SMPL22_BONE_ORDER is topologically sorted (root first), so iterating it is safe.
+        # Create nodes. Since dictionary is unordered, we must ensure parents
+        # exist. SMPL22_BONE_ORDER is topologically sorted (root first), so
+        # iterating it is safe.
         
         # Root node (Armature)
-        armature = ET.SubElement(visual_scene, "node", id="Armature", name="Armature")
-        ET.SubElement(armature, "matrix", sid="transform").text = "1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"
+        armature = ET.SubElement(
+            visual_scene,
+            "node",
+            id="Armature",
+            name="Armature",
+        )
+        ET.SubElement(
+            armature,
+            "matrix",
+            sid="transform",
+        ).text = "1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"
         
         for bone_name in SMPL22_BONE_ORDER:
             parent_name = SMPL22_HIERARCHY.get(bone_name)
-            parent_node = bone_elements.get(parent_name) if parent_name else armature
+            parent_node = (
+                bone_elements.get(parent_name) if parent_name else armature
+            )
             
-            node = ET.SubElement(parent_node, "node", id=bone_name, name=bone_name, sid=bone_name, type="JOINT")
+            node = ET.SubElement(
+                parent_node,
+                "node",
+                id=bone_name,
+                name=bone_name,
+                sid=bone_name,
+                type="JOINT",
+            )
             bone_elements[bone_name] = node
             
+            # Use a single matrix transform that combines translation and rotation
+            # Initial matrix is identity with offset translation
             offset = SMPL22_DEFAULT_OFFSETS.get(bone_name, [0.0, 0.0, 0.0])
-            ET.SubElement(node, "translate", sid="location").text = f"{offset[0]} {offset[1]} {offset[2]}"
-            
-            # Rotation placeholders (Z, Y, X order for Euler)
-            # We will animate these.
-            # Collada uses axis-angle.
-            rot_z = ET.SubElement(node, "rotate", sid="rotationZ")
-            rot_z.text = "0 0 1 0"
-            rot_y = ET.SubElement(node, "rotate", sid="rotationY")
-            rot_y.text = "0 1 0 0"
-            rot_x = ET.SubElement(node, "rotate", sid="rotationX")
-            rot_x.text = "1 0 0 0"
+            # Column-major order for Collada: m00 m10 m20 m30 m01 m11 m21 m31 ...
+            # But Collada uses row-major string format:
+            # m00 m01 m02 m03 m10 m11 m12 m13 m20 m21 m22 m23 m30 m31 m32 m33
+            init_matrix = (
+                f"1 0 0 {offset[0]} "
+                f"0 1 0 {offset[1]} "
+                f"0 0 1 {offset[2]} "
+                f"0 0 0 1"
+            )
+            ET.SubElement(
+                node,
+                "matrix",
+                sid="transform",
+            ).text = init_matrix
 
         # Library Animations
         lib_anims = ET.SubElement(root, "library_animations")
@@ -217,59 +303,108 @@ class AnimationRebuilder:
         frames = sample.axisAngles.shape[0]
         times = np.arange(frames) / fps
         times_str = " ".join(f"{t:.4f}" for t in times)
+        time_count = frames
         
         reshaped_poses = sample.axisAngles.reshape(frames, -1, 3)
         
         # Handle root translation if available
-        root_trans = sample.extras.get("trans")
-        if root_trans is not None and isinstance(root_trans, (np.ndarray, list)):
-            trans_data = np.array(root_trans)
-            if trans_data.shape == (frames, 3):
-                self._add_animation_channel(lib_anims, "pelvis", "translate", times_str, trans_data, ["X", "Y", "Z"])
+        trans_data = self._prepareRootTranslation(
+            sample.extras.get("trans"),
+            frames,
+            zeroRootTranslation,
+            anchorRootTranslation,
+        )
 
         for bone_name in SMPL22_BONE_ORDER:
             source_index = self.boneIndex.get(bone_name)
             if source_index is None or source_index >= reshaped_poses.shape[1]:
                 continue
                 
-            bone_rotations = reshaped_poses[:, source_index, :] # (frames, 3) axis-angle
+            bone_rotations = reshaped_poses[:, source_index, :]
+            offset = SMPL22_DEFAULT_OFFSETS.get(bone_name, [0.0, 0.0, 0.0])
             
-            # Convert to Euler (degrees)
-            quats = self._axisAngleToQuat(bone_rotations)
-            rot = Rotation(quats, kind="quat")
-            eulers = rot.as_array("euler") # (frames, 3) radians (x, y, z)
-            eulers_deg = np.degrees(eulers)
+            # Convert axis-angle to rotation matrices
+            # Shape: (frames, 3, 3)
+            rot_matrices = (
+                Rotation(bone_rotations, kind="axis_angle")
+                .matrix
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32)
+            )
             
-            # Export Z, Y, X channels (Kornia/Rotation outputs XYZ order)
-            # We defined <rotate> elements for Z, Y, X.
-            # We need to map the Euler angles to these.
-            # Rotation.euler returns (roll, pitch, yaw) -> (x, y, z)
-            # So we export X, Y, Z channels.
+            # Build 4x4 transformation matrices for each frame
+            # Include translation offset and optionally root translation
+            matrices_4x4 = np.zeros((frames, 4, 4), dtype=np.float32)
+            matrices_4x4[:, :3, :3] = rot_matrices
+            matrices_4x4[:, 0, 3] = offset[0]
+            matrices_4x4[:, 1, 3] = offset[1]
+            matrices_4x4[:, 2, 3] = offset[2]
+            matrices_4x4[:, 3, 3] = 1.0
             
-            self._add_animation_channel(lib_anims, bone_name, "rotationX", times_str, eulers_deg[:, 0:1], ["ANGLE"])
-            self._add_animation_channel(lib_anims, bone_name, "rotationY", times_str, eulers_deg[:, 1:2], ["ANGLE"])
-            self._add_animation_channel(lib_anims, bone_name, "rotationZ", times_str, eulers_deg[:, 2:3], ["ANGLE"])
+            # For pelvis, add root translation if available
+            if bone_name == "pelvis" and trans_data is not None:
+                matrices_4x4[:, 0, 3] += trans_data[:, 0]
+                matrices_4x4[:, 1, 3] += trans_data[:, 1]
+                matrices_4x4[:, 2, 3] += trans_data[:, 2]
+            
+            # Add matrix animation channel
+            self._add_matrix_animation_channel(
+                lib_anims,
+                bone_name,
+                "transform",
+                times_str,
+                time_count,
+                matrices_4x4,
+            )
 
         # Scene instance
         scene = ET.SubElement(root, "scene")
-        instance_visual_scene = ET.SubElement(scene, "instance_visual_scene", url="#Scene")
+        instance_visual_scene = ET.SubElement(
+            scene,
+            "instance_visual_scene",
+            url="#Scene",
+        )
         
         # Write to file
-        xml_str = minidom.parseString(ET.tostring(root)).toprettyxml(indent="  ")
+        xml_str = minidom.parseString(
+            ET.tostring(root)
+        ).toprettyxml(indent="  ")
         with open(outputPath, "w") as f:
             f.write(xml_str)
 
-    def _add_animation_channel(self, lib_anims: ET.Element, bone_name: str, target_sid: str, times_str: str, data: np.ndarray, params: List[str]) -> None:
-        """Helper to add an animation channel."""
+    def _add_animation_channel(
+        self,
+        lib_anims: ET.Element,
+        bone_name: str,
+        target_sid: str,
+        times_str: str,
+        time_count: int,
+        data: np.ndarray,
+        params: List[str],
+    ) -> None:
+        """Create a Collada animation channel bound to a node sid."""
         anim_id = f"{bone_name}_{target_sid}"
         anim_node = ET.SubElement(lib_anims, "animation", id=anim_id)
         
         # Source: Input (Time)
         source_input = ET.SubElement(anim_node, "source", id=f"{anim_id}_input")
-        float_array = ET.SubElement(source_input, "float_array", id=f"{anim_id}_input_array", count=str(len(times_str.split())))
+        float_array = ET.SubElement(
+            source_input,
+            "float_array",
+            id=f"{anim_id}_input_array",
+            count=str(time_count),
+        )
         float_array.text = times_str
         technique = ET.SubElement(source_input, "technique_common")
-        accessor = ET.SubElement(technique, "accessor", source=f"#{anim_id}_input_array", count=str(len(times_str.split())), stride="1")
+        accessor = ET.SubElement(
+            technique,
+            "accessor",
+            source=f"#{anim_id}_input_array",
+            count=str(time_count),
+            stride="1",
+        )
         ET.SubElement(accessor, "param", name="TIME", type="float")
         
         # Source: Output (Values)
@@ -278,26 +413,75 @@ class AnimationRebuilder:
         data_str = " ".join(f"{v:.4f}" for v in flat_data)
         count = len(flat_data)
         
-        source_output = ET.SubElement(anim_node, "source", id=f"{anim_id}_output")
-        float_array = ET.SubElement(source_output, "float_array", id=f"{anim_id}_output_array", count=str(count))
+        source_output = ET.SubElement(
+            anim_node,
+            "source",
+            id=f"{anim_id}_output",
+        )
+        float_array = ET.SubElement(
+            source_output,
+            "float_array",
+            id=f"{anim_id}_output_array",
+            count=str(count),
+        )
         float_array.text = data_str
         technique = ET.SubElement(source_output, "technique_common")
-        accessor = ET.SubElement(technique, "accessor", source=f"#{anim_id}_output_array", count=str(len(data)), stride=str(len(params)))
+        accessor = ET.SubElement(
+            technique,
+            "accessor",
+            source=f"#{anim_id}_output_array",
+            count=str(len(data)),
+            stride=str(len(params)),
+        )
         for param in params:
             ET.SubElement(accessor, "param", name=param, type="float")
             
         # Sampler
-        sampler = ET.SubElement(anim_node, "sampler", id=f"{anim_id}_sampler")
-        ET.SubElement(sampler, "input", semantic="INPUT", source=f"#{anim_id}_input")
-        ET.SubElement(sampler, "input", semantic="OUTPUT", source=f"#{anim_id}_output")
-        ET.SubElement(sampler, "input", semantic="INTERPOLATION", source=f"#{anim_id}_interpolation") # Missing interpolation source?
+        sampler = ET.SubElement(
+            anim_node,
+            "sampler",
+            id=f"{anim_id}_sampler",
+        )
+        ET.SubElement(
+            sampler,
+            "input",
+            semantic="INPUT",
+            source=f"#{anim_id}_input",
+        )
+        ET.SubElement(
+            sampler,
+            "input",
+            semantic="OUTPUT",
+            source=f"#{anim_id}_output",
+        )
+        ET.SubElement(
+            sampler,
+            "input",
+            semantic="INTERPOLATION",
+            source=f"#{anim_id}_interpolation",
+        )
         
         # Add interpolation source (LINEAR)
-        source_interp = ET.SubElement(anim_node, "source", id=f"{anim_id}_interpolation")
-        name_array = ET.SubElement(source_interp, "Name_array", id=f"{anim_id}_interpolation_array", count=str(len(times_str.split())))
-        name_array.text = " ".join(["LINEAR"] * len(times_str.split()))
+        source_interp = ET.SubElement(
+            anim_node,
+            "source",
+            id=f"{anim_id}_interpolation",
+        )
+        name_array = ET.SubElement(
+            source_interp,
+            "Name_array",
+            id=f"{anim_id}_interpolation_array",
+            count=str(time_count),
+        )
+        name_array.text = " ".join(["LINEAR"] * time_count)
         technique = ET.SubElement(source_interp, "technique_common")
-        accessor = ET.SubElement(technique, "accessor", source=f"#{anim_id}_interpolation_array", count=str(len(times_str.split())), stride="1")
+        accessor = ET.SubElement(
+            technique,
+            "accessor",
+            source=f"#{anim_id}_interpolation_array",
+            count=str(time_count),
+            stride="1",
+        )
         ET.SubElement(accessor, "param", name="INTERPOLATION", type="name")
         
         # Channel
@@ -309,7 +493,12 @@ class AnimationRebuilder:
         if target_sid.startswith("rotation"):
             target += ".ANGLE"
             
-        ET.SubElement(anim_node, "channel", source=f"#{anim_id}_sampler", target=target)
+        ET.SubElement(
+            anim_node,
+            "channel",
+            source=f"#{anim_id}_sampler",
+            target=target,
+        )
 
     def _axisAngleToQuat(self, axisAngle: np.ndarray) -> np.ndarray:
         # axisAngle: (N, 3)
@@ -326,6 +515,160 @@ class AnimationRebuilder:
         quats = np.concatenate([axes * sin_half, cos_half], axis=1)
         return quats
 
+    def _add_matrix_animation_channel(
+        self,
+        lib_anims: ET.Element,
+        bone_name: str,
+        target_sid: str,
+        times_str: str,
+        time_count: int,
+        matrices: np.ndarray,
+    ) -> None:
+        """
+        Create a Collada animation channel for 4x4 matrix transforms.
+        
+        Parameters
+        ----------
+        matrices : np.ndarray
+            Shape (frames, 4, 4) transformation matrices.
+        """
+        anim_id = f"{bone_name}_{target_sid}"
+        anim_node = ET.SubElement(lib_anims, "animation", id=anim_id)
+        
+        # Source: Input (Time)
+        source_input = ET.SubElement(anim_node, "source", id=f"{anim_id}_input")
+        float_array = ET.SubElement(
+            source_input,
+            "float_array",
+            id=f"{anim_id}_input_array",
+            count=str(time_count),
+        )
+        float_array.text = times_str
+        technique = ET.SubElement(source_input, "technique_common")
+        accessor = ET.SubElement(
+            technique,
+            "accessor",
+            source=f"#{anim_id}_input_array",
+            count=str(time_count),
+            stride="1",
+        )
+        ET.SubElement(accessor, "param", name="TIME", type="float")
+        
+        # Source: Output (Matrix values)
+        # Flatten matrices to row-major format for Collada
+        # Each 4x4 matrix becomes 16 floats
+        flat_matrices = matrices.reshape(time_count, 16)
+        data_str = " ".join(f"{v:.6f}" for v in flat_matrices.flatten())
+        count = time_count * 16
+        
+        source_output = ET.SubElement(
+            anim_node,
+            "source",
+            id=f"{anim_id}_output",
+        )
+        float_array = ET.SubElement(
+            source_output,
+            "float_array",
+            id=f"{anim_id}_output_array",
+            count=str(count),
+        )
+        float_array.text = data_str
+        technique = ET.SubElement(source_output, "technique_common")
+        accessor = ET.SubElement(
+            technique,
+            "accessor",
+            source=f"#{anim_id}_output_array",
+            count=str(time_count),
+            stride="16",
+        )
+        ET.SubElement(accessor, "param", name="TRANSFORM", type="float4x4")
+            
+        # Sampler
+        sampler = ET.SubElement(
+            anim_node,
+            "sampler",
+            id=f"{anim_id}_sampler",
+        )
+        ET.SubElement(
+            sampler,
+            "input",
+            semantic="INPUT",
+            source=f"#{anim_id}_input",
+        )
+        ET.SubElement(
+            sampler,
+            "input",
+            semantic="OUTPUT",
+            source=f"#{anim_id}_output",
+        )
+        ET.SubElement(
+            sampler,
+            "input",
+            semantic="INTERPOLATION",
+            source=f"#{anim_id}_interpolation",
+        )
+        
+        # Add interpolation source (LINEAR)
+        source_interp = ET.SubElement(
+            anim_node,
+            "source",
+            id=f"{anim_id}_interpolation",
+        )
+        name_array = ET.SubElement(
+            source_interp,
+            "Name_array",
+            id=f"{anim_id}_interpolation_array",
+            count=str(time_count),
+        )
+        name_array.text = " ".join(["LINEAR"] * time_count)
+        technique = ET.SubElement(source_interp, "technique_common")
+        accessor = ET.SubElement(
+            technique,
+            "accessor",
+            source=f"#{anim_id}_interpolation_array",
+            count=str(time_count),
+            stride="1",
+        )
+        ET.SubElement(accessor, "param", name="INTERPOLATION", type="name")
+        
+        # Channel - target the matrix transform
+        target = f"{bone_name}/{target_sid}"
+        ET.SubElement(
+            anim_node,
+            "channel",
+            source=f"#{anim_id}_sampler",
+            target=target,
+        )
+
+    def _prepareRootTranslation(
+        self,
+        rawTrans: object,
+        frameCount: int,
+        zeroRootTranslation: bool,
+        anchorRootTranslation: bool,
+    ) -> Optional[np.ndarray]:
+        if rawTrans is None or not isinstance(rawTrans, (np.ndarray, list)):
+            return None
+        trans_data = np.array(rawTrans)
+        if trans_data.shape != (frameCount, 3):
+            LOGGER.warning(
+                "Ignoring root translation with unexpected shape %s, "
+                "expected (%s, 3).",
+                trans_data.shape,
+                frameCount,
+            )
+            return None
+        if zeroRootTranslation:
+            LOGGER.info(
+                "Zeroing root translation across %s frames.",
+                frameCount,
+            )
+            return np.zeros_like(trans_data)
+        if anchorRootTranslation:
+            LOGGER.info("Anchoring root translation to first frame.")
+            return trans_data - trans_data[0]
+        return trans_data
+
     def _serialize(self, value: object) -> object:
         return
 
@@ -339,4 +682,3 @@ class AnimationRebuilder:
         if isinstance(value, (str, int, float, bool)) or value is None:
             return value
         return str(value)
-
