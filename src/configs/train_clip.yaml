@@ -1,14 +1,54 @@
 paths:
-  dataset-root: "/Volumes/Code assets/dataset"
+  dataset-root: "/Users/eddy.hummel/dataset"
   checkpoint-dir: output/checkpoints
+  # Network architecture is loaded from network.yaml
+  network-config: "network.yaml"
+
+# ============================================
+# Profile: Mac (32GB RAM, MPS GPU)
+# ============================================
 training:
-  batch-size: 2
+  epochs: 100
+  device: mps
   max-length: 64
   model-name: xlm-roberta-base
-  learning-rate: 0.0001
-  epochs: 1000
-  device: cpu
-  embed-dim: 64
   validation-split: 0.1
-  early-stopping-patience: 3
-  resume-checkpoint: output/checkpoints/best_model.pt  # Décommenter pour reprendre l'entraînement
+  early-stopping-patience: 15
+  batch-size: 2
+  gradient-accumulation: 2
+  max-samples: null
+  rotate-dataset: false
+  MM-memory-limit-gb: 25.0
+  weight-decay: 0.01
+  resume-checkpoint: output/checkpoints/best_model.pt
+  
+  # Learning Rate Configuration
+  learning-rate: 0.00001      # Initial/base learning rate
+  lr-min: 0.0000001           # Minimum LR floor (1e-7)
+  lr-warmup-epochs: 3         # Warmup epochs (0 to disable)
+  lr-schedule: cosine         # Schedule type: constant, cosine, linear, step
+  # lr-decay-epochs: 90       # Optional: decay phase length
+
+# ============================================
+# Profile: DGX Spark (128GB RAM, GB10 GPU)
+# Use with: --profile spark
+# ============================================
+spark:
+  epochs: 50
+  device: cuda
+  max-length: 64
+  model-name: xlm-roberta-base
+  validation-split: 0.1
+  early-stopping-patience: 10
+  batch-size: 64
+  gradient-accumulation: 1
+  max-samples: null
+  rotate-dataset: false
+  MM-memory-limit-gb: 0.0
+  weight-decay: 0.01
+  
+  # Learning Rate Configuration
+  learning-rate: 0.0001
+  lr-min: 0.000001
+  lr-warmup-epochs: 5
+  lr-schedule: cosine

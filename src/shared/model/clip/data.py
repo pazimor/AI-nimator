@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import Dataset
@@ -20,6 +21,8 @@ from src.shared.types import (
     ClipPromptSegment,
     MotionTextSample,
 )
+
+LOGGER = logging.getLogger("shared.clip.data")
 def loadPromptFile(path: str | Path) -> List[ClipPromptSegment]:
     """
     Return prompt segments listed in a prompt.json file.
@@ -109,7 +112,12 @@ class MotionTextClipDataset(Dataset[MotionTextSample]):
         self.maxLength = maxLength
         self.cacheMotion = cacheMotion
         self.skeletonNormalizer = skeletonNormalizer
-        self.motionCache: Dict[Path, MotionPayload] = {}
+        # LRU cache with size 1: keeps only the last loaded file
+        # Since prompts from the same file are consecutive, this avoids reloading
+        self._cachedPath: Optional[Path] = None
+        self._cachedMotion: Optional[Tuple] = None
+        self._cacheHits = 0
+        self._cacheMisses = 0
         self.records: List[ClipDatasetRecord] = self._buildIndex()
 
     def __len__(self) -> int:
@@ -138,7 +146,17 @@ class MotionTextClipDataset(Dataset[MotionTextSample]):
             Tokenized text fields and motion slice for contrastive training.
         """
         record = self.records[index]
-        motionSlice, meta = self._sliceMotion(record)
+        try:
+            motionSlice, meta = self._sliceMotion(record)
+        except Exception as e:
+            LOGGER.error(
+                "Failed to load sample %d from file: %s (frames %d-%d)",
+                index,
+                record.animationPath,
+                record.startFrame,
+                record.endFrame,
+            )
+            raise
         encoded = self._tokenize(record.tag, record.promptText)
         return {
             "input_ids": encoded["input_ids"],
@@ -240,7 +258,11 @@ class MotionTextClipDataset(Dataset[MotionTextSample]):
 
     def _loadMotion(self, path: Path) -> MotionPayload:
         """
-        Load motion from disk or memory cache.
+        Load motion from disk or LRU cache.
+        
+        Uses a single-entry LRU cache. Since prompts from the same animation
+        file are indexed consecutively, this avoids reloading the same file
+        multiple times within a batch or consecutive samples.
 
         Parameters
         ----------
@@ -252,15 +274,52 @@ class MotionTextClipDataset(Dataset[MotionTextSample]):
         MotionPayload
             Motion tensor and metadata.
         """
-        if self.cacheMotion and path in self.motionCache:
-            return self.motionCache[path]
+        # Check if this is the cached file
+        if self.cacheMotion and self._cachedPath == path and self._cachedMotion is not None:
+            self._cacheHits += 1
+            return self._cachedMotion
+        
+        # Cache miss - need to load from disk
+        self._cacheMisses += 1
+        LOGGER.debug(
+            "Loading motion file: %s (cache hits: %d, misses: %d)",
+            path,
+            self._cacheHits,
+            self._cacheMisses,
+        )
         motion, meta = loadAnimationPayload(
             path,
             skeletonNormalizer=self.skeletonNormalizer,
         )
+        
+        # Update LRU cache (replace previous entry)
         if self.cacheMotion:
-            self.motionCache[path] = (motion, meta)
+            self._cachedPath = path
+            self._cachedMotion = (motion, meta)
+        
         return motion, meta
+    
+    def clearCache(self) -> None:
+        """
+        Clear the motion cache.
+        
+        Call this between dataset rotations or when memory needs to be freed.
+        """
+        self._cachedPath = None
+        self._cachedMotion = None
+        LOGGER.debug(
+            "Motion cache cleared (total hits: %d, misses: %d)",
+            self._cacheHits,
+            self._cacheMisses,
+        )
+    
+    def getCacheStats(self) -> Dict[str, int]:
+        """Return cache hit/miss statistics."""
+        return {
+            "hits": self._cacheHits,
+            "misses": self._cacheMisses,
+            "hitRate": self._cacheHits / max(1, self._cacheHits + self._cacheMisses),
+        }
 
     @staticmethod
     def _composeText(tag: str, promptText: str) -> str:

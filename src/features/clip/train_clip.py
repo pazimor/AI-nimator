@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import gc
 from pathlib import Path
-from typing import Iterable, Mapping, Optional, Tuple
+from typing import Iterable, List, Mapping, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Subset, random_split
@@ -21,8 +22,76 @@ from src.shared.constants.clip import (
 from src.shared.logging_utils import logClipBatchStats
 from src.shared.model.clip.core import ClipModel
 from src.shared.model.clip.data import MotionTextClipDataset, motionTextCollate
+from src.shared.progress import TrainingProgressBar
 
 BatchDict = Mapping[str, object]
+
+
+class RotatingDatasetManager:
+    """Manage dataset rotation for training on chunks."""
+
+    def __init__(
+        self,
+        dataset: MotionTextClipDataset,
+        maxSamples: int,
+        batchSize: int,
+        validationSplit: float = 0.1,
+    ) -> None:
+        self.dataset = dataset
+        self.maxSamples = maxSamples
+        self.batchSize = batchSize
+        self.validationSplit = validationSplit
+        self.currentOffset = 0
+        self.totalSamples = len(dataset)
+        self.allIndices = list(range(self.totalSamples))
+
+    def getDataloaders(self) -> Tuple[DataLoader, Optional[DataLoader]]:
+        """Get train/val dataloaders for current chunk."""
+        import random
+
+        # Select chunk indices
+        endOffset = min(self.currentOffset + self.maxSamples, self.totalSamples)
+        chunkIndices = self.allIndices[self.currentOffset : endOffset]
+
+        # Wrap around if we hit the end
+        if len(chunkIndices) < self.maxSamples and self.currentOffset > 0:
+            remaining = self.maxSamples - len(chunkIndices)
+            chunkIndices.extend(self.allIndices[:remaining])
+
+        # Split into train/val
+        random.shuffle(chunkIndices)
+        valSize = max(1, int(len(chunkIndices) * self.validationSplit))
+        trainSize = len(chunkIndices) - valSize
+
+        trainIndices = chunkIndices[:trainSize]
+        valIndices = chunkIndices[trainSize:]
+
+        trainSubset = Subset(self.dataset, trainIndices)
+        valSubset = Subset(self.dataset, valIndices)
+
+        trainLoader = DataLoader(
+            trainSubset,
+            batch_size=self.batchSize,
+            shuffle=True,
+            collate_fn=motionTextCollate,
+        )
+        valLoader = DataLoader(
+            valSubset,
+            batch_size=self.batchSize,
+            shuffle=False,
+            collate_fn=motionTextCollate,
+        )
+
+        return trainLoader, valLoader
+
+    def rotate(self) -> None:
+        """Advance to next chunk for next epoch."""
+        self.currentOffset = (self.currentOffset + self.maxSamples) % self.totalSamples
+
+    def getProgress(self) -> str:
+        """Return string describing current position in dataset."""
+        endOffset = min(self.currentOffset + self.maxSamples, self.totalSamples)
+        return f"samples {self.currentOffset + 1}-{endOffset}/{self.totalSamples}"
 
 
 def buildDataloader(
@@ -70,6 +139,7 @@ def buildDataloader(
 def buildOptimizer(
     model: ClipModel,
     learningRate: float = DEFAULT_LEARNING_RATE,
+    weightDecay: float = 0.0,
 ) -> torch.optim.Optimizer:
     """
     Create the AdamW optimizer covering learnable modules.
@@ -80,13 +150,19 @@ def buildOptimizer(
         Model containing the trainable parameters.
     learningRate : float, optional
         Learning rate provided to AdamW.
+    weightDecay : float, optional
+        L2 regularization weight (default 0.0).
 
     Returns
     -------
     torch.optim.Optimizer
         Configured optimizer instance.
     """
-    return torch.optim.AdamW(_trainableParameters(model), lr=learningRate)
+    return torch.optim.AdamW(
+        _trainableParameters(model), 
+        lr=learningRate,
+        weight_decay=weightDecay,
+    )
 
 
 def trainOneEpoch(
@@ -94,6 +170,9 @@ def trainOneEpoch(
     model: ClipModel,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    epoch: int = 1,
+    totalEpochs: int = 1,
+    chunkInfo: Optional[str] = None,
 ) -> float:
     """
     Run a single training epoch and return the average loss.
@@ -108,6 +187,12 @@ def trainOneEpoch(
         Optimizer handling gradient updates.
     device : torch.device
         Target device where tensors are moved.
+    epoch : int
+        Current epoch number (1-based).
+    totalEpochs : int
+        Total number of epochs.
+    chunkInfo : Optional[str]
+        Optional description of current dataset chunk.
 
     Returns
     -------
@@ -115,13 +200,20 @@ def trainOneEpoch(
         Average training loss across the epoch.
     """
     model.train()
-    totalLoss = 0.0
-    for batchIndex, batch in enumerate(dataloader):
-        batchLoss, outputs = _runBatch(batch, model, optimizer, device)
-        totalLoss += batchLoss
-        if batchIndex % BATCH_LOG_FREQUENCY == 0:
-            logClipBatchStats(batchIndex, outputs)
-    return totalLoss / max(len(dataloader), 1)
+
+    with TrainingProgressBar(
+        dataloader,
+        epoch=epoch,
+        totalEpochs=totalEpochs,
+        desc="CLIP",
+        device=device,
+        chunkInfo=chunkInfo,
+    ) as pbar:
+        for batch in pbar:
+            batchLoss, outputs = _runBatch(batch, model, optimizer, device)
+            pbar.updateLoss(batchLoss)
+
+        return pbar.metrics.avgLoss
 
 
 def demoTrainingRun(
@@ -268,6 +360,120 @@ def _runBatch(
     loss.backward()
     optimizer.step()
     return float(loss.detach().item()), outputs
+
+
+def _runBatchAccumulate(
+    batch: BatchDict,
+    model: ClipModel,
+    device: torch.device,
+    accumulationSteps: int,
+) -> tuple[float, Mapping[str, torch.Tensor]]:
+    """
+    Execute a forward/backward pass for gradient accumulation.
+
+    Parameters
+    ----------
+    batch : BatchDict
+        Mini-batch emitted by the dataloader.
+    model : ClipModel
+        CLIP model under training.
+    device : torch.device
+        Target device where tensors reside.
+    accumulationSteps : int
+        Number of steps to accumulate gradients over.
+
+    Returns
+    -------
+    tuple[float, Mapping[str, torch.Tensor]]
+        Detached loss value and model outputs.
+    """
+    outputs = model(
+        textInputIds=_toDevice(batch["input_ids"], device),
+        textAttentionMask=_toDevice(batch["attention_mask"], device),
+        motionInput=_toDevice(batch["motion"], device),
+        computeLoss=True,
+    )
+    loss = outputs["clip_loss"] / accumulationSteps
+    loss.backward()
+    return float(outputs["clip_loss"].detach().item()), outputs
+
+
+def trainOneEpochWithAccumulation(
+    dataloader: Iterable[BatchDict],
+    model: ClipModel,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    accumulationSteps: int = 1,
+    epoch: int = 1,
+    totalEpochs: int = 1,
+    chunkInfo: Optional[str] = None,
+    memoryLimitGB: float = 0.0,
+) -> float:
+    """
+    Run a single training epoch with gradient accumulation.
+
+    Parameters
+    ----------
+    dataloader : Iterable[BatchDict]
+        Iterable yielding MotionTextClipDataset batches.
+    model : ClipModel
+        Model under training.
+    optimizer : torch.optim.Optimizer
+        Optimizer handling gradient updates.
+    device : torch.device
+        Target device where tensors are moved.
+    accumulationSteps : int
+        Number of batches to accumulate before stepping.
+    epoch : int
+        Current epoch number (1-based).
+    totalEpochs : int
+        Total number of epochs.
+    chunkInfo : Optional[str]
+        Optional description of current dataset chunk.
+    memoryLimitGB : float
+        Maximum memory usage in GB before triggering cleanup (0 = disabled).
+
+    Returns
+    -------
+    float
+        Average training loss across the epoch.
+    """
+    model.train()
+    optimizer.zero_grad()
+    
+    # Setup memory manager
+    from src.shared.dataset_manager import MemoryManager, MemoryManagerConfig
+    memoryConfig = MemoryManagerConfig(MM_memoryLimitGB=memoryLimitGB)
+    memoryManager = MemoryManager(memoryConfig, device)
+
+    with TrainingProgressBar(
+        dataloader,
+        epoch=epoch,
+        totalEpochs=totalEpochs,
+        desc="CLIP",
+        device=device,
+        chunkInfo=chunkInfo,
+    ) as pbar:
+        for batchIndex, batch in enumerate(pbar):
+            batchLoss, outputs = _runBatchAccumulate(
+                batch, model, device, accumulationSteps
+            )
+            pbar.updateLoss(batchLoss)
+
+            # Step optimizer every accumulationSteps batches
+            if (batchIndex + 1) % accumulationSteps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+            
+            # Check memory and cleanup if needed
+            memoryManager.checkAndCleanup(batchIndex)
+
+        # Handle remaining gradients
+        if len(dataloader) % accumulationSteps != 0:
+            optimizer.step()
+            optimizer.zero_grad()
+
+        return pbar.metrics.avgLoss
 
 
 def _trainableParameters(model: ClipModel) -> list[torch.nn.Parameter]:

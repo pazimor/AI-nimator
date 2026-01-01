@@ -39,6 +39,12 @@ from .generation import (
     GenerationTrainingResult,
     validateTag,
 )
+from .network import (
+    ClipNetworkConfig,
+    GenerationNetworkConfig,
+    LearningRateHyperparameters,
+    NetworkConfig,
+)
 
 
 @dataclass(frozen=True)
@@ -97,4 +103,9 @@ __all__ = [
     "GenerationTrainingPaths",
     "GenerationTrainingResult",
     "validateTag",
+    # Network and LR types
+    "ClipNetworkConfig",
+    "GenerationNetworkConfig",
+    "LearningRateHyperparameters",
+    "NetworkConfig",
 ]

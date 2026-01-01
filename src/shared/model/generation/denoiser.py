@@ -197,7 +197,7 @@ class DenoiserBlock(nn.Module):
         # RoPE positional encoding
         h = self.rope(h)
 
-        # Multi-head attention
+        # Multi-head attention for temporal relationships
         h = h + self.attention(self.norm(h))
 
         # Transform layer with AdaLN conditioning

@@ -27,17 +27,23 @@ class DDIM(nn.Module):
         self.num_timesteps = num_timesteps
         
         # Define beta schedule (linear)
-        self.betas = torch.linspace(beta_start, beta_end, num_timesteps)
-        self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-        self.alphas_cumprod_prev = torch.cat([torch.tensor([1.0]), self.alphas_cumprod[:-1]])
+        betas = torch.linspace(beta_start, beta_end, num_timesteps)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = torch.cat([torch.tensor([1.0]), alphas_cumprod[:-1]])
+        
+        # Register as buffers so they move with .to(device)
+        self.register_buffer("betas", betas)
+        self.register_buffer("alphas", alphas)
+        self.register_buffer("alphas_cumprod", alphas_cumprod)
+        self.register_buffer("alphas_cumprod_prev", alphas_cumprod_prev)
         
         # Calculations for diffusion q(x_t | x_{t-1}) and others
-        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
-        self.log_one_minus_alphas_cumprod = torch.log(1.0 - self.alphas_cumprod)
-        self.sqrt_recip_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod)
-        self.sqrt_recipm1_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod - 1)
+        self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
+        self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
+        self.register_buffer("log_one_minus_alphas_cumprod", torch.log(1.0 - alphas_cumprod))
+        self.register_buffer("sqrt_recip_alphas_cumprod", torch.sqrt(1.0 / alphas_cumprod))
+        self.register_buffer("sqrt_recipm1_alphas_cumprod", torch.sqrt(1.0 / alphas_cumprod - 1))
 
     def q_sample(self, x_start: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None) -> torch.Tensor:
         """
@@ -107,5 +113,6 @@ class DDIM(nn.Module):
             Extracted and reshaped tensor.
         """
         batch_size = t.shape[0]
-        out = a.gather(-1, t.cpu())
-        return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device)
+        # Ensure both tensors are on the same device for gather
+        out = a.to(t.device).gather(-1, t)
+        return out.reshape(batch_size, *((1,) * (len(x_shape) - 1)))

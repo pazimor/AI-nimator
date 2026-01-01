@@ -49,18 +49,8 @@ class GenerationTrainingHyperparameters:
     ----------
     batchSize : int
         Batch size passed to the dataloader.
-    learningRate : float
-        Optimizer learning rate.
     epochs : int
         Number of full epochs to run.
-    embedDim : int
-        Dimension of the shared embedding space (must match CLIP).
-    numHeads : int
-        Number of attention heads in the denoiser.
-    numLayers : int
-        Number of denoising transformer layers.
-    diffusionSteps : int
-        Number of diffusion timesteps.
     device : str
         Requested device backend ("auto", "cuda", "cpu", "mps").
     validationSplit : float
@@ -73,22 +63,40 @@ class GenerationTrainingHyperparameters:
         Hugging Face identifier for the XLM-Roberta tokenizer.
     resumeCheckpoint : Optional[Path]
         Path to a checkpoint file to resume training from.
+    
+    Learning Rate Configuration
+    ---------------------------
+    learningRate : float
+        Initial/base learning rate.
+    lrMin : float
+        Minimum learning rate floor.
+    lrWarmupEpochs : int
+        Number of warmup epochs (0 to disable).
+    lrSchedule : str
+        Schedule type: "constant", "cosine", "linear", "step".
+    lrDecayEpochs : Optional[int]
+        Decay phase length (default: epochs - warmup).
     """
 
     batchSize: int
-    learningRate: float
     epochs: int
-    embedDim: int = 64
-    numHeads: int = 4
-    numLayers: int = 6
-    numBones: int = 22  # Number of skeleton bones in the dataset
-    diffusionSteps: int = 1000
     device: str = "auto"
     validationSplit: float = 0.1
     earlyStoppingPatience: int = 5
     maxPromptLength: int = 64
     modelName: str = "xlm-roberta-base"
     resumeCheckpoint: Optional[Path] = None
+    MM_memoryLimitGB: float = 0.0  # Memory limit in GB (0 = disabled)
+    maxSamples: Optional[int] = None  # Limit dataset size (None = use all)
+    gradientAccumulation: int = 1  # Accumulate gradients over N batches
+    rotateDataset: bool = False  # Rotate through dataset chunks each epoch
+    
+    # Learning Rate Configuration
+    learningRate: float = 0.001
+    lrMin: float = 1e-7
+    lrWarmupEpochs: int = 0
+    lrSchedule: str = "cosine"
+    lrDecayEpochs: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -102,10 +110,13 @@ class GenerationTrainingConfig:
         Filesystem layout for dataset and checkpoints.
     training : GenerationTrainingHyperparameters
         Hyperparameters controlling optimization.
+    networkConfigPath : Optional[Path]
+        Path to network.yaml for architecture configuration.
     """
 
     paths: GenerationTrainingPaths
     training: GenerationTrainingHyperparameters
+    networkConfigPath: Optional[Path] = None
 
 
 @dataclass(frozen=True)

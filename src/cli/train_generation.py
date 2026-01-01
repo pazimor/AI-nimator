@@ -4,20 +4,24 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 from pathlib import Path
 from typing import Optional
 
 import torch
 
-from src.features.generation.config_loader import loadGenerationConfig
+from src.shared.config_loader import loadGenerationConfig
 from src.features.generation.train_generation import (
     buildOptimizer,
     buildTrainValDataloaders,
     evaluateValidation,
     loadCheckpoint,
+    RotatingDatasetManager,
     saveCheckpoint,
     trainOneEpoch,
 )
+from src.shared.config_loader import loadNetworkConfig
+from src.shared.learning_rate import LearningRateScheduler, LearningRateConfig
 from src.shared.model.generation.ddim import DDIM
 from src.shared.model.generation.motion_generator import MotionGenerator
 from src.shared.types import GenerationTrainingConfig, GenerationTrainingResult
@@ -44,6 +48,13 @@ def buildArgumentParser() -> argparse.ArgumentParser:
         default=DEFAULT_CONFIG_PATH,
         help="Path to the generation training YAML configuration file.",
     )
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default=None,
+        help="Configuration profile to use (e.g., 'spark' for DGX Spark). "
+             "If not specified, uses 'training' section.",
+    )
     return parser
 
 
@@ -55,8 +66,11 @@ def main() -> None:
 
     try:
         configPath = _validateConfigPath(arguments.config)
-        config = loadGenerationConfig(configPath)
+        config = loadGenerationConfig(configPath, profile=arguments.profile)
+        if arguments.profile:
+            LOGGER.info("Using profile: %s", arguments.profile)
         result = _runTraining(config)
+        
         parser.exit(
             0,
             f"Training finished with loss={result.finalLoss:.4f} "
@@ -85,27 +99,76 @@ def _runTraining(
     """
     device = _resolveDevice(config.training.device)
     LOGGER.info("Using device: %s", device)
+    
+    # Log effective batch size
+    effectiveBatchSize = config.training.batchSize * config.training.gradientAccumulation
+    LOGGER.info(
+        "Batch size: %d x %d accumulation = %d effective",
+        config.training.batchSize,
+        config.training.gradientAccumulation,
+        effectiveBatchSize,
+    )
 
-    # Build dataloaders
-    trainLoader, valLoader = buildTrainValDataloaders(
-        datasetRoot=config.paths.datasetRoot,
-        maxLength=config.training.maxPromptLength,
-        batchSize=config.training.batchSize,
-        modelName=config.training.modelName,
-        validationSplit=config.training.validationSplit,
+    # Setup dataset manager based on rotation mode
+    datasetManager: Optional[RotatingDatasetManager] = None
+    trainLoader = None
+    valLoader = None
+    
+    if config.training.rotateDataset and config.training.maxSamples:
+        # Use rotating dataset manager
+        datasetManager = RotatingDatasetManager(
+            datasetRoot=config.paths.datasetRoot,
+            maxLength=config.training.maxPromptLength,
+            batchSize=config.training.batchSize,
+            modelName=config.training.modelName,
+            validationSplit=config.training.validationSplit,
+            chunkSize=config.training.maxSamples,
+        )
+        LOGGER.info(
+            "Dataset rotation enabled: %d samples per epoch, %d total samples",
+            config.training.maxSamples,
+            datasetManager.totalSize,
+        )
+        epochsToSeeAll = math.ceil(datasetManager.totalSize / config.training.maxSamples)
+        LOGGER.info(
+            "Full dataset coverage every %d epochs",
+            epochsToSeeAll,
+        )
+    else:
+        # Build static dataloaders
+        trainLoader, valLoader = buildTrainValDataloaders(
+            datasetRoot=config.paths.datasetRoot,
+            maxLength=config.training.maxPromptLength,
+            batchSize=config.training.batchSize,
+            modelName=config.training.modelName,
+            validationSplit=config.training.validationSplit,
+            maxSamples=config.training.maxSamples,
+        )
+        LOGGER.info(
+            "Dataset loaded: %d training batches",
+            len(trainLoader),
+        )
+
+    # Load network configuration
+    networkConfig = loadNetworkConfig(
+        configPath=config.networkConfigPath,
+        profile=None,  # Profile is determined by the training config
     )
     LOGGER.info(
-        "Dataset loaded: %d training batches",
-        len(trainLoader),
+        "Network config: embed_dim=%d, num_heads=%d, num_layers=%d, diffusion_steps=%d",
+        networkConfig.embedDim,
+        networkConfig.generation.numHeads,
+        networkConfig.generation.numLayers,
+        networkConfig.generation.diffusionSteps,
     )
 
-    # Build model
+    # Build model with network config
     model = MotionGenerator(
-        embedDim=config.training.embedDim,
-        numHeads=config.training.numHeads,
-        numLayers=config.training.numLayers,
-        numBones=config.training.numBones,
-        diffusionSteps=config.training.diffusionSteps,
+        embedDim=networkConfig.embedDim,
+        numHeads=networkConfig.generation.numHeads,
+        numLayers=networkConfig.generation.numLayers,
+        numBones=networkConfig.generation.numBones,
+        diffusionSteps=networkConfig.generation.diffusionSteps,
         modelName=config.training.modelName,
         clipCheckpoint=config.paths.clipCheckpoint,
     ).to(device)
@@ -117,16 +180,22 @@ def _runTraining(
         learningRate=config.training.learningRate,
     )
 
-    # Build DDIM scheduler
-    ddim = DDIM(num_timesteps=config.training.diffusionSteps)
+    # Build DDIM scheduler and move to device
+    ddim = DDIM(num_timesteps=networkConfig.generation.diffusionSteps).to(device)
 
-    # Move DDIM buffers to device
-    ddim.betas = ddim.betas.to(device)
-    ddim.alphas = ddim.alphas.to(device)
-    ddim.alphas_cumprod = ddim.alphas_cumprod.to(device)
-    ddim.alphas_cumprod_prev = ddim.alphas_cumprod_prev.to(device)
-    ddim.sqrt_alphas_cumprod = ddim.sqrt_alphas_cumprod.to(device)
-    ddim.sqrt_one_minus_alphas_cumprod = ddim.sqrt_one_minus_alphas_cumprod.to(device)
+    # Learning rate scheduler with configurable warmup and decay
+    lrConfig = LearningRateConfig(
+        initialLR=config.training.learningRate,
+        minLR=config.training.lrMin,
+        warmupEpochs=config.training.lrWarmupEpochs,
+        scheduleType=config.training.lrSchedule,
+        decayEpochs=config.training.lrDecayEpochs,
+    )
+    scheduler = LearningRateScheduler(
+        optimizer=optimizer,
+        config=lrConfig,
+        totalEpochs=config.training.epochs,
+    )
 
     bestValLoss: Optional[float] = None
     epochsWithoutImprovement = 0
@@ -153,14 +222,26 @@ def _runTraining(
     # Training loop
     for epochIndex in range(startEpoch, config.training.epochs):
         epochsRun = epochIndex + 1 - startEpoch
-        LOGGER.info(
-            "Starting epoch %s/%s",
-            epochIndex + 1,
-            config.training.epochs,
-        )
+        currentLr = optimizer.param_groups[0]['lr']
+        
+        # Get dataloaders for this epoch (rotating or static)
+        chunkInfo: Optional[str] = None
+        if datasetManager is not None:
+            trainLoader, valLoader, startIdx, endIdx = datasetManager.getDataloadersForEpoch(epochIndex)
+            chunkInfo = f"samples {startIdx+1}-{endIdx}"
 
-        trainLoss = trainOneEpoch(trainLoader, model, optimizer, ddim, device)
-        LOGGER.info("Epoch %s train loss: %.4f", epochIndex + 1, trainLoss)
+        trainLoss = trainOneEpoch(
+            trainLoader, model, optimizer, ddim, device,
+            gradientAccumulation=config.training.gradientAccumulation,
+            epoch=epochIndex + 1,
+            totalEpochs=config.training.epochs,
+            chunkInfo=chunkInfo,
+            memoryLimitGB=config.training.MM_memoryLimitGB,
+        )
+        LOGGER.info("Epoch %s train loss: %.4f (lr=%.6f)", epochIndex + 1, trainLoss, currentLr)
+        
+        # Update learning rate
+        scheduler.step()
 
         # Validation evaluation
         if valLoader is not None:
@@ -211,7 +292,6 @@ def _runTraining(
         finalLoss=finalLoss,
         device=device.type,
     )
-
 
 def _resolveDevice(choice: str) -> torch.device:
     """

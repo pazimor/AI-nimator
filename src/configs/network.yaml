@@ -1,0 +1,63 @@
+# ============================================
+# Network Architecture Configuration
+# ============================================
+# This file defines the neural network architecture for both
+# CLIP and Generation models. The embed-dim is shared between
+# both models to ensure compatibility.
+#
+# Use --profile spark to select the DGX Spark configuration.
+# ============================================
+
+# ============================================
+# Profile: Mac (32GB RAM, MPS GPU)
+# Default profile for local development
+# ============================================
+default:
+  # Shared embedding dimension (MUST be the same for CLIP and Generation)
+  embed-dim: 128
+  
+  # CLIP Motion Encoder Architecture
+  clip:
+    motion-num-heads: 4
+    motion-num-layers: 2
+  
+  # Generation Denoiser Architecture
+  generation:
+    num-heads: 4
+    num-layers: 3
+    num-bones: 22
+    diffusion-steps: 100
+
+# ============================================
+# Profile: DGX Spark (128GB RAM, GB10 GPU)
+# Use with: --profile spark
+# ============================================
+spark:
+  embed-dim: 256
+  
+  clip:
+    motion-num-heads: 8
+    motion-num-layers: 4
+
+  generation:
+    num-heads: 8
+    num-layers: 8
+    num-bones: 22
+    diffusion-steps: 500
+
+# ============================================
+# Profile: Lightweight (for testing/debugging)
+# Use with: --profile lightweight
+# ============================================
+lightweight:
+  embed-dim: 64
+  
+  clip:
+    motion-num-heads: 2
+    motion-num-layers: 1
+  
+  generation:
+    num-heads: 2
+    num-layers: 2
+    num-bones: 22
+    diffusion-steps: 50

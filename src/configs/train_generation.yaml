@@ -1,20 +1,54 @@
 paths:
-  dataset-root: "/Volumes/oui/dataset_used/dataset"
+  dataset-root: "/Users/eddy.hummel/dataset"
   clip-checkpoint: "output/checkpoints/best_model.pt"
   checkpoint-dir: "output/generation_checkpoints"
+  # Network architecture is loaded from network.yaml
+  network-config: "network.yaml"
 
+# ============================================
+# Profile: Mac (32GB RAM, MPS GPU)
+# ============================================
 training:
-  batch-size: 2
-  learning-rate: 0.0001
-  epochs: 500
-  embed-dim: 64  # Must match CLIP checkpoint
-  num-heads: 6
-  num-layers: 4
-  num-bones: 22  # Number of skeleton bones in the dataset
-  diffusion-steps: 1000
-  device: cpu
-  max-length: 64
+  epochs: 50
+  device: mps
+  max-length: 32
   model-name: xlm-roberta-base
   validation-split: 0.1
-  early-stopping-patience: 5
+  early-stopping-patience: 50
+  batch-size: 2
+  gradient-accumulation: 8
+  max-samples: 2000
+  rotate-dataset: true
+  MM-memory-limit-gb: 20.0
+  resume-checkpoint: output/generation_checkpoints/best_model.pt
+  
+  # Learning Rate Configuration
+  learning-rate: 0.001       # Initial/base learning rate
+  lr-min: 0.000001            # Minimum LR floor (1e-6)
+  lr-warmup-epochs: 10        # Warmup epochs (0 to disable)
+  lr-schedule: cosine         # Schedule type: constant, cosine, linear, step
+  # lr-decay-epochs: 500      # Optional: decay phase length (default: epochs - warmup)
+
+# ============================================
+# Profile: DGX Spark (128GB RAM, GB10 GPU)
+# Use with: --profile spark
+# ============================================
+spark:
+  epochs: 200
+  device: cuda
+  max-length: 32
+  model-name: xlm-roberta-base
+  validation-split: 0.1
+  early-stopping-patience: 30
+  batch-size: 32
+  gradient-accumulation: 1
+  max-samples: null
+  rotate-dataset: false
+  MM-memory-limit-gb: 0.0
   # resume-checkpoint: output/generation_checkpoints/best_model.pt
+  
+  # Learning Rate Configuration
+  learning-rate: 0.001
+  lr-min: 0.00001
+  lr-warmup-epochs: 20
+  lr-schedule: cosine

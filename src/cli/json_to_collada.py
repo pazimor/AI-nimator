@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from src.features.dataset_builder.animation_rebuilder import AnimationRebuilder
-from src.features.dataset_builder.config_loader import loadBuilderConfig
+from src.shared.config_loader import loadBuilderConfig
 from src.shared.quaternion import Rotation
 from src.shared.types import AnimationSample
 

@@ -26,6 +26,8 @@ class ClipModel(nn.Module):
         tokenizer: Optional[PreTrainedTokenizerBase] = None,
         textEncoder: Optional[XLMRobertaModel] = None,
         freezeTextEncoder: bool = True,
+        motionNumHeads: int = 4,
+        motionNumLayers: int = 2,
     ) -> None:
         """
         Initialize ClipModel.
@@ -42,21 +44,31 @@ class ClipModel(nn.Module):
             Pre-initialized text encoder for testing or specialization.
         freezeTextEncoder : bool, optional
             When True the XLM-R encoder is frozen.
+        motionNumHeads : int, optional
+            Number of attention heads in motion encoder, by default 4.
+        motionNumLayers : int, optional
+            Number of transformer layers in motion encoder, by default 2.
         """
         super().__init__()
         self.modelName = modelName
         self.textEncoder = textEncoder or XLMRobertaModel.from_pretrained(
             modelName,
+            low_cpu_mem_usage=True,  # Reduce memory during loading
         )
         if freezeTextEncoder:
             self._freezeTextEncoder()
+            self.textEncoder.eval()  # Set to eval mode to save memory (no dropout)
         self.tokenizer = tokenizer or XLMRobertaTokenizerFast.from_pretrained(
             modelName,
         )
 
         hiddenSize = self.textEncoder.config.hidden_size
         self.textProj = nn.Linear(hiddenSize, embedDim)
-        self.motionBackbone = TemporalUNet(embedDim=embedDim)
+        self.motionBackbone = TemporalUNet(
+            embedDim=embedDim,
+            numHeads=motionNumHeads,
+            numLayers=motionNumLayers,
+        )
         self.motionProj = nn.Linear(embedDim, embedDim)
         self.logitScale = nn.Parameter(torch.ones([]) * DEFAULT_LOGIT_SCALE)
 

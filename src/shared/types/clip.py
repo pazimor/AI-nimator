@@ -166,14 +166,10 @@ class ClipTrainingHyperparameters:
         Maximum token length used by the tokenizer.
     modelName : str
         Hugging Face identifier for the tokenizer/model.
-    learningRate : float
-        Optimizer learning rate.
     epochs : int
         Number of full epochs to run.
     device : str
         Requested device backend ("auto", "cuda", "cpu", "mps").
-    embedDim : int
-        Dimension of the shared CLIP embedding space.
     validationSplit : float
         Fraction of dataset reserved for validation (0.0-1.0).
     earlyStoppingPatience : int
@@ -182,19 +178,52 @@ class ClipTrainingHyperparameters:
         Directory to save model checkpoints.
     resumeCheckpoint : Optional[Path]
         Path to a checkpoint file to resume training from.
+    gradientAccumulation : int
+        Number of batches to accumulate before optimizer step.
+    maxSamples : Optional[int]
+        Maximum number of samples per epoch (for dataset rotation).
+    rotateDataset : bool
+        Whether to rotate through dataset chunks each epoch.
+    MM_memoryLimitGB : float
+        Maximum memory usage in GB before triggering cleanup (0 to disable).
+    weightDecay : float
+        Weight decay for regularization.
+    
+    Learning Rate Configuration
+    ---------------------------
+    learningRate : float
+        Initial/base learning rate.
+    lrMin : float
+        Minimum learning rate floor.
+    lrWarmupEpochs : int
+        Number of warmup epochs (0 to disable).
+    lrSchedule : str
+        Schedule type: "constant", "cosine", "linear", "step".
+    lrDecayEpochs : Optional[int]
+        Decay phase length (default: epochs - warmup).
     """
 
     batchSize: int
     maxPromptLength: int
     modelName: str
-    learningRate: float
     epochs: int
     device: str = "auto"
-    embedDim: int = 512
     validationSplit: float = 0.1
     earlyStoppingPatience: int = 3
     checkpointDir: Optional[Path] = None
     resumeCheckpoint: Optional[Path] = None
+    gradientAccumulation: int = 1
+    maxSamples: Optional[int] = None
+    rotateDataset: bool = False
+    MM_memoryLimitGB: float = 0.0
+    weightDecay: float = 0.0
+    
+    # Learning Rate Configuration
+    learningRate: float = 0.001
+    lrMin: float = 1e-7
+    lrWarmupEpochs: int = 0
+    lrSchedule: str = "cosine"
+    lrDecayEpochs: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -208,10 +237,13 @@ class ClipTrainingConfig:
         Filesystem layout for prompts and animations.
     training : ClipTrainingHyperparameters
         Hyperparameters controlling optimization.
+    networkConfigPath : Optional[Path]
+        Path to network.yaml for architecture configuration.
     """
 
     paths: ClipTrainingPaths
     training: ClipTrainingHyperparameters
+    networkConfigPath: Optional[Path] = None
 
 
 @dataclass(frozen=True)

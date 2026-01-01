@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from src.features.dataset_builder.config_loader import loadBuilderConfig
+from src.shared.config_loader import loadBuilderConfig
 from src.features.dataset_builder.dataset_builder import DatasetBuilder
 from src.shared.types import DatasetBuildOptions
 

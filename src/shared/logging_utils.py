@@ -7,7 +7,7 @@ from typing import Mapping, Sequence
 
 import torch
 
-LOGGER = logging.getLogger("clip.training")
+LOGGER = logging.getLogger("shared.logging_utils")
 
 
 def logClipBatchStats(

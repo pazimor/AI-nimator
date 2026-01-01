@@ -8,16 +8,23 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+from torch.utils.data import DataLoader
 
-from src.features.clip.config_loader import loadTrainingConfig
+from src.shared.config_loader import loadTrainingConfig
 from src.features.clip.train_clip import (
+    RotatingDatasetManager,
     buildOptimizer,
     buildTrainValDataloaders,
     evaluateValidation,
     loadCheckpoint,
     saveCheckpoint,
     trainOneEpoch,
+    trainOneEpochWithAccumulation,
+    _buildDataset,
+    _buildTokenizer,
 )
+from src.shared.config_loader import loadNetworkConfig
+from src.shared.learning_rate import LearningRateScheduler, LearningRateConfig
 from src.shared.model.clip.core import ClipModel
 from src.shared.types import ClipTrainingConfig, ClipTrainingResult
 
@@ -43,6 +50,12 @@ def buildArgumentParser() -> argparse.ArgumentParser:
         default=DEFAULT_CONFIG_PATH,
         help="Path to the CLIP training YAML configuration file.",
     )
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default=None,
+        help="Configuration profile to use (e.g., 'spark' for DGX Spark).",
+    )
     return parser
 
 
@@ -55,7 +68,7 @@ def main() -> None:
     arguments = parser.parse_args()
     try:
         configPath = _validateConfigPath(arguments.config)
-        config = loadTrainingConfig(configPath)
+        config = loadTrainingConfig(configPath, profile=arguments.profile)
         result = _runTraining(config)
         parser.exit(
             0,
@@ -84,27 +97,96 @@ def _runTraining(
         Dataclass describing the training outcome.
     """
     device = _resolveDevice(config.training.device)
-    trainLoader, valLoader = buildTrainValDataloaders(
-        promptRoot=config.paths.promptRoot,
-        animationRoot=config.paths.animationRoot,
-        maxLength=config.training.maxPromptLength,
-        batchSize=config.training.batchSize,
-        modelName=config.training.modelName,
-        validationSplit=config.training.validationSplit,
+    
+    # Load network architecture config
+    networkConfigPath = Path(config.training.networkConfigPath)
+    networkConfig = loadNetworkConfig(networkConfigPath, profile=config.training.networkProfile)
+    
+    # Build model with motion encoder parameters
+    LOGGER.info(
+        "Building CLIP model with embed_dim=%d, motion_heads=%d, motion_layers=%d",
+        networkConfig.embedDim,
+        networkConfig.clip.motionNumHeads,
+        networkConfig.clip.motionNumLayers,
     )
     model = ClipModel(
         modelName=config.training.modelName,
-        embedDim=config.training.embedDim,
+        embedDim=networkConfig.embedDim,
+        motionNumHeads=networkConfig.clip.motionNumHeads,
+        motionNumLayers=networkConfig.clip.motionNumLayers,
     ).to(device)
+    
+    # Log model size
+    totalParams = sum(p.numel() for p in model.parameters())
+    trainableParams = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    LOGGER.info(
+        "Model params: %s total, %s trainable",
+        f"{totalParams:,}",
+        f"{trainableParams:,}",
+    )
+    
     optimizer = buildOptimizer(
         model=model,
         learningRate=config.training.learningRate,
+        weightDecay=config.training.weightDecay,
     )
+    
+    # Learning rate scheduler with warmup
+    lrConfig = LearningRateConfig(
+        baseLr=config.training.learningRate,
+        minLr=config.training.lrMin,
+        warmupEpochs=config.training.lrWarmupEpochs,
+        totalEpochs=config.training.epochs,
+        schedule=config.training.lrSchedule,
+        decayEpochs=config.training.lrDecayEpochs,
+    )
+    lrScheduler = LearningRateScheduler(lrConfig)
+    scheduler = lrScheduler.buildScheduler(optimizer)
+    LOGGER.info(
+        "Using LR scheduler: %d warmup epochs, schedule=%s, min_lr=%.2e",
+        config.training.lrWarmupEpochs,
+        config.training.lrSchedule,
+        config.training.lrMin,
+    )
+
+    # Setup dataset manager (rotating or static)
+    rotatingManager: Optional[RotatingDatasetManager] = None
+    trainLoader: Optional[DataLoader] = None
+    valLoader: Optional[DataLoader] = None
+    
+    if config.training.rotateDataset and config.training.maxSamples:
+        LOGGER.info(
+            "Using rotating dataset with %d samples per epoch",
+            config.training.maxSamples,
+        )
+        dataset = _buildDataset(
+            promptRoot=config.paths.promptRoot,
+            animationRoot=config.paths.animationRoot,
+            tokenizer=_buildTokenizer(config.training.modelName),
+            maxLength=config.training.maxPromptLength,
+        )
+        rotatingManager = RotatingDatasetManager(
+            dataset=dataset,
+            maxSamples=config.training.maxSamples,
+            batchSize=config.training.batchSize,
+            validationSplit=config.training.validationSplit,
+        )
+        LOGGER.info("Total dataset size: %d samples", len(dataset))
+    else:
+        trainLoader, valLoader = buildTrainValDataloaders(
+            promptRoot=config.paths.promptRoot,
+            animationRoot=config.paths.animationRoot,
+            maxLength=config.training.maxPromptLength,
+            batchSize=config.training.batchSize,
+            modelName=config.training.modelName,
+            validationSplit=config.training.validationSplit,
+        )
 
     bestValLoss: Optional[float] = None
     epochsWithoutImprovement = 0
     startEpoch = 0
     trainLoss = 0.0
+    epochsRun = 0
 
     # Resume from checkpoint if specified
     if config.training.resumeCheckpoint is not None:
@@ -122,14 +204,41 @@ def _runTraining(
             resumedLoss,
         )
 
+    useAccumulation = config.training.gradientAccumulation > 1
+
     for epochIndex in range(startEpoch, config.training.epochs):
-        epochsRun = epochIndex + 1 - startEpoch
-        LOGGER.info(
-            "Starting epoch %s/%s",
-            epochsRun,
-            config.training.epochs,
-        )
-        trainLoss = trainOneEpoch(trainLoader, model, optimizer, device)
+        epochsRun = epochIndex + 1
+        
+        # Get dataloaders (rotating or static)
+        chunkInfo: Optional[str] = None
+        if rotatingManager is not None:
+            trainLoader, valLoader = rotatingManager.getDataloaders()
+            chunkInfo = rotatingManager.getProgress()
+
+        # Training
+        if useAccumulation:
+            trainLoss = trainOneEpochWithAccumulation(
+                trainLoader,
+                model,
+                optimizer,
+                device,
+                accumulationSteps=config.training.gradientAccumulation,
+                epoch=epochsRun,
+                totalEpochs=config.training.epochs,
+                chunkInfo=chunkInfo,
+                memoryLimitGB=config.training.MM_memoryLimitGB,
+            )
+        else:
+            trainLoss = trainOneEpoch(
+                trainLoader,
+                model,
+                optimizer,
+                device,
+                epoch=epochsRun,
+                totalEpochs=config.training.epochs,
+                chunkInfo=chunkInfo,
+            )
+        
         LOGGER.info("Epoch %s train loss: %.4f", epochsRun, trainLoss)
 
         # Validation evaluation
@@ -164,6 +273,14 @@ def _runTraining(
                     epochsWithoutImprovement,
                 )
                 break
+
+        # Rotate dataset for next epoch
+        if rotatingManager is not None:
+            rotatingManager.rotate()
+        
+        # Step LR scheduler
+        scheduler.step()
+        LOGGER.info("LR: %.6f", scheduler.get_last_lr()[0])
 
     finalLoss = bestValLoss if bestValLoss is not None else trainLoss
     return ClipTrainingResult(
