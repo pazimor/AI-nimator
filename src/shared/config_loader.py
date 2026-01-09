@@ -341,6 +341,14 @@ def loadGenerationConfig(
         maxSamples=_optionalInt(trainingSection, "max-samples"),
         gradientAccumulation=_int(trainingSection, "gradient-accumulation", 1),
         rotateDataset=_bool(trainingSection, "rotate-dataset", False),
+        motionSplitFrames=_optionalInt(
+            trainingSection,
+            "motion-split-frames",
+        ),
+        motionDownsampleTargetFrames=_optionalInt(
+            trainingSection,
+            "motion-downsample-target-frames",
+        ),
         # Learning Rate Configuration
         learningRate=_float(trainingSection, "learning-rate", GENERATION_DEFAULT_LEARNING_RATE),
         lrMin=_float(trainingSection, "lr-min", 1e-7),

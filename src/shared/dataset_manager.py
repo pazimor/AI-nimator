@@ -16,15 +16,19 @@ import os
 import psutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Dict, List, Optional, Tuple
 
 import torch
-from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data import DataLoader, Dataset, Subset, random_split
 from transformers import XLMRobertaTokenizerFast
 
 from src.shared.model.clip.data import MotionTextClipDataset, motionTextCollate
+from src.shared.types import ClipDatasetRecord
 
 LOGGER = logging.getLogger("shared.dataset_manager")
+
+ZERO_FRAME_COUNT = 0
+MIN_FRAME_COUNT = 1
 
 
 @dataclass
@@ -192,6 +196,288 @@ class MemoryManager:
         LOGGER.info("MM: Memory usage%s: %s", contextStr, memStr)
 
 
+@dataclass(frozen=True)
+class MotionProcessingConfig:
+    """
+    Configuration for motion length processing.
+
+    Attributes
+    ----------
+    motionSplitFrames : Optional[int]
+        Maximum frames per sample after splitting (None to disable).
+    motionDownsampleTargetFrames : Optional[int]
+        Target frame count for temporal downsampling (None to disable).
+    """
+
+    motionSplitFrames: Optional[int] = None
+    motionDownsampleTargetFrames: Optional[int] = None
+
+    def hasSplit(self) -> bool:
+        """Return True when splitting is enabled."""
+        return _isFrameCountValid(self.motionSplitFrames)
+
+    def hasDownsample(self) -> bool:
+        """Return True when downsampling is enabled."""
+        return _isFrameCountValid(self.motionDownsampleTargetFrames)
+
+
+class MotionWindowDataset(Dataset[Dict[str, object]]):
+    """
+    Dataset wrapper applying motion splitting and downsampling.
+
+    Uses the underlying MotionTextClipDataset for caching and tokenization.
+    """
+
+    def __init__(
+        self,
+        baseDataset: MotionTextClipDataset,
+        processingConfig: MotionProcessingConfig,
+    ) -> None:
+        """
+        Initialize the wrapper dataset.
+
+        Parameters
+        ----------
+        baseDataset : MotionTextClipDataset
+            Base dataset providing motion loading and tokenization.
+        processingConfig : MotionProcessingConfig
+            Motion length processing configuration.
+        """
+        self.baseDataset = baseDataset
+        self.processingConfig = processingConfig
+        self.records = _splitRecords(
+            baseDataset.records,
+            processingConfig.motionSplitFrames,
+        )
+
+    def __len__(self) -> int:
+        """Return the number of samples after processing."""
+        return len(self.records)
+
+    def __getitem__(self, index: int) -> Dict[str, object]:
+        """Return a processed sample from the dataset."""
+        record = self.records[index]
+        motionSlice, meta = self.baseDataset._sliceMotion(record)
+        motionSlice = _downsampleMotion(
+            motionSlice,
+            self.processingConfig.motionDownsampleTargetFrames,
+        )
+        return _buildSample(record, motionSlice, meta, self.baseDataset)
+
+    def clearCache(self) -> None:
+        """Clear the underlying motion cache."""
+        self.baseDataset.clearCache()
+
+    def getCacheStats(self) -> dict:
+        """Return cache hit/miss statistics."""
+        return self.baseDataset.getCacheStats()
+
+
+def _isFrameCountValid(value: Optional[int]) -> bool:
+    """
+    Return True when a frame count is valid.
+
+    Parameters
+    ----------
+    value : Optional[int]
+        Frame count to validate.
+    """
+    return value is not None and value >= MIN_FRAME_COUNT
+
+
+def _getRecordLength(record: ClipDatasetRecord) -> int:
+    """
+    Return the number of frames in a record.
+
+    Parameters
+    ----------
+    record : ClipDatasetRecord
+        Dataset record to inspect.
+    """
+    return max(record.endFrame - record.startFrame, ZERO_FRAME_COUNT)
+
+
+def _splitRecords(
+    records: List[ClipDatasetRecord],
+    splitFrames: Optional[int],
+) -> List[ClipDatasetRecord]:
+    """
+    Split records into fixed-length windows when requested.
+
+    Parameters
+    ----------
+    records : List[ClipDatasetRecord]
+        Dataset records to split.
+    splitFrames : Optional[int]
+        Maximum frames per split sample.
+    """
+    if not _isFrameCountValid(splitFrames):
+        return list(records)
+    return _expandRecords(records, splitFrames)
+
+
+def _expandRecords(
+    records: List[ClipDatasetRecord],
+    splitFrames: int,
+) -> List[ClipDatasetRecord]:
+    """
+    Expand records using fixed-length splitting.
+
+    Parameters
+    ----------
+    records : List[ClipDatasetRecord]
+        Dataset records to split.
+    splitFrames : int
+        Maximum frames per split sample.
+    """
+    expandedRecords: List[ClipDatasetRecord] = []
+    for record in records:
+        expandedRecords.extend(_splitRecord(record, splitFrames))
+    return expandedRecords
+
+
+def _splitRecord(
+    record: ClipDatasetRecord,
+    splitFrames: int,
+) -> List[ClipDatasetRecord]:
+    """
+    Split a single record into fixed-length windows.
+
+    Parameters
+    ----------
+    record : ClipDatasetRecord
+        Dataset record to split.
+    splitFrames : int
+        Maximum frames per split sample.
+    """
+    recordLength = _getRecordLength(record)
+    if recordLength <= splitFrames:
+        return [record]
+    return _buildSplitRecords(record, splitFrames)
+
+
+def _buildSplitRecords(
+    record: ClipDatasetRecord,
+    splitFrames: int,
+) -> List[ClipDatasetRecord]:
+    """
+    Build split records using contiguous windows.
+
+    Parameters
+    ----------
+    record : ClipDatasetRecord
+        Dataset record to split.
+    splitFrames : int
+        Maximum frames per split sample.
+    """
+    splitRecords: List[ClipDatasetRecord] = []
+    startFrame = record.startFrame
+    while startFrame < record.endFrame:
+        endFrame = min(startFrame + splitFrames, record.endFrame)
+        if endFrame <= startFrame:
+            break
+        splitRecords.append(_cloneRecord(record, startFrame, endFrame))
+        startFrame = endFrame
+    return splitRecords
+
+
+def _cloneRecord(
+    record: ClipDatasetRecord,
+    startFrame: int,
+    endFrame: int,
+) -> ClipDatasetRecord:
+    """
+    Clone a record with new frame bounds.
+
+    Parameters
+    ----------
+    record : ClipDatasetRecord
+        Source dataset record.
+    startFrame : int
+        New start frame.
+    endFrame : int
+        New end frame.
+    """
+    return ClipDatasetRecord(
+        promptText=record.promptText,
+        tag=record.tag,
+        animationPath=record.animationPath,
+        startFrame=startFrame,
+        endFrame=endFrame,
+        sourceFile=record.sourceFile,
+        metadata=record.metadata,
+    )
+
+
+def _computeDownsampleStride(currentFrames: int, targetFrames: int) -> int:
+    """
+    Compute stride to reduce frames to the target count.
+
+    Parameters
+    ----------
+    currentFrames : int
+        Current motion frame count.
+    targetFrames : int
+        Desired target frame count.
+    """
+    stride = math.ceil(currentFrames / targetFrames)
+    return max(stride, MIN_FRAME_COUNT)
+
+
+def _downsampleMotion(
+    motion: torch.Tensor,
+    targetFrames: Optional[int],
+) -> torch.Tensor:
+    """
+    Downsample a motion tensor to a target frame count.
+
+    Parameters
+    ----------
+    motion : torch.Tensor
+        Motion tensor shaped (frames, bones, channels).
+    targetFrames : Optional[int]
+        Desired target frame count.
+    """
+    if not _isFrameCountValid(targetFrames):
+        return motion
+    currentFrames = motion.shape[0]
+    if currentFrames <= targetFrames:
+        return motion
+    stride = _computeDownsampleStride(currentFrames, targetFrames)
+    return motion[::stride]
+
+
+def _buildSample(
+    record: ClipDatasetRecord,
+    motionSlice: torch.Tensor,
+    meta: Dict[str, object],
+    dataset: MotionTextClipDataset,
+) -> Dict[str, object]:
+    """
+    Build a dataset sample dictionary.
+
+    Parameters
+    ----------
+    record : ClipDatasetRecord
+        Dataset record metadata.
+    motionSlice : torch.Tensor
+        Motion slice for the record.
+    meta : Dict[str, object]
+        Metadata from the motion payload.
+    dataset : MotionTextClipDataset
+        Dataset used for tokenization.
+    """
+    encoded = dataset._tokenize(record.tag, record.promptText)
+    return {
+        "input_ids": encoded["input_ids"],
+        "attention_mask": encoded["attention_mask"],
+        "motion": motionSlice,
+        "time": torch.tensor([record.startFrame, record.endFrame]),
+        "tag": record.tag,
+        "meta": meta,
+    }
+
+
 class DatasetManager:
     """
     Unified dataset management for CLIP and Generation training.
@@ -218,6 +504,12 @@ class DatasetManager:
         Maximum samples per epoch (None = use all).
     rotateDataset : bool
         Whether to rotate through dataset chunks each epoch.
+    motionSplitFrames : Optional[int]
+        Maximum frames per sample after splitting (None = use all).
+    motionDownsampleTargetFrames : Optional[int]
+        Target frame count for temporal downsampling (None = disable).
+    cacheMotion : bool
+        Whether to cache motion payloads for reuse.
     memoryConfig : Optional[MemoryManagerConfig]
         Memory management configuration.
     device : Optional[torch.device]
@@ -237,6 +529,9 @@ class DatasetManager:
         validationSplit: float,
         maxSamples: Optional[int] = None,
         rotateDataset: bool = False,
+        motionSplitFrames: Optional[int] = None,
+        motionDownsampleTargetFrames: Optional[int] = None,
+        cacheMotion: bool = True,
         memoryConfig: Optional[MemoryManagerConfig] = None,
         device: Optional[torch.device] = None,
         promptRoot: Optional[Path] = None,
@@ -251,6 +546,11 @@ class DatasetManager:
         self.validationSplit = validationSplit
         self.maxSamples = maxSamples
         self.rotateDataset = rotateDataset
+        self.motionProcessingConfig = MotionProcessingConfig(
+            motionSplitFrames=motionSplitFrames,
+            motionDownsampleTargetFrames=motionDownsampleTargetFrames,
+        )
+        self.cacheMotion = cacheMotion
         self.currentOffset = 0
         
         # Memory management
@@ -258,34 +558,69 @@ class DatasetManager:
         self.memoryManager = MemoryManager(self.memoryConfig, device)
         
         # Lazy-loaded dataset
-        self._dataset: Optional[MotionTextClipDataset] = None
+        self._dataset: Optional[Dataset[Dict[str, object]]] = None
+        self._baseDataset: Optional[MotionTextClipDataset] = None
         self._totalSize: Optional[int] = None
         self._allIndices: Optional[List[int]] = None
+        self._staticDataloaders: Optional[
+            Tuple[DataLoader, Optional[DataLoader], str]
+        ] = None
         
-    def _ensureDataset(self) -> MotionTextClipDataset:
+    def _ensureDataset(self) -> Dataset[Dict[str, object]]:
         """
         Lazy-load dataset metadata.
         
         Returns
         -------
-        MotionTextClipDataset
-            The loaded dataset.
+        Dataset[Dict[str, object]]
+            The processed dataset.
         """
         if self._dataset is None:
             LOGGER.info("MM: Loading dataset from %s", self.promptRoot)
-            tokenizer = XLMRobertaTokenizerFast.from_pretrained(self.modelName)
-            self._dataset = MotionTextClipDataset(
-                rootPrompts=self.promptRoot,
-                rootAnimations=self.animationRoot,
-                tokenizer=tokenizer,
-                maxLength=self.maxLength,
-                cacheMotion=True,  # Enable LRU cache (single-entry, auto-clears)
-            )
+            self._baseDataset = self._buildBaseDataset()
+            self._dataset = self._wrapDataset(self._baseDataset)
             self._totalSize = len(self._dataset)
             self._allIndices = list(range(self._totalSize))
+            self._staticDataloaders = None
             LOGGER.info("MM: Dataset indexed: %d total samples", self._totalSize)
             
         return self._dataset
+
+    def _buildBaseDataset(self) -> MotionTextClipDataset:
+        """
+        Build the base dataset instance.
+
+        Returns
+        -------
+        MotionTextClipDataset
+            Dataset instance without motion length transforms.
+        """
+        tokenizer = XLMRobertaTokenizerFast.from_pretrained(self.modelName)
+        return MotionTextClipDataset(
+            rootPrompts=self.promptRoot,
+            rootAnimations=self.animationRoot,
+            tokenizer=tokenizer,
+            maxLength=self.maxLength,
+            cacheMotion=self.cacheMotion,
+        )
+
+    def _wrapDataset(
+        self,
+        baseDataset: MotionTextClipDataset,
+    ) -> Dataset[Dict[str, object]]:
+        """
+        Apply motion length processing when configured.
+
+        Parameters
+        ----------
+        baseDataset : MotionTextClipDataset
+            Dataset providing motion and tokenization logic.
+        """
+        if not self.motionProcessingConfig.hasSplit() and not (
+            self.motionProcessingConfig.hasDownsample()
+        ):
+            return baseDataset
+        return MotionWindowDataset(baseDataset, self.motionProcessingConfig)
     
     @property
     def totalSize(self) -> int:
@@ -368,6 +703,8 @@ class DatasetManager:
     
     def _getStaticDataloaders(self) -> Tuple[DataLoader, Optional[DataLoader], str]:
         """Get static dataloaders (all samples or limited)."""
+        if self._staticDataloaders is not None:
+            return self._staticDataloaders
         dataset = self._dataset
         totalSize = self._totalSize or len(dataset)
         
@@ -379,7 +716,8 @@ class DatasetManager:
             indices = list(range(totalSize))
             chunkInfo = f"all {totalSize} samples"
             
-        return self._buildDataloaders(indices, chunkInfo)
+        self._staticDataloaders = self._buildDataloaders(indices, chunkInfo)
+        return self._staticDataloaders
     
     def _buildDataloaders(
         self,
@@ -405,7 +743,7 @@ class DatasetManager:
     
     def _makeDataloader(
         self,
-        dataset: MotionTextClipDataset,
+        dataset: Dataset[Dict[str, object]],
         shuffle: bool = True,
     ) -> DataLoader:
         """Create a dataloader with custom collation."""
@@ -443,15 +781,15 @@ class DatasetManager:
         Call this between dataset rotations or when memory needs to be freed.
         Also triggers garbage collection.
         """
-        if self._dataset is not None:
-            self._dataset.clearCache()
+        if self._baseDataset is not None:
+            self._baseDataset.clearCache()
         self.memoryManager._performCleanup()
         LOGGER.info("MM: Motion cache and memory cleared")
     
     def getCacheStats(self) -> dict:
         """Return cache hit/miss statistics."""
-        if self._dataset is not None:
-            return self._dataset.getCacheStats()
+        if self._baseDataset is not None:
+            return self._baseDataset.getCacheStats()
         return {"hits": 0, "misses": 0, "hitRate": 0.0}
     
     def logMemoryStatus(self, context: str = "") -> None:

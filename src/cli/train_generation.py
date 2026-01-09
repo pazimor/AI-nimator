@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import math
 from pathlib import Path
 from typing import Optional
 
@@ -13,13 +12,12 @@ import torch
 from src.shared.config_loader import loadGenerationConfig
 from src.features.generation.train_generation import (
     buildOptimizer,
-    buildTrainValDataloaders,
     evaluateValidation,
     loadCheckpoint,
-    RotatingDatasetManager,
     saveCheckpoint,
     trainOneEpoch,
 )
+from src.shared.dataset_manager import DatasetManager, MemoryManagerConfig
 from src.shared.config_loader import loadNetworkConfig
 from src.shared.learning_rate import LearningRateScheduler, LearningRateConfig
 from src.shared.model.generation.ddim import DDIM
@@ -69,7 +67,7 @@ def main() -> None:
         config = loadGenerationConfig(configPath, profile=arguments.profile)
         if arguments.profile:
             LOGGER.info("Using profile: %s", arguments.profile)
-        result = _runTraining(config)
+        result = _runTraining(config, profile=arguments.profile)
         
         parser.exit(
             0,
@@ -83,6 +81,7 @@ def main() -> None:
 
 def _runTraining(
     config: GenerationTrainingConfig,
+    profile: Optional[str] = None,
 ) -> GenerationTrainingResult:
     """
     Execute the end-to-end training workflow.
@@ -91,6 +90,8 @@ def _runTraining(
     ----------
     config : GenerationTrainingConfig
         Parsed training configuration.
+    profile : Optional[str]
+        Optional network profile name to apply.
 
     Returns
     -------
@@ -109,50 +110,41 @@ def _runTraining(
         effectiveBatchSize,
     )
 
-    # Setup dataset manager based on rotation mode
-    datasetManager: Optional[RotatingDatasetManager] = None
-    trainLoader = None
-    valLoader = None
-    
+    # Setup dataset manager
+    memoryConfig = MemoryManagerConfig(
+        MM_memoryLimitGB=config.training.MM_memoryLimitGB,
+    )
+    datasetManager = DatasetManager(
+        datasetRoot=config.paths.datasetRoot,
+        maxLength=config.training.maxPromptLength,
+        batchSize=config.training.batchSize,
+        modelName=config.training.modelName,
+        validationSplit=config.training.validationSplit,
+        maxSamples=config.training.maxSamples,
+        rotateDataset=config.training.rotateDataset,
+        motionSplitFrames=config.training.motionSplitFrames,
+        motionDownsampleTargetFrames=(
+            config.training.motionDownsampleTargetFrames
+        ),
+        cacheMotion=False,
+        memoryConfig=memoryConfig,
+        device=device,
+    )
+    LOGGER.info("Dataset indexed: %d total samples", datasetManager.totalSize)
     if config.training.rotateDataset and config.training.maxSamples:
-        # Use rotating dataset manager
-        datasetManager = RotatingDatasetManager(
-            datasetRoot=config.paths.datasetRoot,
-            maxLength=config.training.maxPromptLength,
-            batchSize=config.training.batchSize,
-            modelName=config.training.modelName,
-            validationSplit=config.training.validationSplit,
-            chunkSize=config.training.maxSamples,
-        )
         LOGGER.info(
-            "Dataset rotation enabled: %d samples per epoch, %d total samples",
-            config.training.maxSamples,
-            datasetManager.totalSize,
+            "Dataset rotation enabled: %d samples per epoch",
+            datasetManager.effectiveSamplesPerEpoch,
         )
-        epochsToSeeAll = math.ceil(datasetManager.totalSize / config.training.maxSamples)
         LOGGER.info(
             "Full dataset coverage every %d epochs",
-            epochsToSeeAll,
-        )
-    else:
-        # Build static dataloaders
-        trainLoader, valLoader = buildTrainValDataloaders(
-            datasetRoot=config.paths.datasetRoot,
-            maxLength=config.training.maxPromptLength,
-            batchSize=config.training.batchSize,
-            modelName=config.training.modelName,
-            validationSplit=config.training.validationSplit,
-            maxSamples=config.training.maxSamples,
-        )
-        LOGGER.info(
-            "Dataset loaded: %d training batches",
-            len(trainLoader),
+            datasetManager.epochsForFullCoverage,
         )
 
     # Load network configuration
     networkConfig = loadNetworkConfig(
         configPath=config.networkConfigPath,
-        profile=None,  # Profile is determined by the training config
+        profile=profile,
     )
     LOGGER.info(
         "Network config: embed_dim=%d, num_heads=%d, num_layers=%d, diffusion_steps=%d",
@@ -225,10 +217,9 @@ def _runTraining(
         currentLr = optimizer.param_groups[0]['lr']
         
         # Get dataloaders for this epoch (rotating or static)
-        chunkInfo: Optional[str] = None
-        if datasetManager is not None:
-            trainLoader, valLoader, startIdx, endIdx = datasetManager.getDataloadersForEpoch(epochIndex)
-            chunkInfo = f"samples {startIdx+1}-{endIdx}"
+        trainLoader, valLoader, chunkInfo = datasetManager.getDataloadersForEpoch(
+            epochIndex
+        )
 
         trainLoss = trainOneEpoch(
             trainLoader, model, optimizer, ddim, device,

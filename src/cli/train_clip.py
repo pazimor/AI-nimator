@@ -69,7 +69,7 @@ def main() -> None:
     try:
         configPath = _validateConfigPath(arguments.config)
         config = loadTrainingConfig(configPath, profile=arguments.profile)
-        result = _runTraining(config)
+        result = _runTraining(config, profile=arguments.profile)
         parser.exit(
             0,
             f"Training finished with loss={result.finalLoss:.4f} "
@@ -82,6 +82,7 @@ def main() -> None:
 
 def _runTraining(
     config: ClipTrainingConfig,
+    profile: Optional[str] = None,
 ) -> ClipTrainingResult:
     """
     Execute the end-to-end training workflow with early stopping and checkpointing.
@@ -90,6 +91,8 @@ def _runTraining(
     ----------
     config : ClipTrainingConfig
         Parsed training configuration.
+    profile : Optional[str]
+        Optional network profile name to apply.
 
     Returns
     -------
@@ -99,8 +102,7 @@ def _runTraining(
     device = _resolveDevice(config.training.device)
     
     # Load network architecture config
-    networkConfigPath = Path(config.training.networkConfigPath)
-    networkConfig = loadNetworkConfig(networkConfigPath, profile=config.training.networkProfile)
+    networkConfig = loadNetworkConfig(configPath=config.networkConfigPath, profile=profile)
     
     # Build model with motion encoder parameters
     LOGGER.info(
@@ -133,15 +135,17 @@ def _runTraining(
     
     # Learning rate scheduler with warmup
     lrConfig = LearningRateConfig(
-        baseLr=config.training.learningRate,
-        minLr=config.training.lrMin,
+        initialLR=config.training.learningRate,
+        minLR=config.training.lrMin,
         warmupEpochs=config.training.lrWarmupEpochs,
-        totalEpochs=config.training.epochs,
-        schedule=config.training.lrSchedule,
+        scheduleType=config.training.lrSchedule,
         decayEpochs=config.training.lrDecayEpochs,
     )
-    lrScheduler = LearningRateScheduler(lrConfig)
-    scheduler = lrScheduler.buildScheduler(optimizer)
+    scheduler = LearningRateScheduler(
+        optimizer=optimizer,
+        config=lrConfig,
+        totalEpochs=config.training.epochs,
+    )
     LOGGER.info(
         "Using LR scheduler: %d warmup epochs, schedule=%s, min_lr=%.2e",
         config.training.lrWarmupEpochs,
@@ -280,7 +284,7 @@ def _runTraining(
         
         # Step LR scheduler
         scheduler.step()
-        LOGGER.info("LR: %.6f", scheduler.get_last_lr()[0])
+        LOGGER.info("LR: %.6f", scheduler.getCurrentLR())
 
     finalLoss = bestValLoss if bestValLoss is not None else trainLoss
     return ClipTrainingResult(

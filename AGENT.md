@@ -23,43 +23,7 @@
 
 ---
 
-## 3 ✍️ special workflow
-
-if i ask you anything produce a TODO list first in the root folder of the project (TODO_WORKFLOW.md) containg: 
-- rewriting my needs with details
-- important points
-- files to work on (modify / create)
-
-using this format:
-
-```md
-Objectif :
-Write code in [LANGAGE] for : [REWROTE NEEDS].
-
-Context :
-- Environnement : [ENV]
-- Style : [AS DESCRIBE IN THIS FILE]
-- Constraints :
-  - [AS DESCRIBE IN THIS FILE]
-  - [ex: strict typed code]
-  ....
-  
----
-File: [FILE PATH] //todo for each files and features
-Feature :
-- Business Rules :
-  - [RULE 1]
-  - [cases / errors]
----
-
-keep AGENT.md rules
-```
-
-if this list is produce you need a GO from the user (meaning th user has review yyour work and may have modify it) use this file as prompt
-
----
-
-## 4 • Code Standards
+## 3 • Code Standards
 
 ### ✏️ Style & Naming
 
@@ -85,13 +49,13 @@ if this list is produce you need a GO from the user (meaning th user has review 
 
 ---
 
-## 5 • files Structure
+## 4 • files Structure
 
 try to folow the project structure
 
 ---
 
-## 6 • Testing & Quality
+## 5 • Testing & Quality
 
 📌 **Test Structure & Placement**
 
@@ -99,7 +63,7 @@ try to folow the project structure
 
 ---
 
-## 7 • Documentation
+## 6 • Documentation
 
 Sphinx documentation must be generated
 1. global readme about the project 

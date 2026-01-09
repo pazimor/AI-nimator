@@ -1,6 +1,6 @@
 paths:
-  dataset-root: "/Users/eddy.hummel/dataset"
-  clip-checkpoint: "output/checkpoints/best_model.pt"
+  dataset-root: "/Volumes/Code assets/dataset"
+  clip-checkpoint: "output/checkpoints/best_model-128.pt"
   checkpoint-dir: "output/generation_checkpoints"
   # Network architecture is loaded from network.yaml
   network-config: "network.yaml"
@@ -19,6 +19,9 @@ training:
   gradient-accumulation: 8
   max-samples: 2000
   rotate-dataset: true
+  # Motion length controls (null disables)
+  motion-split-frames: null  # Example: 1024
+  motion-downsample-target-frames: null  # Example: 2048
   MM-memory-limit-gb: 20.0
   resume-checkpoint: output/generation_checkpoints/best_model.pt
   
@@ -44,8 +47,11 @@ spark:
   gradient-accumulation: 1
   max-samples: null
   rotate-dataset: false
+  # Motion length controls (null disables)
+  motion-split-frames: null  # Example: 1024
+  motion-downsample-target-frames: null  # Example: 2048
   MM-memory-limit-gb: 0.0
-  # resume-checkpoint: output/generation_checkpoints/best_model.pt
+  resume-checkpoint: output/generation_checkpoints/best_model.pt
   
   # Learning Rate Configuration
   learning-rate: 0.001

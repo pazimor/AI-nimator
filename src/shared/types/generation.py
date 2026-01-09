@@ -63,6 +63,10 @@ class GenerationTrainingHyperparameters:
         Hugging Face identifier for the XLM-Roberta tokenizer.
     resumeCheckpoint : Optional[Path]
         Path to a checkpoint file to resume training from.
+    motionSplitFrames : Optional[int]
+        Maximum frames per sample after splitting (None to disable).
+    motionDownsampleTargetFrames : Optional[int]
+        Target frame count for temporal downsampling (None to disable).
     
     Learning Rate Configuration
     ---------------------------
@@ -90,6 +94,8 @@ class GenerationTrainingHyperparameters:
     maxSamples: Optional[int] = None  # Limit dataset size (None = use all)
     gradientAccumulation: int = 1  # Accumulate gradients over N batches
     rotateDataset: bool = False  # Rotate through dataset chunks each epoch
+    motionSplitFrames: Optional[int] = None
+    motionDownsampleTargetFrames: Optional[int] = None
     
     # Learning Rate Configuration
     learningRate: float = 0.001

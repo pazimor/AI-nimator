@@ -28,6 +28,44 @@ def _countParameters(stateDict: Dict[str, Any]) -> Dict[str, int]:
     return {"total": total, "size_mb": total * 4 / (1024 * 1024)}  # Assuming float32
 
 
+def _summarizeModuleParams(module: torch.nn.Module) -> Dict[str, int]:
+    """Summarize parameter counts and size for a module."""
+    total = 0
+    trainable = 0
+    totalBytes = 0
+    trainableBytes = 0
+    for param in module.parameters():
+        num = param.numel()
+        total += num
+        totalBytes += num * param.element_size()
+        if param.requires_grad:
+            trainable += num
+            trainableBytes += num * param.element_size()
+    return {
+        "total": total,
+        "trainable": trainable,
+        "total_bytes": totalBytes,
+        "trainable_bytes": trainableBytes,
+    }
+
+
+def _printParamSummary(label: str, module: torch.nn.Module) -> None:
+    """Print a readable parameter summary for a module."""
+    summary = _summarizeModuleParams(module)
+    totalSize = _formatSize(summary["total_bytes"])
+    trainableSize = _formatSize(summary["trainable_bytes"])
+    print(
+        "Params %s: total=%s (%s) trainable=%s (%s)"
+        % (
+            label,
+            f"{summary['total']:,}",
+            totalSize,
+            f"{summary['trainable']:,}",
+            trainableSize,
+        )
+    )
+
+
 def inspectCheckpoint(checkpointPath: str, verbose: bool = False) -> None:
     """
     Inspect a PyTorch checkpoint and display its contents.
@@ -198,6 +236,223 @@ def listCheckpoints(directory: str) -> None:
     print()
 
 
+def _resolveDevice(device: str) -> torch.device:
+    """Resolve device string to torch.device."""
+    if device == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    return torch.device(device)
+
+
+def shapeCheck(
+    networkConfigPath: str,
+    networkProfile: str,
+    batchSize: int,
+    frames: int,
+    device: str,
+    motionChannels: int,
+    full: bool,
+    modelName: str,
+    maxLength: int,
+) -> None:
+    """
+    Run a shape-only validation pass for the generation network.
+
+    Parameters
+    ----------
+    networkConfigPath : str
+        Path to network.yaml.
+    networkProfile : str
+        Profile name in network.yaml.
+    batchSize : int
+        Batch size for dummy inputs.
+    frames : int
+        Number of frames for dummy motion.
+    device : str
+        Torch device string (cpu, cuda, mps, auto).
+    motionChannels : int
+        Channels per bone (default 6).
+    full : bool
+        If True, include CLIP text encoder and quaternion conversion.
+    modelName : str
+        Hugging Face model name for CLIP text encoder.
+    maxLength : int
+        Max token length for dummy prompts.
+    """
+    from src.shared.config_loader import loadNetworkConfig
+
+    resolvedDevice = _resolveDevice(device)
+    networkConfig = loadNetworkConfig(Path(networkConfigPath), profile=networkProfile)
+
+    embedDim = networkConfig.embedDim
+    numHeads = networkConfig.generation.numHeads
+    numLayers = networkConfig.generation.numLayers
+    numBones = networkConfig.generation.numBones
+    diffusionSteps = networkConfig.generation.diffusionSteps
+
+    if embedDim % numHeads != 0:
+        print(
+            "❌ Invalid config: embedDim must be divisible by numHeads "
+            f"(embedDim={embedDim}, numHeads={numHeads})."
+        )
+        sys.exit(1)
+
+    print("\n" + "=" * 60)
+    print("✅ Shape check: generation network")
+    print("=" * 60)
+    print(f"network.yaml: {networkConfigPath} (profile={networkProfile})")
+    print(
+        "D=%d H=%d L=%d K=%d C=%d T=%d device=%s"
+        % (embedDim, numHeads, numLayers, numBones, motionChannels, frames, resolvedDevice)
+    )
+    if motionChannels != 6 and full:
+        print(
+            "❌ Full check requires motionChannels=6 (6D rotations). "
+            f"Got motionChannels={motionChannels}."
+        )
+        sys.exit(1)
+
+    tags = [None] * batchSize
+    timesteps = torch.randint(
+        0,
+        diffusionSteps,
+        (batchSize,),
+        device=resolvedDevice,
+        dtype=torch.long,
+    )
+    noisyMotion = torch.randn(
+        batchSize,
+        frames,
+        numBones,
+        motionChannels,
+        device=resolvedDevice,
+    )
+
+    with torch.no_grad():
+        if full:
+            from src.shared.model.generation.motion_generator import MotionGenerator
+
+            model = MotionGenerator(
+                embedDim=embedDim,
+                numHeads=numHeads,
+                numLayers=numLayers,
+                numBones=numBones,
+                diffusionSteps=diffusionSteps,
+                modelName=modelName,
+                clipCheckpoint=None,
+            ).to(resolvedDevice)
+            model.eval()
+
+            _printParamSummary("MotionGenerator", model)
+            _printParamSummary("MotionDenoiser", model.denoiser)
+            _printParamSummary("CLIP", model.clip)
+
+            prompts = ["shape check"] * batchSize
+            encoded = model.clip.tokenizer(
+                prompts,
+                padding="max_length",
+                truncation=True,
+                max_length=maxLength,
+                return_tensors="pt",
+            )
+            inputIds = encoded["input_ids"].to(resolvedDevice)
+            attentionMask = encoded["attention_mask"].to(resolvedDevice)
+
+            outputs = model(
+                textInputIds=inputIds,
+                textAttentionMask=attentionMask,
+                tags=tags,
+                noisyMotion=noisyMotion,
+                timesteps=timesteps,
+                targetNoise=None,
+            )
+            predictedNoise = outputs["predicted_noise"]
+
+            if predictedNoise.shape != noisyMotion.shape:
+                print(
+                    "❌ Shape mismatch: predicted_noise %s vs noisyMotion %s"
+                    % (tuple(predictedNoise.shape), tuple(noisyMotion.shape))
+                )
+                sys.exit(1)
+
+            motionFlat = predictedNoise.view(batchSize, frames, numBones * motionChannels)
+            smoothed = model.smoothing(motionFlat)
+            motion6d = smoothed.view(batchSize, frames, numBones, motionChannels)
+            motionQuat = model._sixdToQuaternion(motion6d)
+            motionQuat = model.velocityReg(motionQuat)
+
+            expectedQuat = (batchSize, frames, numBones, 4)
+            if motionQuat.shape != expectedQuat:
+                print(
+                    "❌ Shape mismatch: quaternion %s vs expected %s"
+                    % (tuple(motionQuat.shape), expectedQuat)
+                )
+                sys.exit(1)
+            print("✅ Full check OK (denoiser + CLIP + post-processing).")
+        else:
+            from src.shared.model.generation.denoiser import MotionDenoiser
+            from src.shared.model.layers.correction import (
+                Renormalization,
+                Smoothing,
+                VelocityRegularization,
+            )
+
+            denoiser = MotionDenoiser(
+                embedDim=embedDim,
+                numHeads=numHeads,
+                numLayers=numLayers,
+                numBones=numBones,
+                motionChannels=motionChannels,
+            ).to(resolvedDevice)
+            denoiser.eval()
+
+            _printParamSummary("MotionDenoiser", denoiser)
+
+            textEmbedding = torch.randn(batchSize, embedDim, device=resolvedDevice)
+            predictedNoise = denoiser(
+                noisyMotion=noisyMotion,
+                textEmbedding=textEmbedding,
+                tags=tags,
+                timesteps=timesteps,
+            )
+
+            if predictedNoise.shape != noisyMotion.shape:
+                print(
+                    "❌ Shape mismatch: predicted_noise %s vs noisyMotion %s"
+                    % (tuple(predictedNoise.shape), tuple(noisyMotion.shape))
+                )
+                sys.exit(1)
+
+            motionFlat = predictedNoise.view(batchSize, frames, numBones * motionChannels)
+            smoothing = Smoothing(channels=numBones * motionChannels).to(resolvedDevice)
+            smoothed = smoothing(motionFlat)
+            motion6d = smoothed.view(batchSize, frames, numBones, motionChannels)
+            if motionChannels == 6:
+                renorm = Renormalization().to(resolvedDevice)
+                velreg = VelocityRegularization().to(resolvedDevice)
+                rotMat = renorm(motion6d)
+                rotMat = velreg(rotMat)
+
+                expectedRot = (batchSize, frames, numBones, 3, 3)
+                if rotMat.shape != expectedRot:
+                    print(
+                        "❌ Shape mismatch: rotation matrix %s vs expected %s"
+                        % (tuple(rotMat.shape), expectedRot)
+                    )
+                    sys.exit(1)
+                print("✅ Fast check OK (denoiser + post-processing).")
+            else:
+                print(
+                    "⚠️  Fast check OK (denoiser + smoothing). "
+                    "Renormalization skipped because motionChannels!=6."
+                )
+
+    print()
+
+
 def main() -> None:
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -216,6 +471,12 @@ Exemples:
 
   # Comparer deux checkpoints
   poetry run python -m src.cli.tools compare ckpt1.pt ckpt2.pt
+
+  # Shape check (denoiser + post-processing)
+  poetry run python -m src.cli.tools shape-check --network-profile default
+
+  # Shape check with CLIP text encoder and quaternion conversion
+  poetry run python -m src.cli.tools shape-check --full --device cpu
         """,
     )
 
@@ -237,6 +498,51 @@ Exemples:
     compareParser.add_argument("checkpoint1", help="Premier checkpoint")
     compareParser.add_argument("checkpoint2", help="Deuxième checkpoint")
 
+    # Shape check command
+    shapeParser = subparsers.add_parser(
+        "shape-check",
+        help="Valider les formes tensors du réseau de génération",
+    )
+    shapeParser.add_argument(
+        "--network-config",
+        default="src/configs/network.yaml",
+        help="Chemin vers network.yaml",
+    )
+    shapeParser.add_argument(
+        "--network-profile",
+        default="default",
+        help="Profil dans network.yaml (default, spark, lightweight)",
+    )
+    shapeParser.add_argument("--batch-size", type=int, default=2, help="Batch size")
+    shapeParser.add_argument("--frames", type=int, default=16, help="Nombre de frames")
+    shapeParser.add_argument(
+        "--device",
+        default="auto",
+        help="Device torch (auto, cpu, cuda, mps)",
+    )
+    shapeParser.add_argument(
+        "--motion-channels",
+        type=int,
+        default=6,
+        help="Channels par bone (6 par defaut)",
+    )
+    shapeParser.add_argument(
+        "--full",
+        action="store_true",
+        help="Inclure CLIP + conversion quaternion",
+    )
+    shapeParser.add_argument(
+        "--model-name",
+        default="xlm-roberta-base",
+        help="Nom du modele textuel (si --full)",
+    )
+    shapeParser.add_argument(
+        "--max-length",
+        type=int,
+        default=64,
+        help="Longueur max des prompts (si --full)",
+    )
+
     args = parser.parse_args()
 
     if args.command == "inspect":
@@ -245,6 +551,18 @@ Exemples:
         listCheckpoints(args.directory)
     elif args.command == "compare":
         compareCheckpoints(args.checkpoint1, args.checkpoint2)
+    elif args.command == "shape-check":
+        shapeCheck(
+            networkConfigPath=args.network_config,
+            networkProfile=args.network_profile,
+            batchSize=args.batch_size,
+            frames=args.frames,
+            device=args.device,
+            motionChannels=args.motion_channels,
+            full=args.full,
+            modelName=args.model_name,
+            maxLength=args.max_length,
+        )
     else:
         parser.print_help()
 

@@ -1,8 +1,8 @@
 paths:
-  dataset-root: "/Users/eddy.hummel/dataset"
+  dataset-root: "/Users/pazimor/dataset"
   checkpoint-dir: output/checkpoints
   # Network architecture is loaded from network.yaml
-  network-config: "network.yaml"
+  network-config: "src/configs/network.yaml"
 
 # ============================================
 # Profile: Mac (32GB RAM, MPS GPU)
@@ -23,7 +23,7 @@ training:
   resume-checkpoint: output/checkpoints/best_model.pt
   
   # Learning Rate Configuration
-  learning-rate: 0.00001      # Initial/base learning rate
+  learning-rate: 0.0001      # Initial/base learning rate
   lr-min: 0.0000001           # Minimum LR floor (1e-7)
   lr-warmup-epochs: 3         # Warmup epochs (0 to disable)
   lr-schedule: cosine         # Schedule type: constant, cosine, linear, step

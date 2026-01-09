@@ -15,6 +15,3 @@ doc/build/*
 **/__pycache__/*
 *.pyc
 **/output/*
-
-# temporary files
- TODO_WORKFLOW.md
