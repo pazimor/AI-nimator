@@ -126,10 +126,10 @@ class RotatingDatasetManager:
                 batch_size=self.batchSize,
                 shuffle=True,
                 collate_fn=motionTextCollate,
-                num_workers=4,
+                num_workers=2,
                 pin_memory=True,
                 prefetch_factor=2,
-                persistent_workers=True,
+                persistent_workers=False,
             )
             return trainLoader, None, startIdx, endIdx
         
@@ -142,20 +142,20 @@ class RotatingDatasetManager:
             batch_size=self.batchSize,
             shuffle=True,
             collate_fn=motionTextCollate,
-            num_workers=4,
+            num_workers=2,
             pin_memory=True,
             prefetch_factor=2,
-            persistent_workers=True,
+            persistent_workers=False,
         )
         valLoader = DataLoader(
             valSubset,
             batch_size=self.batchSize,
             shuffle=False,
             collate_fn=motionTextCollate,
-            num_workers=4,
+            num_workers=2,
             pin_memory=True,
             prefetch_factor=2,
-            persistent_workers=True,
+            persistent_workers=False,
         )
         
         return trainLoader, valLoader, startIdx, endIdx
@@ -249,10 +249,10 @@ def _makeDataloader(
         batch_size=batchSize,
         shuffle=shuffle,
         collate_fn=motionTextCollate,
-        num_workers=4,
+        num_workers=2,
         pin_memory=True,
         prefetch_factor=2,
-        persistent_workers=True,
+        persistent_workers=False,
     )
 
 

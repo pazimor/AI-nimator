@@ -321,10 +321,10 @@ def _makeDataloader(
         batch_size=batchSize,
         shuffle=True,
         collate_fn=motionTextCollate,
-        num_workers=4,
+        num_workers=2,
         pin_memory=True,
         prefetch_factor=2,
-        persistent_workers=True,
+        persistent_workers=False,
     )
 
 
