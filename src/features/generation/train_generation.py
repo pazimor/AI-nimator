@@ -126,8 +126,10 @@ class RotatingDatasetManager:
                 batch_size=self.batchSize,
                 shuffle=True,
                 collate_fn=motionTextCollate,
-                num_workers=0,
-                pin_memory=False,
+                num_workers=4,
+                pin_memory=True,
+                prefetch_factor=2,
+                persistent_workers=True,
             )
             return trainLoader, None, startIdx, endIdx
         
@@ -140,16 +142,20 @@ class RotatingDatasetManager:
             batch_size=self.batchSize,
             shuffle=True,
             collate_fn=motionTextCollate,
-            num_workers=0,
-            pin_memory=False,
+            num_workers=4,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True,
         )
         valLoader = DataLoader(
             valSubset,
             batch_size=self.batchSize,
             shuffle=False,
             collate_fn=motionTextCollate,
-            num_workers=0,
-            pin_memory=False,
+            num_workers=4,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True,
         )
         
         return trainLoader, valLoader, startIdx, endIdx
@@ -243,8 +249,10 @@ def _makeDataloader(
         batch_size=batchSize,
         shuffle=shuffle,
         collate_fn=motionTextCollate,
-        num_workers=0,
-        pin_memory=False,
+        num_workers=4,
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True,
     )
 
 
@@ -394,10 +402,10 @@ def _runBatch(
     """
     optimizer.zero_grad(set_to_none=True)  # More memory-efficient than zero_grad()
 
-    # Move data to device
-    inputIds = batch["input_ids"].to(device)
-    attentionMask = batch["attention_mask"].to(device)
-    motion = batch["motion"].to(device)
+    # Move data to device (non_blocking=True for async CPU->GPU transfer)
+    inputIds = batch["input_ids"].to(device, non_blocking=True)
+    attentionMask = batch["attention_mask"].to(device, non_blocking=True)
+    motion = batch["motion"].to(device, non_blocking=True)
     tags = batch["tag"]
 
     # Delete batch reference early
@@ -483,10 +491,10 @@ def _runBatchAccumulate(
     float
         Batch loss value.
     """
-    # Move data to device
-    inputIds = batch["input_ids"].to(device)
-    attentionMask = batch["attention_mask"].to(device)
-    motion = batch["motion"].to(device)
+    # Move data to device (non_blocking=True for async CPU->GPU transfer)
+    inputIds = batch["input_ids"].to(device, non_blocking=True)
+    attentionMask = batch["attention_mask"].to(device, non_blocking=True)
+    motion = batch["motion"].to(device, non_blocking=True)
     tags = batch["tag"]
 
     del batch
@@ -564,9 +572,9 @@ def evaluateValidation(
 
     with torch.no_grad():
         for batch in dataloader:
-            inputIds = batch["input_ids"].to(device)
-            attentionMask = batch["attention_mask"].to(device)
-            motion = batch["motion"].to(device)
+            inputIds = batch["input_ids"].to(device, non_blocking=True)
+            attentionMask = batch["attention_mask"].to(device, non_blocking=True)
+            motion = batch["motion"].to(device, non_blocking=True)
             tags = batch["tag"]
 
             batchSize = motion.shape[0]

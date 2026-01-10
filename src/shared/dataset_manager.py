@@ -752,8 +752,10 @@ class DatasetManager:
             batch_size=self.batchSize,
             shuffle=shuffle,
             collate_fn=motionTextCollate,
-            num_workers=0,
-            pin_memory=False,
+            num_workers=4,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True,
         )
     
     def checkMemory(self, batchIndex: int, force: bool = False) -> bool:

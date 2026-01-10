@@ -321,6 +321,10 @@ def _makeDataloader(
         batch_size=batchSize,
         shuffle=True,
         collate_fn=motionTextCollate,
+        num_workers=4,
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True,
     )
 
 
@@ -521,7 +525,7 @@ def _toDevice(value: object, device: torch.device) -> torch.Tensor:
     """
     if not isinstance(value, torch.Tensor):
         raise TypeError("Expected tensor batch entry.")
-    return value.to(device)
+    return value.to(device, non_blocking=True)
 
 
 def _resolveDevice(device: torch.device | None) -> torch.device:
