@@ -2,138 +2,18 @@
 
 from __future__ import annotations
 
-import gc
 from pathlib import Path
-from typing import Iterable, List, Mapping, Optional, Tuple
+from typing import Iterable, Mapping, Optional, Tuple
 
 import torch
-from torch.utils.data import DataLoader, Subset, random_split
-from transformers import XLMRobertaTokenizerFast
+from torch.utils.data import DataLoader
 
-from src.shared.constants.clip import (
-    BATCH_LOG_FREQUENCY,
-    DEFAULT_BATCH_SIZE,
-    DEFAULT_EMBED_DIM,
-    DEFAULT_LEARNING_RATE,
-    DEFAULT_MODEL_NAME,
-    DEFAULT_PROMPT_MAX_LENGTH,
-    DEFAULT_VALIDATION_SPLIT,
-)
-from src.shared.logging_utils import logClipBatchStats
+from src.shared.constants.clip import DEFAULT_LEARNING_RATE
 from src.shared.model.clip.core import ClipModel
-from src.shared.model.clip.data import MotionTextClipDataset, motionTextCollate
 from src.shared.progress import TrainingProgressBar
 
 BatchDict = Mapping[str, object]
 
-
-class RotatingDatasetManager:
-    """Manage dataset rotation for training on chunks."""
-
-    def __init__(
-        self,
-        dataset: MotionTextClipDataset,
-        maxSamples: int,
-        batchSize: int,
-        validationSplit: float = 0.1,
-    ) -> None:
-        self.dataset = dataset
-        self.maxSamples = maxSamples
-        self.batchSize = batchSize
-        self.validationSplit = validationSplit
-        self.currentOffset = 0
-        self.totalSamples = len(dataset)
-        self.allIndices = list(range(self.totalSamples))
-
-    def getDataloaders(self) -> Tuple[DataLoader, Optional[DataLoader]]:
-        """Get train/val dataloaders for current chunk."""
-        import random
-
-        # Select chunk indices
-        endOffset = min(self.currentOffset + self.maxSamples, self.totalSamples)
-        chunkIndices = self.allIndices[self.currentOffset : endOffset]
-
-        # Wrap around if we hit the end
-        if len(chunkIndices) < self.maxSamples and self.currentOffset > 0:
-            remaining = self.maxSamples - len(chunkIndices)
-            chunkIndices.extend(self.allIndices[:remaining])
-
-        # Split into train/val
-        random.shuffle(chunkIndices)
-        valSize = max(1, int(len(chunkIndices) * self.validationSplit))
-        trainSize = len(chunkIndices) - valSize
-
-        trainIndices = chunkIndices[:trainSize]
-        valIndices = chunkIndices[trainSize:]
-
-        trainSubset = Subset(self.dataset, trainIndices)
-        valSubset = Subset(self.dataset, valIndices)
-
-        trainLoader = DataLoader(
-            trainSubset,
-            batch_size=self.batchSize,
-            shuffle=True,
-            collate_fn=motionTextCollate,
-        )
-        valLoader = DataLoader(
-            valSubset,
-            batch_size=self.batchSize,
-            shuffle=False,
-            collate_fn=motionTextCollate,
-        )
-
-        return trainLoader, valLoader
-
-    def rotate(self) -> None:
-        """Advance to next chunk for next epoch."""
-        self.currentOffset = (self.currentOffset + self.maxSamples) % self.totalSamples
-
-    def getProgress(self) -> str:
-        """Return string describing current position in dataset."""
-        endOffset = min(self.currentOffset + self.maxSamples, self.totalSamples)
-        return f"samples {self.currentOffset + 1}-{endOffset}/{self.totalSamples}"
-
-
-def buildDataloader(
-    promptRoot: Path,
-    animationRoot: Path,
-    maxLength: int = DEFAULT_PROMPT_MAX_LENGTH,
-    batchSize: int = DEFAULT_BATCH_SIZE,
-    modelName: str = DEFAULT_MODEL_NAME,
-) -> DataLoader:
-    """
-    Instantiate dataset and dataloader for CLIP training.
-
-    Parameters
-    ----------
-    promptRoot : Path
-        Directory containing prompt.json files.
-    animationRoot : Path
-        Directory containing animation payloads.
-    maxLength : int, optional
-        Maximum token length for padding/truncation.
-    batchSize : int, optional
-        Batch size used during training.
-    modelName : str, optional
-        Hugging Face identifier of the tokenizer.
-
-    Returns
-    -------
-    DataLoader
-        Configured dataloader using the shared collate function.
-    """
-    dataset = _buildDataset(
-        promptRoot=promptRoot,
-        animationRoot=animationRoot,
-        tokenizer=_buildTokenizer(modelName),
-        maxLength=maxLength,
-    )
-    if len(dataset) == 0:
-        raise ValueError(
-            f"No samples found under {promptRoot}. "
-            "Verify the dataset-root/prompt-root configuration.",
-        )
-    return _makeDataloader(dataset, batchSize)
 
 
 def buildOptimizer(
@@ -180,7 +60,7 @@ def trainOneEpoch(
     Parameters
     ----------
     dataloader : Iterable[BatchDict]
-        Iterable yielding MotionTextClipDataset batches.
+        Iterable yielding preprocessed text-motion batches.
     model : ClipModel
         Model under training.
     optimizer : torch.optim.Optimizer
@@ -214,114 +94,6 @@ def trainOneEpoch(
             pbar.updateLoss(batchLoss)
 
         return pbar.metrics.avgLoss
-
-
-def demoTrainingRun(
-    promptRoot: Path,
-    animationRoot: Path,
-    device: torch.device | None = None,
-) -> Tuple[ClipModel, float]:
-    """
-    Launch a minimal training loop for smoke testing purposes.
-
-    Parameters
-    ----------
-    promptRoot : Path
-        Root directory containing prompt.json files.
-    animationRoot : Path
-        Directory containing animation payloads.
-    device : torch.device | None, optional
-        Requested device; defaults to CUDA when available.
-
-    Returns
-    -------
-    Tuple[ClipModel, float]
-        Trained model and last epoch loss value.
-    """
-    resolvedDevice = _resolveDevice(device)
-    dataloader = buildDataloader(promptRoot, animationRoot)
-    model = ClipModel()
-    model.to(resolvedDevice)
-    optimizer = buildOptimizer(model=model)
-    loss = trainOneEpoch(dataloader, model, optimizer, resolvedDevice)
-    return model, loss
-
-
-def _buildTokenizer(modelName: str) -> XLMRobertaTokenizerFast:
-    """
-    Return the tokenizer expected by ClipModel.
-
-    Parameters
-    ----------
-    modelName : str
-        Hugging Face identifier of the tokenizer.
-
-    Returns
-    -------
-    XLMRobertaTokenizerFast
-        Tokenizer preloaded with vocabulary files.
-    """
-    return XLMRobertaTokenizerFast.from_pretrained(modelName)
-
-
-def _buildDataset(
-    promptRoot: Path,
-    animationRoot: Path,
-    tokenizer: XLMRobertaTokenizerFast,
-    maxLength: int,
-) -> MotionTextClipDataset:
-    """
-    Index prompt segments without pre-loading motions.
-
-    Parameters
-    ----------
-    promptRoot : Path
-        Directory containing prompt.json files.
-    animationRoot : Path
-        Directory containing animation payloads.
-    tokenizer : XLMRobertaTokenizerFast
-        Tokenizer used to encode prompts.
-    maxLength : int
-        Maximum token sequence length.
-
-    Returns
-    -------
-    MotionTextClipDataset
-        Dataset yielding text-motion pairs.
-    """
-    return MotionTextClipDataset(
-        rootPrompts=promptRoot,
-        rootAnimations=animationRoot,
-        tokenizer=tokenizer,
-        maxLength=maxLength,
-    )
-
-
-def _makeDataloader(
-    dataset: MotionTextClipDataset,
-    batchSize: int,
-) -> DataLoader:
-    """
-    Build the dataloader with custom collation.
-
-    Parameters
-    ----------
-    dataset : MotionTextClipDataset
-        Dataset created by `_buildDataset`.
-    batchSize : int
-        Batch size used during training.
-
-    Returns
-    -------
-    DataLoader
-        Dataloader yielding padded batches.
-    """
-    return DataLoader(
-        dataset,
-        batch_size=batchSize,
-        shuffle=True,
-        collate_fn=motionTextCollate,
-    )
 
 
 def _runBatch(
@@ -415,7 +187,7 @@ def trainOneEpochWithAccumulation(
     Parameters
     ----------
     dataloader : Iterable[BatchDict]
-        Iterable yielding MotionTextClipDataset batches.
+        Iterable yielding preprocessed text-motion batches.
     model : ClipModel
         Model under training.
     optimizer : torch.optim.Optimizer
@@ -524,93 +296,11 @@ def _toDevice(value: object, device: torch.device) -> torch.Tensor:
     return value.to(device)
 
 
-def _resolveDevice(device: torch.device | None) -> torch.device:
-    """
-    Select CUDA when available with a CPU fallback.
-
-    Parameters
-    ----------
-    device : torch.device | None
-        Requested device override.
-
-    Returns
-    -------
-    torch.device
-        Device used for the training loop.
-    """
-    if device is not None:
-        return device
-    backend = "cuda" if torch.cuda.is_available() else "cpu"
-    return torch.device(backend)
-
-
-def buildTrainValDataloaders(
-    promptRoot: Path,
-    animationRoot: Path,
-    maxLength: int = DEFAULT_PROMPT_MAX_LENGTH,
-    batchSize: int = DEFAULT_BATCH_SIZE,
-    modelName: str = DEFAULT_MODEL_NAME,
-    validationSplit: float = DEFAULT_VALIDATION_SPLIT,
-) -> Tuple[DataLoader, Optional[DataLoader]]:
-    """
-    Build train and validation dataloaders with a split.
-
-    Parameters
-    ----------
-    promptRoot : Path
-        Directory containing prompt.json files.
-    animationRoot : Path
-        Directory containing animation payloads.
-    maxLength : int, optional
-        Maximum token length for padding/truncation.
-    batchSize : int, optional
-        Batch size used during training.
-    modelName : str, optional
-        Hugging Face identifier of the tokenizer.
-    validationSplit : float, optional
-        Fraction of data to use for validation (0.0-1.0).
-
-    Returns
-    -------
-    Tuple[DataLoader, Optional[DataLoader]]
-        Training dataloader and optional validation dataloader.
-    """
-    dataset = _buildDataset(
-        promptRoot=promptRoot,
-        animationRoot=animationRoot,
-        tokenizer=_buildTokenizer(modelName),
-        maxLength=maxLength,
-    )
-    if len(dataset) == 0:
-        raise ValueError(
-            f"No samples found under {promptRoot}. "
-            "Verify the dataset-root/prompt-root configuration.",
-        )
-    if validationSplit <= 0.0 or len(dataset) < 2:
-        return _makeDataloader(dataset, batchSize), None
-    valSize = max(1, int(len(dataset) * validationSplit))
-    trainSize = len(dataset) - valSize
-    trainSubset, valSubset = random_split(dataset, [trainSize, valSize])
-    trainLoader = DataLoader(
-        trainSubset,
-        batch_size=batchSize,
-        shuffle=True,
-        collate_fn=motionTextCollate,
-    )
-    valLoader = DataLoader(
-        valSubset,
-        batch_size=batchSize,
-        shuffle=False,
-        collate_fn=motionTextCollate,
-    )
-    return trainLoader, valLoader
-
-
 def evaluateValidation(
     dataloader: DataLoader,
     model: ClipModel,
     device: torch.device,
-) -> float:
+) -> tuple[float, dict[str, float]]:
     """
     Compute average loss on the validation set without gradients.
 
@@ -625,11 +315,18 @@ def evaluateValidation(
 
     Returns
     -------
-    float
-        Average validation loss.
+    tuple[float, dict[str, float]]
+        Average validation loss and retrieval metrics.
     """
     model.eval()
     totalLoss = 0.0
+    retrieval = {
+        "t2m_top1": 0.0,
+        "t2m_top5": 0.0,
+        "m2t_top1": 0.0,
+        "m2t_top5": 0.0,
+        "count": 0.0,
+    }
     with torch.no_grad():
         for batch in dataloader:
             outputs = model(
@@ -639,8 +336,60 @@ def evaluateValidation(
                 computeLoss=True,
             )
             totalLoss += float(outputs["clip_loss"].item())
+            _accumulateRetrieval(retrieval, outputs)
     model.train()
-    return totalLoss / max(len(dataloader), 1)
+    avgLoss = totalLoss / max(len(dataloader), 1)
+    metrics = _finalizeRetrieval(retrieval)
+    return avgLoss, metrics
+
+
+def _accumulateRetrieval(
+    metrics: dict[str, float],
+    outputs: Mapping[str, object],
+) -> None:
+    logitsText = outputs.get("logits_per_text")
+    logitsMotion = outputs.get("logits_per_motion")
+    if not isinstance(logitsText, torch.Tensor):
+        return
+    if not isinstance(logitsMotion, torch.Tensor):
+        return
+    batchSize = logitsText.shape[0]
+    if batchSize == 0:
+        return
+
+    target = torch.arange(batchSize, device=logitsText.device)
+    for k in (1, 5):
+        k = min(k, batchSize)
+        correctText = (
+            logitsText.topk(k, dim=1).indices == target[:, None]
+        ).any(dim=1).sum()
+        correctMotion = (
+            logitsMotion.topk(k, dim=1).indices == target[:, None]
+        ).any(dim=1).sum()
+        if k == 1:
+            metrics["t2m_top1"] += float(correctText.item())
+            metrics["m2t_top1"] += float(correctMotion.item())
+        else:
+            metrics["t2m_top5"] += float(correctText.item())
+            metrics["m2t_top5"] += float(correctMotion.item())
+    metrics["count"] += float(batchSize)
+
+
+def _finalizeRetrieval(metrics: dict[str, float]) -> dict[str, float]:
+    count = metrics.get("count", 0.0)
+    if count <= 0:
+        return {
+            "t2m_top1": 0.0,
+            "t2m_top5": 0.0,
+            "m2t_top1": 0.0,
+            "m2t_top5": 0.0,
+        }
+    return {
+        "t2m_top1": metrics["t2m_top1"] / count,
+        "t2m_top5": metrics["t2m_top5"] / count,
+        "m2t_top1": metrics["m2t_top1"] / count,
+        "m2t_top5": metrics["m2t_top5"] / count,
+    }
 
 
 def saveCheckpoint(

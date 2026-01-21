@@ -1,64 +1,70 @@
-"""Unified dataset management for training workflows.
-
-This module provides a reusable DatasetManager class that handles:
-- Dataset loading with file logging
-- Max samples limiting
-- Dataset rotation across epochs
-- Memory management with threshold-based GC
-"""
+"""Unified dataset management for training workflows."""
 
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import math
 import os
-import psutil
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import psutil
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
-from transformers import XLMRobertaTokenizerFast
 
-from src.shared.model.clip.data import MotionTextClipDataset, motionTextCollate
-from src.shared.types import ClipDatasetRecord
+from src.shared.model.clip.data import motionTextCollate
+from src.shared.preprocessed_dataset import PreprocessedMotionDataset
 
 LOGGER = logging.getLogger("shared.dataset_manager")
 
-ZERO_FRAME_COUNT = 0
-MIN_FRAME_COUNT = 1
+BYTES_PER_GB = 1024 * 1024 * 1024
+AUTO_MEMORY_FRACTION = 0.6
+AUTO_MIN_SAMPLE_MULTIPLIER = 4
+DEFAULT_NUM_WORKERS_DIVISOR = 2
+DEFAULT_PREFETCH_FACTOR = 2
+MAX_NUM_WORKERS = 8
+MIN_SAMPLES = 1
+MODEL_MEMORY_MULTIPLIER = 3
+DEFAULT_VALIDATION_SEED = 42
+VALIDATION_INDICES_KEY = "indices"
+VALIDATION_METADATA_KEY = "metadata"
+VALIDATION_META_TOTAL = "total_size"
+VALIDATION_META_SPLIT = "validation_split"
+VALIDATION_META_SEED = "seed"
 
 
 @dataclass
 class MemoryManagerConfig:
     """
     Configuration for memory management.
-    
+
     Attributes
     ----------
     MM_memoryLimitGB : float
         Maximum memory usage in GB before triggering cleanup.
         Set to 0 to disable memory-based cleanup.
     """
-    
+
     MM_memoryLimitGB: float = 0.0
-    
+
     @property
     def MM_memoryLimitBytes(self) -> int:
         """Return memory limit in bytes."""
-        return int(self.MM_memoryLimitGB * 1024 * 1024 * 1024)
+        return int(self.MM_memoryLimitGB * BYTES_PER_GB)
 
 
 class MemoryManager:
     """
     Manages memory usage during training.
-    
+
     Uses a threshold-based approach instead of interval-based GC.
     Monitors both CPU and GPU (MPS/CUDA) memory.
     """
-    
+
     def __init__(
         self,
         config: MemoryManagerConfig,
@@ -66,7 +72,7 @@ class MemoryManager:
     ) -> None:
         """
         Initialize memory manager.
-        
+
         Parameters
         ----------
         config : MemoryManagerConfig
@@ -77,24 +83,24 @@ class MemoryManager:
         self.config = config
         self.device = device
         self._lastCheckBatch = 0
-        self._checkInterval = 10  # Check memory every N batches
-        
+        self._checkInterval = 10
+
     def getMemoryUsageGB(self) -> float:
         """
         Return current process memory usage in GB.
-        
+
         Returns
         -------
         float
             Memory usage in gigabytes.
         """
         process = psutil.Process(os.getpid())
-        return process.memory_info().rss / (1024 ** 3)
-    
+        return process.memory_info().rss / BYTES_PER_GB
+
     def getGPUMemoryUsageGB(self) -> Optional[float]:
         """
         Return current GPU memory usage in GB.
-        
+
         Returns
         -------
         Optional[float]
@@ -102,34 +108,35 @@ class MemoryManager:
         """
         if self.device is None:
             return None
-            
+
         if self.device.type == "mps":
             try:
-                # MPS memory tracking
-                allocated = torch.mps.current_allocated_memory() / (1024 ** 3)
+                allocated = torch.mps.current_allocated_memory() / BYTES_PER_GB
                 return allocated
             except Exception:
                 return None
-        elif self.device.type == "cuda":
+        if self.device.type == "cuda":
             try:
-                allocated = torch.cuda.memory_allocated(self.device) / (1024 ** 3)
+                allocated = (
+                    torch.cuda.memory_allocated(self.device) / BYTES_PER_GB
+                )
                 return allocated
             except Exception:
                 return None
-                
+
         return None
-    
+
     def checkAndCleanup(self, batchIndex: int, force: bool = False) -> bool:
         """
         Check memory usage and trigger cleanup if needed.
-        
+
         Parameters
         ----------
         batchIndex : int
             Current batch index.
         force : bool
             Force cleanup regardless of threshold.
-            
+
         Returns
         -------
         bool
@@ -137,22 +144,21 @@ class MemoryManager:
         """
         if self.config.MM_memoryLimitGB <= 0 and not force:
             return False
-            
-        # Only check every N batches to avoid overhead
-        if not force and (batchIndex - self._lastCheckBatch) < self._checkInterval:
+
+        if not force and (
+            batchIndex - self._lastCheckBatch
+        ) < self._checkInterval:
             return False
-            
+
         self._lastCheckBatch = batchIndex
-        
-        # Get current memory usage
+
         cpuMemGB = self.getMemoryUsageGB()
         gpuMemGB = self.getGPUMemoryUsageGB()
-        
-        # Check if we exceed the limit
+
         currentUsageGB = cpuMemGB
         if gpuMemGB is not None:
             currentUsageGB = max(currentUsageGB, gpuMemGB)
-            
+
         if currentUsageGB > self.config.MM_memoryLimitGB or force:
             self._performCleanup()
             LOGGER.debug(
@@ -161,24 +167,24 @@ class MemoryManager:
                 self.config.MM_memoryLimitGB,
             )
             return True
-            
+
         return False
-    
+
     def _performCleanup(self) -> None:
         """Perform garbage collection and GPU cache cleanup."""
         gc.collect()
-        
+
         if self.device is not None:
             if self.device.type == "mps":
                 if hasattr(torch.mps, "empty_cache"):
                     torch.mps.empty_cache()
             elif self.device.type == "cuda":
                 torch.cuda.empty_cache()
-    
+
     def logMemoryStatus(self, context: str = "") -> None:
         """
         Log current memory usage.
-        
+
         Parameters
         ----------
         context : str
@@ -186,612 +192,552 @@ class MemoryManager:
         """
         cpuMemGB = self.getMemoryUsageGB()
         gpuMemGB = self.getGPUMemoryUsageGB()
-        
+
         parts = [f"CPU: {cpuMemGB:.2f} GB"]
         if gpuMemGB is not None:
             parts.append(f"GPU: {gpuMemGB:.2f} GB")
-        
+
         memStr = ", ".join(parts)
         contextStr = f" ({context})" if context else ""
         LOGGER.info("MM: Memory usage%s: %s", contextStr, memStr)
 
 
-@dataclass(frozen=True)
-class MotionProcessingConfig:
-    """
-    Configuration for motion length processing.
-
-    Attributes
-    ----------
-    motionSplitFrames : Optional[int]
-        Maximum frames per sample after splitting (None to disable).
-    motionDownsampleTargetFrames : Optional[int]
-        Target frame count for temporal downsampling (None to disable).
-    """
-
-    motionSplitFrames: Optional[int] = None
-    motionDownsampleTargetFrames: Optional[int] = None
-
-    def hasSplit(self) -> bool:
-        """Return True when splitting is enabled."""
-        return _isFrameCountValid(self.motionSplitFrames)
-
-    def hasDownsample(self) -> bool:
-        """Return True when downsampling is enabled."""
-        return _isFrameCountValid(self.motionDownsampleTargetFrames)
-
-
-class MotionWindowDataset(Dataset[Dict[str, object]]):
-    """
-    Dataset wrapper applying motion splitting and downsampling.
-
-    Uses the underlying MotionTextClipDataset for caching and tokenization.
-    """
-
-    def __init__(
-        self,
-        baseDataset: MotionTextClipDataset,
-        processingConfig: MotionProcessingConfig,
-    ) -> None:
-        """
-        Initialize the wrapper dataset.
-
-        Parameters
-        ----------
-        baseDataset : MotionTextClipDataset
-            Base dataset providing motion loading and tokenization.
-        processingConfig : MotionProcessingConfig
-            Motion length processing configuration.
-        """
-        self.baseDataset = baseDataset
-        self.processingConfig = processingConfig
-        self.records = _splitRecords(
-            baseDataset.records,
-            processingConfig.motionSplitFrames,
-        )
-
-    def __len__(self) -> int:
-        """Return the number of samples after processing."""
-        return len(self.records)
-
-    def __getitem__(self, index: int) -> Dict[str, object]:
-        """Return a processed sample from the dataset."""
-        record = self.records[index]
-        motionSlice, meta = self.baseDataset._sliceMotion(record)
-        motionSlice = _downsampleMotion(
-            motionSlice,
-            self.processingConfig.motionDownsampleTargetFrames,
-        )
-        return _buildSample(record, motionSlice, meta, self.baseDataset)
-
-    def clearCache(self) -> None:
-        """Clear the underlying motion cache."""
-        self.baseDataset.clearCache()
-
-    def getCacheStats(self) -> dict:
-        """Return cache hit/miss statistics."""
-        return self.baseDataset.getCacheStats()
-
-
-def _isFrameCountValid(value: Optional[int]) -> bool:
-    """
-    Return True when a frame count is valid.
-
-    Parameters
-    ----------
-    value : Optional[int]
-        Frame count to validate.
-    """
-    return value is not None and value >= MIN_FRAME_COUNT
-
-
-def _getRecordLength(record: ClipDatasetRecord) -> int:
-    """
-    Return the number of frames in a record.
-
-    Parameters
-    ----------
-    record : ClipDatasetRecord
-        Dataset record to inspect.
-    """
-    return max(record.endFrame - record.startFrame, ZERO_FRAME_COUNT)
-
-
-def _splitRecords(
-    records: List[ClipDatasetRecord],
-    splitFrames: Optional[int],
-) -> List[ClipDatasetRecord]:
-    """
-    Split records into fixed-length windows when requested.
-
-    Parameters
-    ----------
-    records : List[ClipDatasetRecord]
-        Dataset records to split.
-    splitFrames : Optional[int]
-        Maximum frames per split sample.
-    """
-    if not _isFrameCountValid(splitFrames):
-        return list(records)
-    return _expandRecords(records, splitFrames)
-
-
-def _expandRecords(
-    records: List[ClipDatasetRecord],
-    splitFrames: int,
-) -> List[ClipDatasetRecord]:
-    """
-    Expand records using fixed-length splitting.
-
-    Parameters
-    ----------
-    records : List[ClipDatasetRecord]
-        Dataset records to split.
-    splitFrames : int
-        Maximum frames per split sample.
-    """
-    expandedRecords: List[ClipDatasetRecord] = []
-    for record in records:
-        expandedRecords.extend(_splitRecord(record, splitFrames))
-    return expandedRecords
-
-
-def _splitRecord(
-    record: ClipDatasetRecord,
-    splitFrames: int,
-) -> List[ClipDatasetRecord]:
-    """
-    Split a single record into fixed-length windows.
-
-    Parameters
-    ----------
-    record : ClipDatasetRecord
-        Dataset record to split.
-    splitFrames : int
-        Maximum frames per split sample.
-    """
-    recordLength = _getRecordLength(record)
-    if recordLength <= splitFrames:
-        return [record]
-    return _buildSplitRecords(record, splitFrames)
-
-
-def _buildSplitRecords(
-    record: ClipDatasetRecord,
-    splitFrames: int,
-) -> List[ClipDatasetRecord]:
-    """
-    Build split records using contiguous windows.
-
-    Parameters
-    ----------
-    record : ClipDatasetRecord
-        Dataset record to split.
-    splitFrames : int
-        Maximum frames per split sample.
-    """
-    splitRecords: List[ClipDatasetRecord] = []
-    startFrame = record.startFrame
-    while startFrame < record.endFrame:
-        endFrame = min(startFrame + splitFrames, record.endFrame)
-        if endFrame <= startFrame:
-            break
-        splitRecords.append(_cloneRecord(record, startFrame, endFrame))
-        startFrame = endFrame
-    return splitRecords
-
-
-def _cloneRecord(
-    record: ClipDatasetRecord,
-    startFrame: int,
-    endFrame: int,
-) -> ClipDatasetRecord:
-    """
-    Clone a record with new frame bounds.
-
-    Parameters
-    ----------
-    record : ClipDatasetRecord
-        Source dataset record.
-    startFrame : int
-        New start frame.
-    endFrame : int
-        New end frame.
-    """
-    return ClipDatasetRecord(
-        promptText=record.promptText,
-        tag=record.tag,
-        animationPath=record.animationPath,
-        startFrame=startFrame,
-        endFrame=endFrame,
-        sourceFile=record.sourceFile,
-        metadata=record.metadata,
-    )
-
-
-def _computeDownsampleStride(currentFrames: int, targetFrames: int) -> int:
-    """
-    Compute stride to reduce frames to the target count.
-
-    Parameters
-    ----------
-    currentFrames : int
-        Current motion frame count.
-    targetFrames : int
-        Desired target frame count.
-    """
-    stride = math.ceil(currentFrames / targetFrames)
-    return max(stride, MIN_FRAME_COUNT)
-
-
-def _downsampleMotion(
-    motion: torch.Tensor,
-    targetFrames: Optional[int],
-) -> torch.Tensor:
-    """
-    Downsample a motion tensor to a target frame count.
-
-    Parameters
-    ----------
-    motion : torch.Tensor
-        Motion tensor shaped (frames, bones, channels).
-    targetFrames : Optional[int]
-        Desired target frame count.
-    """
-    if not _isFrameCountValid(targetFrames):
-        return motion
-    currentFrames = motion.shape[0]
-    if currentFrames <= targetFrames:
-        return motion
-    stride = _computeDownsampleStride(currentFrames, targetFrames)
-    return motion[::stride]
-
-
-def _buildSample(
-    record: ClipDatasetRecord,
-    motionSlice: torch.Tensor,
-    meta: Dict[str, object],
-    dataset: MotionTextClipDataset,
-) -> Dict[str, object]:
-    """
-    Build a dataset sample dictionary.
-
-    Parameters
-    ----------
-    record : ClipDatasetRecord
-        Dataset record metadata.
-    motionSlice : torch.Tensor
-        Motion slice for the record.
-    meta : Dict[str, object]
-        Metadata from the motion payload.
-    dataset : MotionTextClipDataset
-        Dataset used for tokenization.
-    """
-    encoded = dataset._tokenize(record.tag, record.promptText)
-    return {
-        "input_ids": encoded["input_ids"],
-        "attention_mask": encoded["attention_mask"],
-        "motion": motionSlice,
-        "time": torch.tensor([record.startFrame, record.endFrame]),
-        "tag": record.tag,
-        "meta": meta,
-    }
-
-
 class DatasetManager:
     """
     Unified dataset management for CLIP and Generation training.
-    
+
     Handles:
-    - Dataset loading with file logging
-    - Max samples limiting
+    - Preprocessed dataset loading
+    - Automatic chunk sizing based on memory
     - Dataset rotation across epochs
     - Memory management integration
-    
-    Parameters
-    ----------
-    datasetRoot : Path
-        Root directory containing prompt and animation files.
-    maxLength : int
-        Maximum token length for prompts.
-    batchSize : int
-        Batch size for dataloaders.
-    modelName : str
-        Hugging Face model name for tokenizer.
-    validationSplit : float
-        Fraction of data for validation.
-    maxSamples : Optional[int]
-        Maximum samples per epoch (None = use all).
-    rotateDataset : bool
-        Whether to rotate through dataset chunks each epoch.
-    motionSplitFrames : Optional[int]
-        Maximum frames per sample after splitting (None = use all).
-    motionDownsampleTargetFrames : Optional[int]
-        Target frame count for temporal downsampling (None = disable).
-    cacheMotion : bool
-        Whether to cache motion payloads for reuse.
-    memoryConfig : Optional[MemoryManagerConfig]
-        Memory management configuration.
-    device : Optional[torch.device]
-        Target device for memory management.
-    promptRoot : Optional[Path]
-        Separate prompt root (defaults to datasetRoot).
-    animationRoot : Optional[Path]
-        Separate animation root (defaults to datasetRoot).
     """
-    
+
     def __init__(
         self,
         datasetRoot: Path,
-        maxLength: int,
         batchSize: int,
-        modelName: str,
         validationSplit: float,
-        maxSamples: Optional[int] = None,
-        rotateDataset: bool = False,
-        motionSplitFrames: Optional[int] = None,
-        motionDownsampleTargetFrames: Optional[int] = None,
-        cacheMotion: bool = True,
+        modelMemoryBytes: int,
         memoryConfig: Optional[MemoryManagerConfig] = None,
         device: Optional[torch.device] = None,
-        promptRoot: Optional[Path] = None,
-        animationRoot: Optional[Path] = None,
+        validationIndicesPath: Optional[Path] = None,
+        maxSamplesPerEpoch: Optional[int] = None,
     ) -> None:
         self.datasetRoot = datasetRoot
-        self.promptRoot = promptRoot or datasetRoot
-        self.animationRoot = animationRoot or datasetRoot
-        self.maxLength = maxLength
         self.batchSize = batchSize
-        self.modelName = modelName
         self.validationSplit = validationSplit
-        self.maxSamples = maxSamples
-        self.rotateDataset = rotateDataset
-        self.motionProcessingConfig = MotionProcessingConfig(
-            motionSplitFrames=motionSplitFrames,
-            motionDownsampleTargetFrames=motionDownsampleTargetFrames,
-        )
-        self.cacheMotion = cacheMotion
-        self.currentOffset = 0
-        
-        # Memory management
+        self.modelMemoryBytes = modelMemoryBytes
+        self.device = device
+        self.validationIndicesPath = validationIndicesPath
+        self.maxSamplesPerEpoch = maxSamplesPerEpoch
+
         self.memoryConfig = memoryConfig or MemoryManagerConfig()
         self.memoryManager = MemoryManager(self.memoryConfig, device)
-        
-        # Lazy-loaded dataset
-        self._dataset: Optional[Dataset[Dict[str, object]]] = None
-        self._baseDataset: Optional[MotionTextClipDataset] = None
+
+        self._dataset: Optional[PreprocessedMotionDataset] = None
         self._totalSize: Optional[int] = None
-        self._allIndices: Optional[List[int]] = None
-        self._staticDataloaders: Optional[
-            Tuple[DataLoader, Optional[DataLoader], str]
-        ] = None
-        
-    def _ensureDataset(self) -> Dataset[Dict[str, object]]:
+        self._maxSamples: Optional[int] = None
+        self._fixedValidationIndices: Optional[List[int]] = None
+        self._fixedValidationIndexSet: Optional[set[int]] = None
+        self._fixedValidationLoader: Optional[DataLoader] = None
+
+    def _ensureDataset(self) -> PreprocessedMotionDataset:
         """
         Lazy-load dataset metadata.
-        
+
         Returns
         -------
-        Dataset[Dict[str, object]]
-            The processed dataset.
+        PreprocessedMotionDataset
+            Loaded preprocessed dataset.
         """
         if self._dataset is None:
-            LOGGER.info("MM: Loading dataset from %s", self.promptRoot)
-            self._baseDataset = self._buildBaseDataset()
-            self._dataset = self._wrapDataset(self._baseDataset)
+            LOGGER.info(
+                "MM: Loading preprocessed dataset from %s",
+                self.datasetRoot,
+            )
+            self._dataset = PreprocessedMotionDataset(self.datasetRoot)
             self._totalSize = len(self._dataset)
-            self._allIndices = list(range(self._totalSize))
-            self._staticDataloaders = None
-            LOGGER.info("MM: Dataset indexed: %d total samples", self._totalSize)
-            
+            self._maxSamples = None
+            LOGGER.info(
+                "MM: Dataset indexed: %d total samples",
+                self._totalSize,
+            )
         return self._dataset
 
-    def _buildBaseDataset(self) -> MotionTextClipDataset:
-        """
-        Build the base dataset instance.
+    @property
+    def dataset(self) -> PreprocessedMotionDataset:
+        """Return the underlying dataset instance."""
+        return self._ensureDataset()
 
-        Returns
-        -------
-        MotionTextClipDataset
-            Dataset instance without motion length transforms.
-        """
-        tokenizer = XLMRobertaTokenizerFast.from_pretrained(self.modelName)
-        return MotionTextClipDataset(
-            rootPrompts=self.promptRoot,
-            rootAnimations=self.animationRoot,
-            tokenizer=tokenizer,
-            maxLength=self.maxLength,
-            cacheMotion=self.cacheMotion,
-        )
-
-    def _wrapDataset(
-        self,
-        baseDataset: MotionTextClipDataset,
-    ) -> Dataset[Dict[str, object]]:
-        """
-        Apply motion length processing when configured.
-
-        Parameters
-        ----------
-        baseDataset : MotionTextClipDataset
-            Dataset providing motion and tokenization logic.
-        """
-        if not self.motionProcessingConfig.hasSplit() and not (
-            self.motionProcessingConfig.hasDownsample()
-        ):
-            return baseDataset
-        return MotionWindowDataset(baseDataset, self.motionProcessingConfig)
-    
     @property
     def totalSize(self) -> int:
         """Get total dataset size."""
         self._ensureDataset()
         return self._totalSize or 0
-    
+
     @property
     def effectiveSamplesPerEpoch(self) -> int:
         """Get effective samples used per epoch."""
-        if self.maxSamples is not None:
-            return min(self.maxSamples, self.totalSize)
-        return self.totalSize
-    
+        maxSamples = self._getMaxSamples()
+        return min(maxSamples, self.totalSize)
+
     @property
     def epochsForFullCoverage(self) -> int:
         """Get number of epochs needed to see full dataset."""
-        if not self.rotateDataset or self.maxSamples is None:
+        maxSamples = self._getMaxSamples()
+        if maxSamples <= 0:
             return 1
-        return math.ceil(self.totalSize / self.maxSamples)
-    
+        return math.ceil(self.totalSize / maxSamples)
+
     def getDataloadersForEpoch(
         self,
         epochIndex: int,
     ) -> Tuple[DataLoader, Optional[DataLoader], str]:
         """
         Get dataloaders for a specific epoch.
-        
+
         Parameters
         ----------
         epochIndex : int
             Zero-based epoch index.
-            
+
         Returns
         -------
         Tuple[DataLoader, Optional[DataLoader], str]
-            Train dataloader, optional validation dataloader, and chunk info string.
+            Train dataloader, optional validation dataloader, and chunk info.
         """
-        dataset = self._ensureDataset()
-        
-        if self.rotateDataset and self.maxSamples is not None:
-            return self._getRotatingDataloaders(epochIndex)
-        else:
-            return self._getStaticDataloaders()
-    
+        self._ensureDataset()
+        return self._getRotatingDataloaders(epochIndex)
+
     def _getRotatingDataloaders(
         self,
         epochIndex: int,
     ) -> Tuple[DataLoader, Optional[DataLoader], str]:
         """Get dataloaders with rotating chunk selection."""
         dataset = self._dataset
+        if dataset is None:
+            raise RuntimeError("Dataset not initialized.")
         totalSize = self._totalSize or len(dataset)
-        chunkSize = self.maxSamples or totalSize
-        
-        # Clear cache from previous chunk to free memory
+        chunkSize = self._getMaxSamples()
+        valIndexSet = self._getFixedValidationIndexSet()
+
         if epochIndex > 0:
-            self.clearMotionCache()
-        
-        # Calculate chunk boundaries
-        startIdx = (epochIndex * chunkSize) % totalSize
-        endIdx = min(startIdx + chunkSize, totalSize)
-        
-        # Handle wrap-around
-        if startIdx + chunkSize > totalSize:
-            indices = list(range(startIdx, totalSize)) + list(
-                range(0, (startIdx + chunkSize) % totalSize)
+            self.clearCache()
+
+        if chunkSize >= totalSize:
+            indices = list(range(totalSize))
+            chunkInfo = f"all {totalSize} samples"
+            return self._buildDataloaders(
+                indices,
+                chunkInfo,
+                valIndexSet,
             )
-        else:
-            indices = list(range(startIdx, endIdx))
-        
-        chunkInfo = f"samples {startIdx + 1}-{min(startIdx + chunkSize, totalSize)}/{totalSize}"
-        
+
+        startIndex, indices = _selectChunkIndices(
+            totalSize=totalSize,
+            chunkSize=chunkSize,
+            epochIndex=epochIndex,
+        )
+        chunkInfo = _formatChunkInfo(startIndex, chunkSize, totalSize)
         LOGGER.info(
             "MM: Loading chunk for epoch %d: %s",
             epochIndex + 1,
             chunkInfo,
         )
-        
-        return self._buildDataloaders(indices, chunkInfo)
-    
-    def _getStaticDataloaders(self) -> Tuple[DataLoader, Optional[DataLoader], str]:
-        """Get static dataloaders (all samples or limited)."""
-        if self._staticDataloaders is not None:
-            return self._staticDataloaders
-        dataset = self._dataset
-        totalSize = self._totalSize or len(dataset)
-        
-        if self.maxSamples is not None and self.maxSamples < totalSize:
-            indices = list(range(self.maxSamples))
-            chunkInfo = f"limited to {self.maxSamples}/{totalSize}"
-            LOGGER.info("MM: Using limited dataset: %s", chunkInfo)
-        else:
-            indices = list(range(totalSize))
-            chunkInfo = f"all {totalSize} samples"
-            
-        self._staticDataloaders = self._buildDataloaders(indices, chunkInfo)
-        return self._staticDataloaders
-    
+        return self._buildDataloaders(indices, chunkInfo, valIndexSet)
+
     def _buildDataloaders(
         self,
         indices: List[int],
         chunkInfo: str,
+        valIndexSet: Optional[set[int]] = None,
     ) -> Tuple[DataLoader, Optional[DataLoader], str]:
         """Build train/val dataloaders from indices."""
         dataset = self._dataset
+        if dataset is None:
+            raise RuntimeError("Dataset not initialized.")
+        if valIndexSet:
+            trainIndices = self._filterTrainingIndices(indices, valIndexSet)
+            trainLoader = self._makeDataloader(
+                Subset(dataset, trainIndices),
+                shuffle=True,
+            )
+            valLoader = self._buildFixedValidationLoader()
+            return trainLoader, valLoader, chunkInfo
         chunkSubset = Subset(dataset, indices)
-        
+
         if self.validationSplit <= 0.0 or len(indices) < 2:
             trainLoader = self._makeDataloader(chunkSubset, shuffle=True)
             return trainLoader, None, chunkInfo
-        
+
         valSize = max(1, int(len(indices) * self.validationSplit))
         trainSize = len(indices) - valSize
         trainSubset, valSubset = random_split(chunkSubset, [trainSize, valSize])
-        
+
         trainLoader = self._makeDataloader(trainSubset, shuffle=True)
         valLoader = self._makeDataloader(valSubset, shuffle=False)
-        
+
         return trainLoader, valLoader, chunkInfo
-    
+
     def _makeDataloader(
         self,
         dataset: Dataset[Dict[str, object]],
         shuffle: bool = True,
     ) -> DataLoader:
         """Create a dataloader with custom collation."""
+        numWorkers = _resolveNumWorkers()
+        pinMemory = self.device is not None and self.device.type == "cuda"
+        persistentWorkers = numWorkers > 0
+        prefetchFactor = DEFAULT_PREFETCH_FACTOR if numWorkers > 0 else None
         return DataLoader(
             dataset,
             batch_size=self.batchSize,
             shuffle=shuffle,
             collate_fn=motionTextCollate,
-            num_workers=0,
-            pin_memory=False,
+            num_workers=numWorkers,
+            pin_memory=pinMemory,
+            persistent_workers=persistentWorkers,
+            prefetch_factor=prefetchFactor,
         )
-    
+
     def checkMemory(self, batchIndex: int, force: bool = False) -> bool:
         """
         Check memory and cleanup if needed.
-        
+
         Parameters
         ----------
         batchIndex : int
             Current batch index.
         force : bool
             Force cleanup regardless of threshold.
-            
+
         Returns
         -------
         bool
             True if cleanup was performed.
         """
         return self.memoryManager.checkAndCleanup(batchIndex, force)
-    
-    def clearMotionCache(self) -> None:
+
+    def clearCache(self) -> None:
         """
-        Clear the motion cache.
-        
+        Clear dataset cache and memory.
+
         Call this between dataset rotations or when memory needs to be freed.
-        Also triggers garbage collection.
         """
-        if self._baseDataset is not None:
-            self._baseDataset.clearCache()
+        if self._dataset is not None:
+            self._dataset.clearCache()
         self.memoryManager._performCleanup()
-        LOGGER.info("MM: Motion cache and memory cleared")
-    
-    def getCacheStats(self) -> dict:
-        """Return cache hit/miss statistics."""
-        if self._baseDataset is not None:
-            return self._baseDataset.getCacheStats()
-        return {"hits": 0, "misses": 0, "hitRate": 0.0}
-    
+        LOGGER.info("MM: Dataset cache and memory cleared")
+
     def logMemoryStatus(self, context: str = "") -> None:
         """Log current memory usage."""
         self.memoryManager.logMemoryStatus(context)
+
+    def _getMaxSamples(self) -> int:
+        """
+        Return auto-computed max samples per epoch.
+
+        Returns
+        -------
+        int
+            Auto-computed chunk size.
+        """
+        if self._maxSamples is None:
+            autoSamples = _computeAutoChunkSize(
+                dataset=self.dataset,
+                batchSize=self.batchSize,
+                modelMemoryBytes=self.modelMemoryBytes,
+            )
+            LOGGER.info(
+                "MM: Auto chunk size: %d samples per epoch",
+                autoSamples,
+            )
+            self._maxSamples = autoSamples
+            if self.maxSamplesPerEpoch is not None:
+                if self.maxSamplesPerEpoch > 0:
+                    cappedSamples = min(
+                        self._maxSamples,
+                        self.maxSamplesPerEpoch,
+                    )
+                    if cappedSamples != self._maxSamples:
+                        LOGGER.info(
+                            "MM: Capping samples per epoch to %d",
+                            cappedSamples,
+                        )
+                    self._maxSamples = cappedSamples
+            coverage = _estimateCoverage(self.totalSize, self._maxSamples)
+            LOGGER.info(
+                "MM: Full dataset coverage every %d epochs",
+                coverage,
+            )
+        return max(self._maxSamples, MIN_SAMPLES)
+
+    def _filterTrainingIndices(
+        self,
+        indices: List[int],
+        valIndexSet: set[int],
+    ) -> List[int]:
+        """
+        Remove validation indices from the training set.
+        """
+        filtered = [idx for idx in indices if idx not in valIndexSet]
+        if filtered:
+            return filtered
+        LOGGER.warning(
+            "MM: Fixed validation set overlaps entire chunk; "
+            "falling back to full chunk for training.",
+        )
+        return indices
+
+    def _buildFixedValidationLoader(self) -> Optional[DataLoader]:
+        """
+        Build a fixed validation loader from stored indices.
+        """
+        if self._fixedValidationLoader is not None:
+            return self._fixedValidationLoader
+        valIndices = self._getFixedValidationIndices()
+        if valIndices is None:
+            return None
+        dataset = self._dataset
+        if dataset is None:
+            raise RuntimeError("Dataset not initialized.")
+        valSubset = Subset(dataset, valIndices)
+        self._fixedValidationLoader = self._makeDataloader(
+            valSubset,
+            shuffle=False,
+        )
+        LOGGER.info(
+            "MM: Using fixed validation set: %d samples",
+            len(valIndices),
+        )
+        return self._fixedValidationLoader
+
+    def _getFixedValidationIndexSet(self) -> Optional[set[int]]:
+        """
+        Return validation indices as a set for fast filtering.
+        """
+        if self._fixedValidationIndexSet is not None:
+            return self._fixedValidationIndexSet
+        valIndices = self._getFixedValidationIndices()
+        if valIndices is None:
+            return None
+        self._fixedValidationIndexSet = set(valIndices)
+        return self._fixedValidationIndexSet
+
+    def _getFixedValidationIndices(self) -> Optional[List[int]]:
+        """
+        Load or create fixed validation indices if configured.
+        """
+        if self.validationIndicesPath is None:
+            return None
+        if self.validationSplit <= 0.0:
+            return None
+        if self._fixedValidationIndices is not None:
+            return self._fixedValidationIndices
+        loaded = self._loadValidationIndices()
+        if loaded is None:
+            loaded = self._createValidationIndices()
+            self._saveValidationIndices(loaded)
+        self._fixedValidationIndices = loaded
+        return loaded
+
+    def _loadValidationIndices(self) -> Optional[List[int]]:
+        """
+        Load validation indices from disk if present and valid.
+        """
+        if self.validationIndicesPath is None:
+            return None
+        if not self.validationIndicesPath.exists():
+            return None
+        try:
+            payload = json.loads(
+                self.validationIndicesPath.read_text(encoding="utf-8")
+            )
+        except json.JSONDecodeError:
+            LOGGER.warning(
+                "MM: Invalid validation indices file, regenerating: %s",
+                self.validationIndicesPath,
+            )
+            return None
+        indices = payload.get(VALIDATION_INDICES_KEY)
+        if not isinstance(indices, list):
+            return None
+        if not indices:
+            return None
+        totalSize = self.totalSize
+        if any(
+            not isinstance(idx, int)
+            or idx < 0
+            or idx >= totalSize
+            for idx in indices
+        ):
+            LOGGER.warning(
+                "MM: Validation indices out of range, regenerating."
+            )
+            return None
+        return indices
+
+    def _createValidationIndices(self) -> List[int]:
+        """
+        Create a deterministic validation split for the full dataset.
+        """
+        totalSize = self.totalSize
+        if totalSize <= 0:
+            return []
+        valSize = max(int(totalSize * self.validationSplit), MIN_SAMPLES)
+        if totalSize > 1:
+            valSize = min(valSize, totalSize - 1)
+        generator = random.Random(DEFAULT_VALIDATION_SEED)
+        indices = list(range(totalSize))
+        generator.shuffle(indices)
+        return sorted(indices[:valSize])
+
+    def _saveValidationIndices(self, indices: List[int]) -> None:
+        """
+        Persist validation indices to disk for reuse.
+        """
+        if self.validationIndicesPath is None:
+            return
+        self.validationIndicesPath.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            VALIDATION_METADATA_KEY: {
+                VALIDATION_META_TOTAL: self.totalSize,
+                VALIDATION_META_SPLIT: self.validationSplit,
+                VALIDATION_META_SEED: DEFAULT_VALIDATION_SEED,
+            },
+            VALIDATION_INDICES_KEY: indices,
+        }
+        self.validationIndicesPath.write_text(
+            json.dumps(payload, indent=2),
+            encoding="utf-8",
+        )
+
+
+def estimateModelBytes(model: torch.nn.Module) -> int:
+    """
+    Estimate the memory footprint of a model.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        Model instance to inspect.
+
+    Returns
+    -------
+    int
+        Estimated bytes including training overhead.
+    """
+    parameterBytes = sum(
+        param.numel() * param.element_size() for param in model.parameters()
+    )
+    bufferBytes = sum(
+        buffer.numel() * buffer.element_size() for buffer in model.buffers()
+    )
+    totalBytes = parameterBytes + bufferBytes
+    return int(totalBytes * MODEL_MEMORY_MULTIPLIER)
+
+
+def _computeAutoChunkSize(
+    dataset: PreprocessedMotionDataset,
+    batchSize: int,
+    modelMemoryBytes: int,
+) -> int:
+    """
+    Compute an automatic chunk size from memory and model size.
+
+    Parameters
+    ----------
+    dataset : PreprocessedMotionDataset
+        Dataset providing average sample size.
+    batchSize : int
+        Training batch size.
+    modelMemoryBytes : int
+        Estimated model memory footprint.
+    """
+    availableBytes = psutil.virtual_memory().available
+    budgetBytes = int(availableBytes * AUTO_MEMORY_FRACTION) - modelMemoryBytes
+    if budgetBytes <= 0:
+        return max(batchSize, MIN_SAMPLES)
+    averageSampleBytes = dataset.getAverageSampleBytes()
+    if averageSampleBytes <= 0:
+        return max(batchSize, MIN_SAMPLES)
+    rawMaxSamples = int(budgetBytes / averageSampleBytes)
+    minSamples = max(batchSize * AUTO_MIN_SAMPLE_MULTIPLIER, MIN_SAMPLES)
+    boundedSamples = min(rawMaxSamples, len(dataset))
+    return max(boundedSamples, minSamples)
+
+
+def _estimateCoverage(totalSize: int, chunkSize: int) -> int:
+    """
+    Estimate epochs needed for full dataset coverage.
+
+    Parameters
+    ----------
+    totalSize : int
+        Total number of samples in the dataset.
+    chunkSize : int
+        Samples per epoch.
+    """
+    if chunkSize <= 0:
+        return 1
+    return math.ceil(totalSize / chunkSize)
+
+
+def _selectChunkIndices(
+    totalSize: int,
+    chunkSize: int,
+    epochIndex: int,
+) -> Tuple[int, List[int]]:
+    """
+    Select indices for a rotating dataset chunk.
+
+    Parameters
+    ----------
+    totalSize : int
+        Total number of samples in the dataset.
+    chunkSize : int
+        Number of samples per epoch.
+    epochIndex : int
+        Zero-based epoch index.
+    """
+    startIndex = (epochIndex * chunkSize) % totalSize
+    endIndex = min(startIndex + chunkSize, totalSize)
+    if startIndex + chunkSize > totalSize:
+        indices = list(range(startIndex, totalSize)) + list(
+            range(0, (startIndex + chunkSize) % totalSize)
+        )
+    else:
+        indices = list(range(startIndex, endIndex))
+    return startIndex, indices
+
+
+def _formatChunkInfo(startIndex: int, chunkSize: int, totalSize: int) -> str:
+    """
+    Format a human-readable chunk description.
+
+    Parameters
+    ----------
+    startIndex : int
+        Chunk start index.
+    chunkSize : int
+        Chunk size.
+    totalSize : int
+        Total dataset size.
+    """
+    endIndex = min(startIndex + chunkSize, totalSize)
+    return f"samples {startIndex + 1}-{endIndex}/{totalSize}"
+
+
+def _resolveNumWorkers() -> int:
+    """
+    Resolve default number of dataloader workers.
+
+    Returns
+    -------
+    int
+        Resolved worker count.
+    """
+    cpuCount = os.cpu_count() or 1
+    suggested = max(cpuCount // DEFAULT_NUM_WORKERS_DIVISOR, 1)
+    return min(suggested, MAX_NUM_WORKERS)

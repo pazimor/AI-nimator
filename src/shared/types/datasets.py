@@ -149,6 +149,168 @@ class DatasetBuilderConfig:
     paths: DatasetBuilderPaths
     processing: DatasetBuilderProcessing = DatasetBuilderProcessing()
 
+
+@dataclass(frozen=True)
+class PreprocessDatasetPaths:
+    """
+    Filesystem locations used by dataset preprocessing.
+
+    Attributes
+    ----------
+    inputRoot : Path
+        Root directory containing prompt.json and animation.json files.
+    outputRoot : Path
+        Destination directory for the preprocessed dataset.
+    """
+
+    inputRoot: Path
+    outputRoot: Path
+
+
+@dataclass(frozen=True)
+class PreprocessDatasetProcessing:
+    """
+    Behavioural settings for dataset preprocessing.
+
+    Attributes
+    ----------
+    modelName : str
+        Hugging Face tokenizer identifier used for preprocessing.
+    maxPromptLength : int
+        Token length used for preprocessing.
+    shardSize : int
+        Number of samples stored per shard.
+    splitFrames : Optional[int]
+        Split segments into windows of this size (None to disable).
+    downsampleTargetFrames : Optional[int]
+        Downsample each segment to this frame count (None to disable).
+    maxSegmentFrames : Optional[int]
+        Drop samples whose final frame count exceeds this limit.
+    """
+
+    modelName: str
+    maxPromptLength: int
+    shardSize: int
+    splitFrames: Optional[int] = None
+    downsampleTargetFrames: Optional[int] = None
+    maxSegmentFrames: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class PreprocessDatasetConfig:
+    """
+    Configuration used by the dataset preprocessor CLI.
+
+    Attributes
+    ----------
+    paths : PreprocessDatasetPaths
+        Filesystem layout for the preprocessor.
+    processing : PreprocessDatasetProcessing
+        Preprocessing options for motions and prompts.
+    """
+
+    paths: PreprocessDatasetPaths
+    processing: PreprocessDatasetProcessing
+
+
+@dataclass(frozen=True)
+class PreprocessedDatasetShardInfo:
+    """
+    Manifest entry describing a single shard.
+
+    Attributes
+    ----------
+    path : str
+        Relative path to the shard file from the dataset root.
+    sampleCount : int
+        Number of samples stored in the shard.
+    """
+
+    path: str
+    sampleCount: int
+
+
+@dataclass(frozen=True)
+class PreprocessedSampleIndex:
+    """
+    Index entry pointing to a preprocessed sample.
+
+    Attributes
+    ----------
+    shardIndex : int
+        Index of the shard containing the sample.
+    shardOffset : int
+        Offset of the sample within the shard.
+    frames : int
+        Frame count for the sample motion tensor.
+    sampleBytes : int
+        Approximate serialized size of the sample.
+    tag : str
+        Dataset tag associated with the sample.
+    sourceFile : str
+        Source identifier for traceability.
+    """
+
+    shardIndex: int
+    shardOffset: int
+    frames: int
+    sampleBytes: int
+    tag: str
+    sourceFile: str
+
+
+@dataclass(frozen=True)
+class PreprocessedDatasetManifest:
+    """
+    Dataset-level metadata for preprocessed datasets.
+
+    Attributes
+    ----------
+    version : int
+        Manifest schema version.
+    modelName : str
+        Tokenizer identifier used during preprocessing.
+    maxPromptLength : int
+        Token length used during preprocessing.
+    splitFrames : Optional[int]
+        Segment split size applied during preprocessing.
+    downsampleTargetFrames : Optional[int]
+        Downsample target applied during preprocessing.
+    maxSegmentFrames : Optional[int]
+        Frame-length filter applied during preprocessing.
+    shardSize : int
+        Number of samples stored per shard.
+    totalSamples : int
+        Total samples in the dataset.
+    averageSampleBytes : float
+        Mean estimated sample size in bytes.
+    maxSampleBytes : int
+        Maximum estimated sample size in bytes.
+    averageFrames : float
+        Mean frame count across samples.
+    maxFrames : int
+        Maximum frame count across samples.
+    shards : List[PreprocessedDatasetShardInfo]
+        Shard metadata list.
+    indexPath : str
+        Relative path to the sample index file.
+    """
+
+    version: int
+    modelName: str
+    maxPromptLength: int
+    splitFrames: Optional[int]
+    downsampleTargetFrames: Optional[int]
+    maxSegmentFrames: Optional[int]
+    shardSize: int
+    totalSamples: int
+    averageSampleBytes: float
+    maxSampleBytes: int
+    averageFrames: float
+    maxFrames: int
+    shards: List[PreprocessedDatasetShardInfo]
+    indexPath: str
+
 @dataclass(frozen=True)
 class PromptRecord:
     """Single row from the HumanML3D index CSV."""

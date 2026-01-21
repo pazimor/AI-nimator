@@ -5,13 +5,12 @@ from __future__ import annotations
 import gc
 import logging
 import os
-import signal
 import sys
 from pathlib import Path
 from typing import Iterable, Mapping, Optional, Tuple
 
 import torch
-from torch.utils.data import DataLoader, random_split, Subset
+from torch.utils.data import DataLoader
 
 # Limit CPU threads to reduce memory usage
 os.environ.setdefault("OMP_NUM_THREADS", "2")
@@ -29,223 +28,137 @@ if sys.platform == "darwin":
     except ImportError:
         pass  # pyobjc not installed, skip
 
-from src.shared.model.clip.data import MotionTextClipDataset, motionTextCollate
 from src.shared.model.generation.ddim import DDIM
-from src.shared.model.generation.losses import diffusionLoss
 from src.shared.model.generation.motion_generator import MotionGenerator
 from src.shared.progress import TrainingProgressBar
-from src.shared.types import GenerationTrainingConfig
-
-from transformers import XLMRobertaTokenizerFast
 
 BatchDict = Mapping[str, object]
+LossComponents = dict[str, float]
 LOGGER = logging.getLogger("generation.train")
+LOSS_COMPONENT_KEYS = (
+    "loss_diffusion",
+    "loss_geodesic",
+    "loss_velocity",
+    "loss_acceleration",
+)
+LOSS_COMPONENT_LABELS = {
+    "loss_diffusion": "diff",
+    "loss_geodesic": "geo",
+    "loss_velocity": "vel",
+    "loss_acceleration": "acc",
+}
 
 
-class RotatingDatasetManager:
+def _initLossComponents() -> LossComponents:
     """
-    Manages rotating through dataset chunks across epochs.
-    
-    Allows training on a small chunk per epoch while eventually
-    seeing the entire dataset over multiple epochs.
-    """
-    
-    def __init__(
-        self,
-        datasetRoot: Path,
-        maxLength: int,
-        batchSize: int,
-        modelName: str,
-        validationSplit: float,
-        chunkSize: int,
-    ) -> None:
-        self.datasetRoot = datasetRoot
-        self.maxLength = maxLength
-        self.batchSize = batchSize
-        self.modelName = modelName
-        self.validationSplit = validationSplit
-        self.chunkSize = chunkSize
-        self.currentOffset = 0
-        self._dataset: Optional[MotionTextClipDataset] = None
-        self._totalSize: Optional[int] = None
-        
-    def _ensureDataset(self) -> MotionTextClipDataset:
-        """Lazy-load dataset metadata (without loading motions)."""
-        if self._dataset is None:
-            tokenizer = XLMRobertaTokenizerFast.from_pretrained(self.modelName)
-            self._dataset = MotionTextClipDataset(
-                rootPrompts=self.datasetRoot,
-                rootAnimations=self.datasetRoot,
-                tokenizer=tokenizer,
-                maxLength=self.maxLength,
-                cacheMotion=False,
-            )
-            self._totalSize = len(self._dataset)
-            LOGGER.info("Dataset indexed: %d total samples", self._totalSize)
-        return self._dataset
-    
-    @property
-    def totalSize(self) -> int:
-        """Get total dataset size."""
-        self._ensureDataset()
-        return self._totalSize or 0
-    
-    def getDataloadersForEpoch(
-        self, epochIndex: int
-    ) -> Tuple[DataLoader, Optional[DataLoader], int, int]:
-        """
-        Get dataloaders for a specific epoch with rotated chunk.
-        
-        Returns
-        -------
-        Tuple containing:
-            - Train dataloader
-            - Validation dataloader (or None)
-            - Start index of chunk
-            - End index of chunk
-        """
-        dataset = self._ensureDataset()
-        totalSize = self._totalSize or len(dataset)
-        
-        # Calculate chunk boundaries
-        startIdx = (epochIndex * self.chunkSize) % totalSize
-        endIdx = min(startIdx + self.chunkSize, totalSize)
-        
-        # Handle wrap-around
-        if startIdx + self.chunkSize > totalSize:
-            # Wrap around to beginning
-            indices = list(range(startIdx, totalSize)) + list(range(0, (startIdx + self.chunkSize) % totalSize))
-        else:
-            indices = list(range(startIdx, endIdx))
-        
-        chunkSubset = Subset(dataset, indices)
-        
-        if self.validationSplit <= 0.0 or len(indices) < 2:
-            trainLoader = DataLoader(
-                chunkSubset,
-                batch_size=self.batchSize,
-                shuffle=True,
-                collate_fn=motionTextCollate,
-                num_workers=0,
-                pin_memory=False,
-            )
-            return trainLoader, None, startIdx, endIdx
-        
-        valSize = max(1, int(len(indices) * self.validationSplit))
-        trainSize = len(indices) - valSize
-        trainSubset, valSubset = random_split(chunkSubset, [trainSize, valSize])
-        
-        trainLoader = DataLoader(
-            trainSubset,
-            batch_size=self.batchSize,
-            shuffle=True,
-            collate_fn=motionTextCollate,
-            num_workers=0,
-            pin_memory=False,
-        )
-        valLoader = DataLoader(
-            valSubset,
-            batch_size=self.batchSize,
-            shuffle=False,
-            collate_fn=motionTextCollate,
-            num_workers=0,
-            pin_memory=False,
-        )
-        
-        return trainLoader, valLoader, startIdx, endIdx
-
-
-def buildTrainValDataloaders(
-    datasetRoot: Path,
-    maxLength: int,
-    batchSize: int,
-    modelName: str,
-    validationSplit: float,
-    maxSamples: Optional[int] = None,
-) -> Tuple[DataLoader, Optional[DataLoader]]:
-    """
-    Build train and validation dataloaders.
-
-    Parameters
-    ----------
-    datasetRoot : Path
-        Root directory containing prompt and animation files.
-    maxLength : int
-        Maximum token length for prompts.
-    batchSize : int
-        Batch size for training.
-    modelName : str
-        Hugging Face model name for tokenizer.
-    validationSplit : float
-        Fraction of data for validation.
-    maxSamples : Optional[int]
-        Maximum number of samples to use (None = use all).
+    Initialize loss component accumulators.
 
     Returns
     -------
-    Tuple[DataLoader, Optional[DataLoader]]
-        Training and optional validation dataloaders.
+    LossComponents
+        Zero-initialized component dictionary.
     """
-    tokenizer = XLMRobertaTokenizerFast.from_pretrained(modelName)
-    dataset = MotionTextClipDataset(
-        rootPrompts=datasetRoot,
-        rootAnimations=datasetRoot,
-        tokenizer=tokenizer,
-        maxLength=maxLength,
-        cacheMotion=False,  # Disable caching to reduce memory usage
-    )
-
-    if len(dataset) == 0:
-        raise ValueError(f"No samples found under {datasetRoot}")
-
-    # Limit dataset size if maxSamples is specified
-    effectiveDataset = dataset
-    if maxSamples is not None and maxSamples < len(dataset):
-        indices = list(range(maxSamples))
-        effectiveDataset = Subset(dataset, indices)
-        LOGGER.info("Dataset limited to %d samples (was %d)", maxSamples, len(dataset))
-
-    if validationSplit <= 0.0 or len(effectiveDataset) < 2:
-        return _makeDataloader(effectiveDataset, batchSize, shuffle=True), None
-
-    valSize = max(1, int(len(effectiveDataset) * validationSplit))
-    trainSize = len(effectiveDataset) - valSize
-    trainSubset, valSubset = random_split(effectiveDataset, [trainSize, valSize])
-
-    trainLoader = DataLoader(
-        trainSubset,
-        batch_size=batchSize,
-        shuffle=True,
-        collate_fn=motionTextCollate,
-        num_workers=0,
-        pin_memory=False,
-    )
-    valLoader = DataLoader(
-        valSubset,
-        batch_size=batchSize,
-        shuffle=False,
-        collate_fn=motionTextCollate,
-        num_workers=0,
-        pin_memory=False,
-    )
-
-    return trainLoader, valLoader
+    return {key: 0.0 for key in LOSS_COMPONENT_KEYS}
 
 
-def _makeDataloader(
-    dataset: MotionTextClipDataset,
-    batchSize: int,
-    shuffle: bool = True,
-) -> DataLoader:
-    """Create a dataloader with custom collation."""
-    return DataLoader(
-        dataset,
-        batch_size=batchSize,
-        shuffle=shuffle,
-        collate_fn=motionTextCollate,
-        num_workers=0,
-        pin_memory=False,
-    )
+def _extractLossComponents(
+    outputs: Mapping[str, torch.Tensor],
+) -> LossComponents:
+    """
+    Extract loss component values from model outputs.
+
+    Parameters
+    ----------
+    outputs : Mapping[str, torch.Tensor]
+        Output dictionary from the model forward pass.
+
+    Returns
+    -------
+    LossComponents
+        Dictionary with detached component values.
+    """
+    components: LossComponents = {}
+    for key in LOSS_COMPONENT_KEYS:
+        value = outputs.get(key)
+        if value is not None:
+            components[key] = float(value.detach().item())
+    return components
+
+
+def _updateLossComponents(
+    componentSums: LossComponents,
+    components: Mapping[str, float],
+) -> None:
+    """
+    Accumulate loss components into running sums.
+
+    Parameters
+    ----------
+    componentSums : LossComponents
+        Running sums to update.
+    components : Mapping[str, float]
+        Latest batch loss components.
+    """
+    for key, value in components.items():
+        if key in componentSums:
+            componentSums[key] += value
+
+
+def _averageLossComponents(
+    componentSums: Mapping[str, float],
+    batchCount: int,
+) -> LossComponents:
+    """
+    Compute average loss components from sums.
+
+    Parameters
+    ----------
+    componentSums : Mapping[str, float]
+        Running loss sums.
+    batchCount : int
+        Number of batches contributing to the sums.
+
+    Returns
+    -------
+    LossComponents
+        Average loss components per batch.
+    """
+    safeCount = max(batchCount, 1)
+    return {
+        key: value / safeCount for key, value in componentSums.items()
+    }
+
+
+def _buildLossPostfix(
+    lossValue: float,
+    avgLoss: float,
+    avgComponents: Mapping[str, float],
+) -> dict[str, str]:
+    """
+    Build progress bar postfix values for loss breakdown.
+
+    Parameters
+    ----------
+    lossValue : float
+        Current batch loss.
+    avgLoss : float
+        Average loss so far.
+    avgComponents : Mapping[str, float]
+        Average component losses.
+
+    Returns
+    -------
+    dict[str, str]
+        Postfix values for tqdm.
+    """
+    postfix = {
+        "loss": f"{lossValue:.4f}",
+        "avg": f"{avgLoss:.4f}",
+    }
+    for key, label in LOSS_COMPONENT_LABELS.items():
+        if key in avgComponents:
+            postfix[label] = f"{avgComponents[key]:.4f}"
+    return postfix
 
 
 def buildOptimizer(
@@ -283,7 +196,7 @@ def trainOneEpoch(
     totalEpochs: int = 1,
     chunkInfo: Optional[str] = None,
     memoryLimitGB: float = 0.0,
-) -> float:
+) -> tuple[float, LossComponents]:
     """
     Run a single training epoch.
 
@@ -312,13 +225,14 @@ def trainOneEpoch(
 
     Returns
     -------
-    float
-        Average training loss.
+    tuple[float, LossComponents]
+        Average training loss and average component losses.
     """
     from src.shared.dataset_manager import MemoryManager, MemoryManagerConfig
     
     model.train()
     numBatches = 0
+    componentSums = _initLossComponents()
     
     # Setup memory manager
     memoryConfig = MemoryManagerConfig(MM_memoryLimitGB=memoryLimitGB)
@@ -337,16 +251,28 @@ def trainOneEpoch(
         chunkInfo=chunkInfo,
     ) as pbar:
         for batch in pbar:
-            loss = _runBatchAccumulate(
+            lossValue, lossComponents = _runBatchAccumulate(
                 batch, model, ddim, device, gradientAccumulation
             )
-            pbar.updateLoss(loss)
+            pbar.updateLoss(lossValue)
+            _updateLossComponents(componentSums, lossComponents)
             numBatches += 1
             accumSteps += 1
+            avgComponents = _averageLossComponents(componentSums, numBatches)
+            pbar.setPostfix(
+                **_buildLossPostfix(
+                    lossValue=lossValue,
+                    avgLoss=pbar.metrics.avgLoss,
+                    avgComponents=avgComponents,
+                )
+            )
 
             # Step optimizer after accumulation
             if accumSteps >= gradientAccumulation:
-                torch.nn.utils.clip_grad_norm_(model.denoiser.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(
+                    model.denoiser.parameters(),
+                    max_norm=1.0,
+                )
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 accumSteps = 0
@@ -361,7 +287,8 @@ def trainOneEpoch(
         gc.collect()
         if device.type == "mps":
             torch.mps.empty_cache()
-        return pbar.metrics.avgLoss
+        avgComponents = _averageLossComponents(componentSums, numBatches)
+        return pbar.metrics.avgLoss, avgComponents
 
 
 def _runBatch(
@@ -370,7 +297,7 @@ def _runBatch(
     optimizer: torch.optim.Optimizer,
     ddim: DDIM,
     device: torch.device,
-) -> float:
+) -> tuple[float, LossComponents]:
     """
     Run forward/backward pass for a single batch.
 
@@ -389,15 +316,20 @@ def _runBatch(
 
     Returns
     -------
-    float
-        Batch loss value.
+    tuple[float, LossComponents]
+        Batch loss value and component breakdown.
     """
-    optimizer.zero_grad(set_to_none=True)  # More memory-efficient than zero_grad()
+    optimizer.zero_grad(
+        set_to_none=True
+    )  # More memory-efficient than zero_grad()
 
     # Move data to device
     inputIds = batch["input_ids"].to(device)
     attentionMask = batch["attention_mask"].to(device)
     motion = batch["motion"].to(device)
+    motionMask = batch.get("motion_mask")
+    if motionMask is not None:
+        motionMask = motionMask.to(device)
     tags = batch["tag"]
 
     # Delete batch reference early
@@ -418,9 +350,6 @@ def _runBatch(
 
     # Add noise to motion
     noisyMotion = ddim.q_sample(motion, timesteps, noise)
-    
-    # Delete original motion to save memory
-    del motion
 
     # Predict noise
     outputs = model(
@@ -430,12 +359,15 @@ def _runBatch(
         noisyMotion=noisyMotion,
         timesteps=timesteps,
         targetNoise=noise,
+        targetMotion=motion,
+        motionMask=motionMask,
     )
     
     # Delete inputs early
-    del inputIds, attentionMask, noisyMotion, tags
+    del inputIds, attentionMask, noisyMotion, tags, motion, motionMask
 
     loss = outputs["loss"]
+    lossComponents = _extractLossComponents(outputs)
     
     # Delete outputs dict early, keep only loss
     del outputs
@@ -452,7 +384,7 @@ def _runBatch(
     # Explicitly delete remaining tensors to free memory
     del noise, timesteps, loss
 
-    return lossValue
+    return lossValue, lossComponents
 
 
 def _runBatchAccumulate(
@@ -461,7 +393,7 @@ def _runBatchAccumulate(
     ddim: DDIM,
     device: torch.device,
     gradientAccumulation: int = 1,
-) -> float:
+) -> tuple[float, LossComponents]:
     """
     Run forward/backward pass for gradient accumulation (no optimizer step).
 
@@ -480,13 +412,16 @@ def _runBatchAccumulate(
 
     Returns
     -------
-    float
-        Batch loss value.
+    tuple[float, LossComponents]
+        Batch loss value and component breakdown.
     """
     # Move data to device
     inputIds = batch["input_ids"].to(device)
     attentionMask = batch["attention_mask"].to(device)
     motion = batch["motion"].to(device)
+    motionMask = batch.get("motion_mask")
+    if motionMask is not None:
+        motionMask = motionMask.to(device)
     tags = batch["tag"]
 
     del batch
@@ -506,7 +441,6 @@ def _runBatchAccumulate(
 
     # Add noise to motion
     noisyMotion = ddim.q_sample(motion, timesteps, noise)
-    del motion
 
     # Predict noise
     outputs = model(
@@ -516,11 +450,14 @@ def _runBatchAccumulate(
         noisyMotion=noisyMotion,
         timesteps=timesteps,
         targetNoise=noise,
+        targetMotion=motion,
+        motionMask=motionMask,
     )
     
-    del inputIds, attentionMask, noisyMotion, tags
+    del inputIds, attentionMask, noisyMotion, tags, motion, motionMask
 
     loss = outputs["loss"]
+    lossComponents = _extractLossComponents(outputs)
     del outputs
 
     # Scale loss for gradient accumulation
@@ -530,7 +467,7 @@ def _runBatchAccumulate(
     lossValue = float(loss.detach().item())
     del noise, timesteps, loss, scaledLoss
 
-    return lossValue
+    return lossValue, lossComponents
 
 
 def evaluateValidation(
@@ -538,7 +475,7 @@ def evaluateValidation(
     model: MotionGenerator,
     ddim: DDIM,
     device: torch.device,
-) -> float:
+) -> tuple[float, LossComponents]:
     """
     Compute average loss on validation set.
 
@@ -555,18 +492,22 @@ def evaluateValidation(
 
     Returns
     -------
-    float
-        Average validation loss.
+    tuple[float, LossComponents]
+        Average validation loss and component breakdown.
     """
     model.eval()
     totalLoss = 0.0
     numBatches = 0
+    componentSums = _initLossComponents()
 
     with torch.no_grad():
         for batch in dataloader:
             inputIds = batch["input_ids"].to(device)
             attentionMask = batch["attention_mask"].to(device)
             motion = batch["motion"].to(device)
+            motionMask = batch.get("motion_mask")
+            if motionMask is not None:
+                motionMask = motionMask.to(device)
             tags = batch["tag"]
 
             batchSize = motion.shape[0]
@@ -587,17 +528,34 @@ def evaluateValidation(
                 noisyMotion=noisyMotion,
                 timesteps=timesteps,
                 targetNoise=noise,
+                targetMotion=motion,
+                motionMask=motionMask,
             )
 
             totalLoss += float(outputs["loss"].item())
+            _updateLossComponents(
+                componentSums,
+                _extractLossComponents(outputs),
+            )
             numBatches += 1
 
             # Free memory in validation loop
-            del inputIds, attentionMask, motion, noisyMotion, noise, timesteps, outputs
+            del (
+                inputIds,
+                attentionMask,
+                motion,
+                noisyMotion,
+                noise,
+                timesteps,
+                outputs,
+                motionMask,
+            )
 
     gc.collect()
     model.train()
-    return totalLoss / max(numBatches, 1)
+    avgLoss = totalLoss / max(numBatches, 1)
+    avgComponents = _averageLossComponents(componentSums, numBatches)
+    return avgLoss, avgComponents
 
 
 def saveCheckpoint(
@@ -670,7 +628,11 @@ def loadCheckpoint(
     Tuple[int, float]
         Epoch and loss from checkpoint.
     """
-    checkpoint = torch.load(checkpointPath, weights_only=False, map_location="cpu")
+    checkpoint = torch.load(
+        checkpointPath,
+        weights_only=False,
+        map_location="cpu",
+    )
 
     # Try to load full model state first, fallback to denoiser only
     if "model_state_dict" in checkpoint:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
@@ -33,11 +33,14 @@ class GenerationTrainingPaths:
         Path to the pre-trained CLIP model checkpoint.
     checkpointDir : Path
         Directory to save generation model checkpoints.
+    validationIndices : Optional[Path]
+        Optional path for fixed validation indices.
     """
 
     datasetRoot: Path
     clipCheckpoint: Path
     checkpointDir: Path
+    validationIndices: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -63,10 +66,10 @@ class GenerationTrainingHyperparameters:
         Hugging Face identifier for the XLM-Roberta tokenizer.
     resumeCheckpoint : Optional[Path]
         Path to a checkpoint file to resume training from.
-    motionSplitFrames : Optional[int]
-        Maximum frames per sample after splitting (None to disable).
-    motionDownsampleTargetFrames : Optional[int]
-        Target frame count for temporal downsampling (None to disable).
+    maxSamplesPerEpoch : Optional[int]
+        Optional cap for samples per epoch.
+    fixedTrainChunk : bool
+        When True, reuse the same training chunk each epoch.
     
     Learning Rate Configuration
     ---------------------------
@@ -80,6 +83,13 @@ class GenerationTrainingHyperparameters:
         Schedule type: "constant", "cosine", "linear", "step".
     lrDecayEpochs : Optional[int]
         Decay phase length (default: epochs - warmup).
+
+    Loss Configuration
+    -----------------
+    geodesicWeight : float
+        Base geodesic loss weight.
+    geodesicWeightSchedule : str
+        Schedule mode for geodesic weighting.
     """
 
     batchSize: int
@@ -91,11 +101,9 @@ class GenerationTrainingHyperparameters:
     modelName: str = "xlm-roberta-base"
     resumeCheckpoint: Optional[Path] = None
     MM_memoryLimitGB: float = 0.0  # Memory limit in GB (0 = disabled)
-    maxSamples: Optional[int] = None  # Limit dataset size (None = use all)
     gradientAccumulation: int = 1  # Accumulate gradients over N batches
-    rotateDataset: bool = False  # Rotate through dataset chunks each epoch
-    motionSplitFrames: Optional[int] = None
-    motionDownsampleTargetFrames: Optional[int] = None
+    maxSamplesPerEpoch: Optional[int] = None
+    fixedTrainChunk: bool = False
     
     # Learning Rate Configuration
     learningRate: float = 0.001
@@ -103,6 +111,8 @@ class GenerationTrainingHyperparameters:
     lrWarmupEpochs: int = 0
     lrSchedule: str = "cosine"
     lrDecayEpochs: Optional[int] = None
+    geodesicWeight: float = 0.1
+    geodesicWeightSchedule: str = "none"
 
 
 @dataclass(frozen=True)
@@ -136,8 +146,8 @@ class GenerationInferenceConfig:
         Path to the trained generation model checkpoint.
     prompt : str
         Text prompt describing the motion.
-    tag : str
-        Categorical tag from the exhaustive list.
+    tag : Optional[str]
+        Categorical tag from the exhaustive list, if provided.
     frames : int
         Number of frames to generate.
     output : Path
@@ -150,11 +160,60 @@ class GenerationInferenceConfig:
 
     checkpoint: Path
     prompt: str
-    tag: str
+    tag: Optional[str]
     frames: int
     output: Path
     device: str = "auto"
     ddimSteps: int = 50
+
+
+@dataclass(frozen=True)
+class GenerationModelSettings:
+    """
+    Settings required to build a generation model for inference.
+
+    Attributes
+    ----------
+    modelName : str
+        Hugging Face identifier for the text encoder.
+    clipCheckpoint : Optional[Path]
+        Optional path to the CLIP checkpoint weights.
+    networkConfigPath : Optional[Path]
+        Optional path to the network configuration file.
+    profile : Optional[str]
+        Optional network profile name to load.
+    """
+
+    modelName: str
+    clipCheckpoint: Optional[Path]
+    networkConfigPath: Optional[Path] = None
+    profile: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class GenerationOutputOptions:
+    """
+    Output locations and export options for generated animations.
+
+    Attributes
+    ----------
+    jsonPath : Path
+        Destination path for the JSON animation payload.
+    daePath : Path
+        Destination path for the Collada export.
+    fps : Optional[int]
+        Optional frames per second override.
+    zeroRootTranslation : bool
+        Zero root translation during Collada export.
+    anchorRootTranslation : bool
+        Anchor root translation during Collada export.
+    """
+
+    jsonPath: Path
+    daePath: Path
+    fps: Optional[int] = None
+    zeroRootTranslation: bool = False
+    anchorRootTranslation: bool = False
 
 
 @dataclass(frozen=True)

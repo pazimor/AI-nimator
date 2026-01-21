@@ -11,6 +11,10 @@ import torch.nn as nn
 from src.shared.model.clip.core import ClipModel
 from src.shared.model.generation.ddim import DDIM
 from src.shared.model.generation.denoiser import MotionDenoiser
+from src.shared.model.generation.losses import (
+    DEFAULT_GEODESIC_WEIGHT,
+    GEODESIC_SCHEDULE_NONE,
+)
 from src.shared.model.layers.correction import (
     Renormalization,
     Smoothing,
@@ -37,6 +41,8 @@ class MotionGenerator(nn.Module):
         clipCheckpoint: Optional[Path] = None,
         smoothingKernel: int = 3,
         maxVelocity: Optional[float] = None,
+        geodesicWeight: float = DEFAULT_GEODESIC_WEIGHT,
+        geodesicWeightSchedule: str = GEODESIC_SCHEDULE_NONE,
     ) -> None:
         """
         Initialize MotionGenerator.
@@ -61,11 +67,17 @@ class MotionGenerator(nn.Module):
             Kernel size for temporal smoothing, by default 3.
         maxVelocity : Optional[float], optional
             Maximum velocity for regularization, by default None.
+        geodesicWeight : float, optional
+            Base geodesic loss weight, by default 0.1.
+        geodesicWeightSchedule : str, optional
+            Schedule for geodesic weighting, by default "none".
         """
         super().__init__()
         self.embedDim = embedDim
         self.numBones = numBones
         self.diffusionSteps = diffusionSteps
+        self.geodesicWeight = geodesicWeight
+        self.geodesicWeightSchedule = geodesicWeightSchedule
 
         # CLIP text encoder (frozen)
         self.clip = ClipModel(
@@ -99,6 +111,8 @@ class MotionGenerator(nn.Module):
         noisyMotion: torch.Tensor,
         timesteps: torch.Tensor,
         targetNoise: Optional[torch.Tensor] = None,
+        targetMotion: Optional[torch.Tensor] = None,
+        motionMask: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass for training.
@@ -117,6 +131,10 @@ class MotionGenerator(nn.Module):
             Diffusion timesteps shaped (batch,).
         targetNoise : Optional[torch.Tensor], optional
             Ground truth noise for loss computation.
+        targetMotion : Optional[torch.Tensor], optional
+            Ground truth clean motion for auxiliary losses.
+        motionMask : Optional[torch.Tensor], optional
+            Boolean mask indicating valid (non-padded) frames.
 
         Returns
         -------
@@ -131,19 +149,51 @@ class MotionGenerator(nn.Module):
             )
 
         # Predict noise
+        padMask = None
+        if motionMask is not None:
+            padMask = ~motionMask.bool()
+
         predictedNoise = self.denoiser(
             noisyMotion=noisyMotion,
             textEmbedding=textEmbeds,
             tags=tags,
             timesteps=timesteps,
+            mask=padMask,
         )
 
         result = {"predicted_noise": predictedNoise}
 
         if targetNoise is not None:
-            from src.shared.model.generation.losses import diffusionLoss
-            loss = diffusionLoss(predictedNoise, targetNoise)
-            result["loss"] = loss
+            if targetMotion is None:
+                from src.shared.model.generation.losses import diffusionLoss
+
+                loss = diffusionLoss(
+                    predictedNoise,
+                    targetNoise,
+                    motionMask=motionMask,
+                )
+                result["loss"] = loss
+            else:
+                from src.shared.model.generation.losses import combinedGenerationLoss
+
+                predictedMotion = self.ddim.predict_start_from_noise(
+                    noisyMotion,
+                    timesteps,
+                    predictedNoise,
+                )
+                loss, components = combinedGenerationLoss(
+                    predictedNoise=predictedNoise,
+                    targetNoise=targetNoise,
+                    predictedMotion=predictedMotion,
+                    targetMotion=targetMotion,
+                    geodesicWeight=self.geodesicWeight,
+                    geodesicWeightSchedule=self.geodesicWeightSchedule,
+                    timesteps=timesteps,
+                    numTimesteps=self.ddim.num_timesteps,
+                    motionMask=motionMask,
+                )
+                result["loss"] = loss
+                result.update(components)
 
         return result
 

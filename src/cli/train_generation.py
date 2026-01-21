@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 import torch
 
@@ -17,7 +17,11 @@ from src.features.generation.train_generation import (
     saveCheckpoint,
     trainOneEpoch,
 )
-from src.shared.dataset_manager import DatasetManager, MemoryManagerConfig
+from src.shared.dataset_manager import (
+    DatasetManager,
+    MemoryManagerConfig,
+    estimateModelBytes,
+)
 from src.shared.config_loader import loadNetworkConfig
 from src.shared.learning_rate import LearningRateScheduler, LearningRateConfig
 from src.shared.model.generation.ddim import DDIM
@@ -102,7 +106,9 @@ def _runTraining(
     LOGGER.info("Using device: %s", device)
     
     # Log effective batch size
-    effectiveBatchSize = config.training.batchSize * config.training.gradientAccumulation
+    effectiveBatchSize = (
+        config.training.batchSize * config.training.gradientAccumulation
+    )
     LOGGER.info(
         "Batch size: %d x %d accumulation = %d effective",
         config.training.batchSize,
@@ -110,44 +116,14 @@ def _runTraining(
         effectiveBatchSize,
     )
 
-    # Setup dataset manager
-    memoryConfig = MemoryManagerConfig(
-        MM_memoryLimitGB=config.training.MM_memoryLimitGB,
-    )
-    datasetManager = DatasetManager(
-        datasetRoot=config.paths.datasetRoot,
-        maxLength=config.training.maxPromptLength,
-        batchSize=config.training.batchSize,
-        modelName=config.training.modelName,
-        validationSplit=config.training.validationSplit,
-        maxSamples=config.training.maxSamples,
-        rotateDataset=config.training.rotateDataset,
-        motionSplitFrames=config.training.motionSplitFrames,
-        motionDownsampleTargetFrames=(
-            config.training.motionDownsampleTargetFrames
-        ),
-        cacheMotion=False,
-        memoryConfig=memoryConfig,
-        device=device,
-    )
-    LOGGER.info("Dataset indexed: %d total samples", datasetManager.totalSize)
-    if config.training.rotateDataset and config.training.maxSamples:
-        LOGGER.info(
-            "Dataset rotation enabled: %d samples per epoch",
-            datasetManager.effectiveSamplesPerEpoch,
-        )
-        LOGGER.info(
-            "Full dataset coverage every %d epochs",
-            datasetManager.epochsForFullCoverage,
-        )
-
     # Load network configuration
     networkConfig = loadNetworkConfig(
         configPath=config.networkConfigPath,
         profile=profile,
     )
     LOGGER.info(
-        "Network config: embed_dim=%d, num_heads=%d, num_layers=%d, diffusion_steps=%d",
+        "Network config: embed_dim=%d, num_heads=%d, num_layers=%d, "
+        "diffusion_steps=%d",
         networkConfig.embedDim,
         networkConfig.generation.numHeads,
         networkConfig.generation.numLayers,
@@ -163,8 +139,33 @@ def _runTraining(
         diffusionSteps=networkConfig.generation.diffusionSteps,
         modelName=config.training.modelName,
         clipCheckpoint=config.paths.clipCheckpoint,
+        geodesicWeight=config.training.geodesicWeight,
+        geodesicWeightSchedule=config.training.geodesicWeightSchedule,
     ).to(device)
-    LOGGER.info("Model initialized with CLIP from %s", config.paths.clipCheckpoint)
+    LOGGER.info(
+        "Model initialized with CLIP from %s",
+        config.paths.clipCheckpoint,
+    )
+
+    modelMemoryBytes = estimateModelBytes(model)
+    memoryConfig = MemoryManagerConfig(
+        MM_memoryLimitGB=config.training.MM_memoryLimitGB,
+    )
+    datasetManager = DatasetManager(
+        datasetRoot=config.paths.datasetRoot,
+        batchSize=config.training.batchSize,
+        validationSplit=config.training.validationSplit,
+        modelMemoryBytes=modelMemoryBytes,
+        memoryConfig=memoryConfig,
+        device=device,
+        validationIndicesPath=config.paths.validationIndices,
+        maxSamplesPerEpoch=config.training.maxSamplesPerEpoch,
+    )
+    datasetManager.dataset.validateCompatibility(
+        modelName=config.training.modelName,
+        maxPromptLength=config.training.maxPromptLength,
+    )
+    LOGGER.info("Dataset indexed: %d total samples", datasetManager.totalSize)
 
     # Build optimizer
     optimizer = buildOptimizer(
@@ -173,7 +174,9 @@ def _runTraining(
     )
 
     # Build DDIM scheduler and move to device
-    ddim = DDIM(num_timesteps=networkConfig.generation.diffusionSteps).to(device)
+    ddim = DDIM(
+        num_timesteps=networkConfig.generation.diffusionSteps
+    ).to(device)
 
     # Learning rate scheduler with configurable warmup and decay
     lrConfig = LearningRateConfig(
@@ -194,10 +197,15 @@ def _runTraining(
     startEpoch = 0
     trainLoss = 0.0
     epochsRun = 0
+    if config.training.fixedTrainChunk:
+        LOGGER.info("Using fixed training chunk for overfit testing.")
 
     # Resume from checkpoint if specified
     if config.training.resumeCheckpoint is not None:
-        LOGGER.info("Resuming from checkpoint: %s", config.training.resumeCheckpoint)
+        LOGGER.info(
+            "Resuming from checkpoint: %s",
+            config.training.resumeCheckpoint,
+        )
         resumedEpoch, resumedLoss = loadCheckpoint(
             checkpointPath=config.training.resumeCheckpoint,
             model=model,
@@ -214,30 +222,47 @@ def _runTraining(
     # Training loop
     for epochIndex in range(startEpoch, config.training.epochs):
         epochsRun = epochIndex + 1 - startEpoch
-        currentLr = optimizer.param_groups[0]['lr']
+        currentLr = optimizer.param_groups[0]["lr"]
         
-        # Get dataloaders for this epoch (rotating or static)
-        trainLoader, valLoader, chunkInfo = datasetManager.getDataloadersForEpoch(
-            epochIndex
+        # Get dataloaders for this epoch (auto-rotating)
+        dataloaderIndex = 0 if config.training.fixedTrainChunk else epochIndex
+        trainLoader, valLoader, chunkInfo = (
+            datasetManager.getDataloadersForEpoch(dataloaderIndex)
         )
 
-        trainLoss = trainOneEpoch(
-            trainLoader, model, optimizer, ddim, device,
+        trainLoss, trainComponents = trainOneEpoch(
+            trainLoader,
+            model,
+            optimizer,
+            ddim,
+            device,
             gradientAccumulation=config.training.gradientAccumulation,
             epoch=epochIndex + 1,
             totalEpochs=config.training.epochs,
             chunkInfo=chunkInfo,
             memoryLimitGB=config.training.MM_memoryLimitGB,
         )
-        LOGGER.info("Epoch %s train loss: %.4f (lr=%.6f)", epochIndex + 1, trainLoss, currentLr)
+        LOGGER.info(
+            "Epoch %s train loss: %.4f (lr=%.6f)",
+            epochIndex + 1,
+            trainLoss,
+            currentLr,
+        )
+        _logLossComponents("train", epochIndex + 1, trainComponents)
         
         # Update learning rate
         scheduler.step()
 
         # Validation evaluation
         if valLoader is not None:
-            valLoss = evaluateValidation(valLoader, model, ddim, device)
+            valLoss, valComponents = evaluateValidation(
+                valLoader,
+                model,
+                ddim,
+                device,
+            )
             LOGGER.info("Epoch %s val loss: %.4f", epochIndex + 1, valLoss)
+            _logLossComponents("val", epochIndex + 1, valComponents)
 
             # Checkpointing - save best model
             if bestValLoss is None or valLoss < bestValLoss:
@@ -259,9 +284,13 @@ def _runTraining(
                 )
 
             # Early stopping check
-            if epochsWithoutImprovement >= config.training.earlyStoppingPatience:
+            if (
+                epochsWithoutImprovement
+                >= config.training.earlyStoppingPatience
+            ):
                 LOGGER.info(
-                    "Early stopping triggered after %s epochs without improvement",
+                    "Early stopping triggered after %s epochs "
+                    "without improvement",
                     epochsWithoutImprovement,
                 )
                 break
@@ -283,6 +312,38 @@ def _runTraining(
         finalLoss=finalLoss,
         device=device.type,
     )
+
+
+def _logLossComponents(
+    phase: str,
+    epoch: int,
+    components: Mapping[str, float],
+) -> None:
+    """
+    Log loss component breakdown for the given phase.
+
+    Parameters
+    ----------
+    phase : str
+        Training phase label (e.g., "train", "val").
+    epoch : int
+        Current epoch number (1-based).
+    components : Mapping[str, float]
+        Loss component averages.
+    """
+    if not components:
+        return
+    LOGGER.info(
+        "Epoch %s %s components: diff=%.4f geo=%.4f "
+        "vel=%.4f acc=%.4f",
+        epoch,
+        phase,
+        components.get("loss_diffusion", 0.0),
+        components.get("loss_geodesic", 0.0),
+        components.get("loss_velocity", 0.0),
+        components.get("loss_acceleration", 0.0),
+    )
+
 
 def _resolveDevice(choice: str) -> torch.device:
     """

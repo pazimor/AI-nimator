@@ -1,0 +1,15 @@
+paths:
+  input-root: "/Users/pazimor/dataset"
+  output-root: "/Users/pazimor/dataset_preprocessed"
+
+processing:
+  model-name: xlm-roberta-base
+  max-length: 256
+  shard-size: 256
+  
+  # Choose one: split-frames OR downsample-target-frames
+  split-frames: 512
+  downsample-target-frames: null
+  
+  # Drop samples whose final frame count exceeds this limit
+  max-segment-frames: 512

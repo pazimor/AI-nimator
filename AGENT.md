@@ -1,6 +1,6 @@
-# 🚀 Codex – Project Coding Guidelines
+# 🚀 Project Coding Guidelines
 
-> **Purpose**: Provide Codex with a concise, self-contained reference of my project conventions so that every suggestion matches my standards **by default**.
+> **Purpose**: Provide Codex a baseline, for my project conventions so that every suggestion matches my standards **by default**.
 >
 > **Scope**: Coding style, architecture, best practices, testing, performance, and more.
 
@@ -8,18 +8,19 @@
 
 ## 1 • Project Context
 
-1. **Framework:** check `pyproject.toml` for each library used
-2. **Environment** setup in a specific .venv
+- **Framework:** check `pyproject.toml` for each library used
+- **Environment** setup with poetry
+- usage of **PyLance** for lint
 
 ---
 
 ## 2 • Golden Rules
 
 1. Document every method with full **DOCString** (NumPy Style).
+2. Be complient with Pylance
 3. Avoid **magic numbers** and strings: always use named constants or enums.
 4. Use **explicit functions** (pure and reusable).
 5. Avoid shortcuts: no `i`, `m`, etc. in anonymous functions or methods.
-6. Avoid `fonction = fonction2` rename fonction2 as fonction and change occurences
 
 ---
 
@@ -53,6 +54,35 @@
 
 try to folow the project structure
 
+```
+.
+├── doc
+├── src
+│   ├── cli
+│   │   ├── [first client]
+│   │   ├── [seconde client]
+│   │   └── [third client]
+│   ├── configs
+│   ├── features
+│   │   ├── [features for first client]
+│   │   ├── [features for seconde client]
+│   │   └── [Features for third client]
+│   └── shared
+│       ├── constants
+│       ├── model
+│       └── types
+└── test //testings files extract from the dataset
+```
+
+Inside features, each Clis got there specific Code here,
+if the an other Cli needs it you have to move the fonction inside shared
+
+### dataset and trained model
+
+dataset-root: "~/dataset_preprocessed"
+model_clip_dir: "src/configs/output/clip"
+model_generation_dir: "src/configs/output/generation"
+
 ---
 
 ## 5 • Testing & Quality
@@ -61,6 +91,7 @@ try to folow the project structure
 
 - Every `test_*.py` file must be **next to** the source file it tests (same folder).
 
+if you need to run a python commande use the virtual env in `~/.venv/`
 ---
 
 ## 6 • Documentation

@@ -6,10 +6,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+DEFAULT_DIFFUSION_WEIGHT = 1.0
+DEFAULT_GEODESIC_WEIGHT = 0.1
+DEFAULT_VELOCITY_WEIGHT = 0.01
+DEFAULT_ACCELERATION_WEIGHT = 0.001
+GEODESIC_SCHEDULE_NONE = "none"
+GEODESIC_SCHEDULE_TIMESTEP = "timestep"
+MIN_DIFFUSION_STEPS = 1
+
 
 def diffusionLoss(
     predictedNoise: torch.Tensor,
     targetNoise: torch.Tensor,
+    motionMask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Standard MSE loss for noise prediction in diffusion models.
@@ -20,19 +29,23 @@ def diffusionLoss(
         Predicted noise from the denoiser.
     targetNoise : torch.Tensor
         Ground truth noise that was added.
+    motionMask : torch.Tensor | None, optional
+        Boolean mask indicating valid (non-padded) frames.
 
     Returns
     -------
     torch.Tensor
         Scalar MSE loss.
     """
-    return F.mse_loss(predictedNoise, targetNoise)
+    squaredError = (predictedNoise - targetNoise) ** 2
+    return _maskedMean(squaredError, motionMask)
 
 
 def geodesicLoss(
     predicted: torch.Tensor,
     target: torch.Tensor,
     eps: float = 1e-7,
+    motionMask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Geodesic loss for 6D rotation representations.
@@ -47,6 +60,8 @@ def geodesicLoss(
         Target 6D rotations shaped (..., 6).
     eps : float, optional
         Epsilon for numerical stability, by default 1e-7.
+    motionMask : torch.Tensor | None, optional
+        Boolean mask indicating valid (non-padded) frames.
 
     Returns
     -------
@@ -63,18 +78,18 @@ def geodesicLoss(
     # Trace of rotation matrix
     trace = diff[..., 0, 0] + diff[..., 1, 1] + diff[..., 2, 2]
 
-    # Clamp to valid range for arccos
-    trace = torch.clamp(trace, -1.0 + eps, 3.0 - eps)
-
     # Geodesic distance: arccos((trace - 1) / 2)
-    angle = torch.acos((trace - 1.0) / 2.0)
+    cos = (trace - 1.0) / 2.0
+    cos = torch.clamp(cos, -1.0 + eps, 1.0 - eps)
+    angle = torch.acos(cos)
 
-    return angle.mean()
+    return _maskedMean(angle, motionMask)
 
 
 def velocityLoss(
     motion: torch.Tensor,
     weight: float = 1.0,
+    motionMask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Temporal velocity regularization loss.
@@ -87,6 +102,8 @@ def velocityLoss(
         Motion sequence shaped (batch, frames, bones, channels).
     weight : float, optional
         Loss weight, by default 1.0.
+    motionMask : torch.Tensor | None, optional
+        Boolean mask indicating valid (non-padded) frames.
 
     Returns
     -------
@@ -97,12 +114,15 @@ def velocityLoss(
         return torch.tensor(0.0, device=motion.device)
 
     velocity = motion[:, 1:] - motion[:, :-1]
-    return weight * (velocity ** 2).mean()
+    if motionMask is not None:
+        motionMask = motionMask[:, 1:] & motionMask[:, :-1]
+    return weight * _maskedMean(velocity ** 2, motionMask)
 
 
 def accelerationLoss(
     motion: torch.Tensor,
     weight: float = 1.0,
+    motionMask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Temporal acceleration regularization loss.
@@ -115,6 +135,8 @@ def accelerationLoss(
         Motion sequence shaped (batch, frames, bones, channels).
     weight : float, optional
         Loss weight, by default 1.0.
+    motionMask : torch.Tensor | None, optional
+        Boolean mask indicating valid (non-padded) frames.
 
     Returns
     -------
@@ -126,7 +148,13 @@ def accelerationLoss(
 
     velocity = motion[:, 1:] - motion[:, :-1]
     acceleration = velocity[:, 1:] - velocity[:, :-1]
-    return weight * (acceleration ** 2).mean()
+    if motionMask is not None:
+        motionMask = (
+            motionMask[:, 2:]
+            & motionMask[:, 1:-1]
+            & motionMask[:, :-2]
+        )
+    return weight * _maskedMean(acceleration ** 2, motionMask)
 
 
 def combinedGenerationLoss(
@@ -134,10 +162,14 @@ def combinedGenerationLoss(
     targetNoise: torch.Tensor,
     predictedMotion: torch.Tensor,
     targetMotion: torch.Tensor,
-    diffusionWeight: float = 1.0,
-    geodesicWeight: float = 0.1,
-    velocityWeight: float = 0.01,
-    accelerationWeight: float = 0.001,
+    diffusionWeight: float = DEFAULT_DIFFUSION_WEIGHT,
+    geodesicWeight: float = DEFAULT_GEODESIC_WEIGHT,
+    velocityWeight: float = DEFAULT_VELOCITY_WEIGHT,
+    accelerationWeight: float = DEFAULT_ACCELERATION_WEIGHT,
+    geodesicWeightSchedule: str = GEODESIC_SCHEDULE_NONE,
+    timesteps: torch.Tensor | None = None,
+    numTimesteps: int | None = None,
+    motionMask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
     Combined loss for motion generation training.
@@ -160,20 +192,47 @@ def combinedGenerationLoss(
         Weight for velocity loss, by default 0.01.
     accelerationWeight : float, optional
         Weight for acceleration loss, by default 0.001.
+    geodesicWeightSchedule : str, optional
+        Schedule mode for geodesic weight, by default "none".
+    timesteps : torch.Tensor | None, optional
+        Diffusion timesteps for schedule-aware weighting.
+    numTimesteps : int | None, optional
+        Total diffusion steps for schedule-aware weighting.
+    motionMask : torch.Tensor | None, optional
+        Boolean mask indicating valid (non-padded) frames.
 
     Returns
     -------
     tuple[torch.Tensor, dict[str, torch.Tensor]]
         Total loss and dictionary of individual loss components.
     """
-    lossDiff = diffusionLoss(predictedNoise, targetNoise)
-    lossGeo = geodesicLoss(predictedMotion, targetMotion)
-    lossVel = velocityLoss(predictedMotion, velocityWeight)
-    lossAcc = accelerationLoss(predictedMotion, accelerationWeight)
+    lossDiff = diffusionLoss(predictedNoise, targetNoise, motionMask)
+    lossGeo = geodesicLoss(
+        predictedMotion,
+        targetMotion,
+        motionMask=motionMask,
+    )
+    geoWeight = _resolveGeodesicWeight(
+        geodesicWeight,
+        geodesicWeightSchedule,
+        timesteps,
+        numTimesteps,
+        predictedNoise.device,
+    )
+    lossVel = velocityLoss(
+        predictedMotion,
+        velocityWeight,
+        motionMask=motionMask,
+    )
+    lossAcc = accelerationLoss(
+        predictedMotion,
+        accelerationWeight,
+        motionMask=motionMask,
+    )
 
     total = (
         diffusionWeight * lossDiff
-        + geodesicWeight * lossGeo
+        + geoWeight * lossGeo
         + lossVel
         + lossAcc
     )
@@ -186,6 +245,48 @@ def combinedGenerationLoss(
     }
 
     return total, components
+
+
+def _resolveGeodesicWeight(
+    baseWeight: float,
+    schedule: str,
+    timesteps: torch.Tensor | None,
+    numTimesteps: int | None,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Resolve geodesic weight based on schedule and timesteps.
+    """
+    if schedule == GEODESIC_SCHEDULE_NONE:
+        return torch.tensor(baseWeight, device=device)
+    if schedule == GEODESIC_SCHEDULE_TIMESTEP:
+        if timesteps is None or numTimesteps is None:
+            return torch.tensor(baseWeight, device=device)
+        denom = max(numTimesteps - 1, MIN_DIFFUSION_STEPS)
+        weights = 1.0 - (timesteps.float() / float(denom))
+        return weights.mean() * baseWeight
+    raise ValueError(f"Unknown geodesic schedule: {schedule}")
+
+
+def _maskedMean(
+    values: torch.Tensor,
+    motionMask: torch.Tensor | None,
+) -> torch.Tensor:
+    """
+    Compute mean over valid frames when a motion mask is provided.
+    """
+    values = torch.nan_to_num(values)
+    if motionMask is None:
+        return values.mean()
+    mask = motionMask.to(values.device).float()
+    while mask.dim() < values.dim():
+        mask = mask.unsqueeze(-1)
+    masked = values * mask
+    valid = mask.sum()
+    if float(valid.item()) == 0.0:
+        return torch.tensor(0.0, device=values.device)
+    scale = values.numel() / mask.numel()
+    return masked.sum() / (valid * scale)
 
 
 def _sixdToRotationMatrix(sixd: torch.Tensor) -> torch.Tensor:

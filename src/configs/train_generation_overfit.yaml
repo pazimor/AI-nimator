@@ -1,0 +1,24 @@
+paths:
+  dataset-root: "/Users/pazimor/dataset_preprocessed"
+  clip-checkpoint: "output/clip/best_model-512.pt"
+  checkpoint-dir: "output/generation_overfit"
+  network-config: "network.yaml"
+
+training:
+  epochs: 3
+  device: mps
+  max-length: 256
+  model-name: xlm-roberta-base
+  validation-split: 0.0
+  early-stopping-patience: 3
+  batch-size: 8
+  gradient-accumulation: 1
+  max-samples-per-epoch: 64
+  fixed-train-chunk: true
+  MM-memory-limit-gb: 0.0
+  learning-rate: 0.001
+  lr-min: 0.00001
+  lr-warmup-epochs: 0
+  lr-schedule: cosine
+  geodesic-weight: 0.1
+  geodesic-weight-schedule: timestep

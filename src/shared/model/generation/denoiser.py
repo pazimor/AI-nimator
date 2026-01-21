@@ -11,6 +11,7 @@ import torch.nn as nn
 from src.shared.model.layers.attention import MultiHeadAttention
 from src.shared.model.layers.normalization import AdaLN, FiLM
 from src.shared.model.layers.positional import RoPE
+from src.shared.model.layers.spatial_gcn import SpatialGCNBlock
 from src.shared.model.layers.temporal import TemporalLayer
 from src.shared.model.layers.transform import TransformLayer
 from src.shared.types.generation import VALID_TAGS
@@ -222,6 +223,7 @@ class MotionDenoiser(nn.Module):
         numBones: int = 65,
         motionChannels: int = 6,
         dropout: float = 0.1,
+        numSpatialLayers: int = 1,
     ) -> None:
         """
         Initialize MotionDenoiser.
@@ -240,6 +242,8 @@ class MotionDenoiser(nn.Module):
             Channels per bone (6D rotation), by default 6.
         dropout : float, optional
             Dropout rate, by default 0.1.
+        numSpatialLayers : int, optional
+            Number of spatial GCN blocks, by default 1.
         """
         super().__init__()
         self.embedDim = embedDim
@@ -247,7 +251,8 @@ class MotionDenoiser(nn.Module):
         self.motionChannels = motionChannels
 
         # Input projections
-        self.motionProj = nn.Linear(numBones * motionChannels, embedDim)
+        self.boneProj = nn.Linear(motionChannels, embedDim)
+        self.frameProj = nn.Linear(numBones * embedDim, embedDim)
         self.textProj = nn.Linear(embedDim, embedDim)
 
         # Conditioning embeddings
@@ -256,6 +261,18 @@ class MotionDenoiser(nn.Module):
 
         # Conditioning dimension: tag + timestep
         condDim = embedDim * 2
+
+        # Spatial blocks (GCN over bones per frame)
+        self.spatialBlocks = nn.ModuleList(
+            [
+                SpatialGCNBlock(
+                    numBones=numBones,
+                    embedDim=embedDim,
+                    dropout=dropout,
+                )
+                for _ in range(numSpatialLayers)
+            ]
+        )
 
         # Denoising blocks
         self.blocks = nn.ModuleList([
@@ -298,11 +315,14 @@ class MotionDenoiser(nn.Module):
         """
         batch, frames, bones, channels = noisyMotion.shape
 
-        # Flatten motion: (batch, frames, bones * channels)
-        motionFlat = noisyMotion.view(batch, frames, bones * channels)
+        # Bone-wise projection + spatial GCN.
+        boneH = self.boneProj(noisyMotion)
+        for block in self.spatialBlocks:
+            boneH = block(boneH)
 
-        # Project motion and text
-        motionH = self.motionProj(motionFlat)
+        # Flatten per-frame features after spatial mixing.
+        motionH = boneH.reshape(batch, frames, bones * self.embedDim)
+        motionH = self.frameProj(motionH)
         textH = self.textProj(textEmbedding)
 
         # Expand text embedding to sequence length and add

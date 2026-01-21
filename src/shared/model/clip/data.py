@@ -407,9 +407,13 @@ def motionTextCollate(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
     Dict[str, object]
         Batched tensors padded on the temporal dimension.
     """
-    maxTime = max(item["motion"].shape[0] for item in batch)
+    lengths = [item["motion"].shape[0] for item in batch]
+    maxTime = max(lengths)
     motionBatch = torch.stack(
         [_padMotion(item["motion"], maxTime) for item in batch],
+    )
+    motionMask = torch.stack(
+        [_buildMotionMask(length, maxTime, motionBatch.device) for length in lengths],
     )
     attentionMasks = torch.stack(
         [item["attention_mask"] for item in batch],
@@ -418,6 +422,7 @@ def motionTextCollate(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
         "input_ids": torch.stack([item["input_ids"] for item in batch]),
         "attention_mask": attentionMasks,
         "motion": motionBatch,
+        "motion_mask": motionMask,
         "time": torch.stack([item["time"] for item in batch]),
         "tag": [item["tag"] for item in batch],
         "meta": [item["meta"] for item in batch],
@@ -453,3 +458,14 @@ def _padMotion(motion: torch.Tensor, targetLength: int) -> torch.Tensor:
         device=motion.device,
     )
     return torch.cat([motion, padding], dim=0)
+
+
+def _buildMotionMask(
+    length: int,
+    targetLength: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Build a boolean mask indicating which frames are valid (not padding).
+    """
+    return torch.arange(targetLength, device=device) < length

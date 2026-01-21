@@ -8,20 +8,19 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from torch.utils.data import DataLoader
-
 from src.shared.config_loader import loadTrainingConfig
 from src.features.clip.train_clip import (
-    RotatingDatasetManager,
     buildOptimizer,
-    buildTrainValDataloaders,
     evaluateValidation,
     loadCheckpoint,
     saveCheckpoint,
     trainOneEpoch,
     trainOneEpochWithAccumulation,
-    _buildDataset,
-    _buildTokenizer,
+)
+from src.shared.dataset_manager import (
+    DatasetManager,
+    MemoryManagerConfig,
+    estimateModelBytes,
 )
 from src.shared.config_loader import loadNetworkConfig
 from src.shared.learning_rate import LearningRateScheduler, LearningRateConfig
@@ -85,7 +84,7 @@ def _runTraining(
     profile: Optional[str] = None,
 ) -> ClipTrainingResult:
     """
-    Execute the end-to-end training workflow with early stopping and checkpointing.
+    Execute the end-to-end training workflow with early stopping.
 
     Parameters
     ----------
@@ -102,11 +101,15 @@ def _runTraining(
     device = _resolveDevice(config.training.device)
     
     # Load network architecture config
-    networkConfig = loadNetworkConfig(configPath=config.networkConfigPath, profile=profile)
+    networkConfig = loadNetworkConfig(
+        configPath=config.networkConfigPath,
+        profile=profile,
+    )
     
     # Build model with motion encoder parameters
     LOGGER.info(
-        "Building CLIP model with embed_dim=%d, motion_heads=%d, motion_layers=%d",
+        "Building CLIP model with embed_dim=%d, motion_heads=%d, "
+        "motion_layers=%d",
         networkConfig.embedDim,
         networkConfig.clip.motionNumHeads,
         networkConfig.clip.motionNumLayers,
@@ -120,7 +123,9 @@ def _runTraining(
     
     # Log model size
     totalParams = sum(p.numel() for p in model.parameters())
-    trainableParams = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    trainableParams = sum(
+        param.numel() for param in model.parameters() if param.requires_grad
+    )
     LOGGER.info(
         "Model params: %s total, %s trainable",
         f"{totalParams:,}",
@@ -153,38 +158,23 @@ def _runTraining(
         config.training.lrMin,
     )
 
-    # Setup dataset manager (rotating or static)
-    rotatingManager: Optional[RotatingDatasetManager] = None
-    trainLoader: Optional[DataLoader] = None
-    valLoader: Optional[DataLoader] = None
-    
-    if config.training.rotateDataset and config.training.maxSamples:
-        LOGGER.info(
-            "Using rotating dataset with %d samples per epoch",
-            config.training.maxSamples,
-        )
-        dataset = _buildDataset(
-            promptRoot=config.paths.promptRoot,
-            animationRoot=config.paths.animationRoot,
-            tokenizer=_buildTokenizer(config.training.modelName),
-            maxLength=config.training.maxPromptLength,
-        )
-        rotatingManager = RotatingDatasetManager(
-            dataset=dataset,
-            maxSamples=config.training.maxSamples,
-            batchSize=config.training.batchSize,
-            validationSplit=config.training.validationSplit,
-        )
-        LOGGER.info("Total dataset size: %d samples", len(dataset))
-    else:
-        trainLoader, valLoader = buildTrainValDataloaders(
-            promptRoot=config.paths.promptRoot,
-            animationRoot=config.paths.animationRoot,
-            maxLength=config.training.maxPromptLength,
-            batchSize=config.training.batchSize,
-            modelName=config.training.modelName,
-            validationSplit=config.training.validationSplit,
-        )
+    modelMemoryBytes = estimateModelBytes(model)
+    memoryConfig = MemoryManagerConfig(
+        MM_memoryLimitGB=config.training.MM_memoryLimitGB,
+    )
+    datasetManager = DatasetManager(
+        datasetRoot=config.paths.datasetRoot,
+        batchSize=config.training.batchSize,
+        validationSplit=config.training.validationSplit,
+        modelMemoryBytes=modelMemoryBytes,
+        memoryConfig=memoryConfig,
+        device=device,
+    )
+    datasetManager.dataset.validateCompatibility(
+        modelName=config.training.modelName,
+        maxPromptLength=config.training.maxPromptLength,
+    )
+    LOGGER.info("Dataset indexed: %d total samples", datasetManager.totalSize)
 
     bestValLoss: Optional[float] = None
     epochsWithoutImprovement = 0
@@ -194,7 +184,10 @@ def _runTraining(
 
     # Resume from checkpoint if specified
     if config.training.resumeCheckpoint is not None:
-        LOGGER.info("Resuming from checkpoint: %s", config.training.resumeCheckpoint)
+        LOGGER.info(
+            "Resuming from checkpoint: %s",
+            config.training.resumeCheckpoint,
+        )
         resumedEpoch, resumedLoss = loadCheckpoint(
             checkpointPath=config.training.resumeCheckpoint,
             model=model,
@@ -213,11 +206,10 @@ def _runTraining(
     for epochIndex in range(startEpoch, config.training.epochs):
         epochsRun = epochIndex + 1
         
-        # Get dataloaders (rotating or static)
-        chunkInfo: Optional[str] = None
-        if rotatingManager is not None:
-            trainLoader, valLoader = rotatingManager.getDataloaders()
-            chunkInfo = rotatingManager.getProgress()
+        # Get dataloaders (auto-rotating)
+        trainLoader, valLoader, chunkInfo = (
+            datasetManager.getDataloadersForEpoch(epochIndex)
+        )
 
         # Training
         if useAccumulation:
@@ -247,8 +239,15 @@ def _runTraining(
 
         # Validation evaluation
         if valLoader is not None:
-            valLoss = evaluateValidation(valLoader, model, device)
+            valLoss, retrieval = evaluateValidation(valLoader, model, device)
             LOGGER.info("Epoch %s val loss: %.4f", epochsRun, valLoss)
+            LOGGER.info(
+                "Retrieval: t2m@1=%.4f t2m@5=%.4f m2t@1=%.4f m2t@5=%.4f",
+                retrieval["t2m_top1"],
+                retrieval["t2m_top5"],
+                retrieval["m2t_top1"],
+                retrieval["m2t_top5"],
+            )
 
             # Checkpointing - save best model
             if bestValLoss is None or valLoss < bestValLoss:
@@ -271,17 +270,17 @@ def _runTraining(
                 )
 
             # Early stopping check
-            if epochsWithoutImprovement >= config.training.earlyStoppingPatience:
+            if (
+                epochsWithoutImprovement
+                >= config.training.earlyStoppingPatience
+            ):
                 LOGGER.info(
-                    "Early stopping triggered after %s epochs without improvement",
+                    "Early stopping triggered after %s epochs "
+                    "without improvement",
                     epochsWithoutImprovement,
                 )
                 break
 
-        # Rotate dataset for next epoch
-        if rotatingManager is not None:
-            rotatingManager.rotate()
-        
         # Step LR scheduler
         scheduler.step()
         LOGGER.info("LR: %.6f", scheduler.getCurrentLR())

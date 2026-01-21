@@ -23,6 +23,9 @@ from src.shared.types import (
     DatasetBuilderConfig,
     DatasetBuilderPaths,
     DatasetBuilderProcessing,
+    PreprocessDatasetConfig,
+    PreprocessDatasetPaths,
+    PreprocessDatasetProcessing,
     GenerationTrainingConfig,
     GenerationTrainingHyperparameters,
     GenerationTrainingPaths,
@@ -42,6 +45,9 @@ GENERATION_DEFAULT_VALIDATION_SPLIT = 0.1
 GENERATION_DEFAULT_EARLY_STOPPING_PATIENCE = 5
 GENERATION_DEFAULT_MAX_LENGTH = 64
 GENERATION_DEFAULT_MODEL_NAME = "xlm-roberta-base"
+GENERATION_DEFAULT_GEODESIC_WEIGHT = 0.1
+GENERATION_DEFAULT_GEODESIC_SCHEDULE = "none"
+PREPROCESS_DEFAULT_SHARD_SIZE = 256
 
 LOGGER = logging.getLogger("shared.config.network")
 
@@ -67,7 +73,8 @@ def loadNetworkConfig(
     NetworkConfig
         Loaded network configuration.
     """
-    resolved = (configPath or DEFAULT_NETWORK_CONFIG_PATH).expanduser().resolve()
+    resolved = (configPath or DEFAULT_NETWORK_CONFIG_PATH)
+    resolved = resolved.expanduser().resolve()
     
     if not resolved.exists():
         LOGGER.warning(
@@ -187,7 +194,8 @@ def loadTrainingConfig(
     payload = yaml.safe_load(resolved.read_text(encoding="utf-8")) or {}
     pathsSection = payload.get("paths", {})
     
-    # Profile selection: default to "training", fallback to legacy "training" key
+    # Profile selection: default to "training".
+    # Fallback to legacy "training" key.
     profileName = profile or "training"
     if profileName in payload:
         trainingSection = payload.get(profileName, {})
@@ -198,7 +206,10 @@ def loadTrainingConfig(
     paths = _loadClipPaths(resolved, pathsSection)
     
     # Get network config path (must exist if provided)
-    networkConfigPath = _optionalExistingPath(resolved, pathsSection.get("network-config"))
+    networkConfigPath = _optionalExistingPath(
+        resolved,
+        pathsSection.get("network-config"),
+    )
     
     hyperparameters = ClipTrainingHyperparameters(
         batchSize=_int(trainingSection, "batch-size", DEFAULT_BATCH_SIZE),
@@ -231,16 +242,29 @@ def loadTrainingConfig(
             trainingSection.get("resume-checkpoint"),
         ),
         gradientAccumulation=_int(trainingSection, "gradient-accumulation", 1),
-        maxSamples=_optionalInt(trainingSection, "max-samples"),
-        rotateDataset=_bool(trainingSection, "rotate-dataset", False),
         MM_memoryLimitGB=_float(trainingSection, "MM-memory-limit-gb", 0.0),
         weightDecay=_float(trainingSection, "weight-decay", 0.0),
         # Learning Rate Configuration
-        learningRate=_float(trainingSection, "learning-rate", DEFAULT_LEARNING_RATE),
+        learningRate=_float(
+            trainingSection,
+            "learning-rate",
+            DEFAULT_LEARNING_RATE,
+        ),
         lrMin=_float(trainingSection, "lr-min", 1e-7),
         lrWarmupEpochs=_int(trainingSection, "lr-warmup-epochs", 0),
         lrSchedule=str(trainingSection.get("lr-schedule", "cosine")),
         lrDecayEpochs=_optionalInt(trainingSection, "lr-decay-epochs"),
+        geodesicWeight=_float(
+            trainingSection,
+            "geodesic-weight",
+            GENERATION_DEFAULT_GEODESIC_WEIGHT,
+        ),
+        geodesicWeightSchedule=str(
+            trainingSection.get(
+                "geodesic-weight-schedule",
+                GENERATION_DEFAULT_GEODESIC_SCHEDULE,
+            )
+        ),
     )
     return ClipTrainingConfig(
         paths=paths,
@@ -249,30 +273,16 @@ def loadTrainingConfig(
     )
 
 
-def _loadClipPaths(configPath: Path, section: Dict[str, Any]) -> ClipTrainingPaths:
-    datasetRoot = section.get("dataset-root")
-    if datasetRoot:
-        resolvedDataset = _resolveExistingPath(
-            configPath,
-            str(datasetRoot),
-            "dataset-root",
-        )
-        return ClipTrainingPaths(
-            promptRoot=resolvedDataset,
-            animationRoot=resolvedDataset,
-        )
-    return ClipTrainingPaths(
-        promptRoot=_resolveExistingPath(
-            configPath,
-            _require(section, "prompt-root"),
-            "prompt-root",
-        ),
-        animationRoot=_resolveExistingPath(
-            configPath,
-            _require(section, "animation-root"),
-            "animation-root",
-        ),
+def _loadClipPaths(
+    configPath: Path,
+    section: Dict[str, Any],
+) -> ClipTrainingPaths:
+    resolvedDataset = _resolveExistingPath(
+        configPath,
+        _require(section, "dataset-root"),
+        "dataset-root",
     )
+    return ClipTrainingPaths(datasetRoot=resolvedDataset)
 
 
 # ==============================================================================
@@ -301,7 +311,9 @@ def loadGenerationConfig(
     """
     resolved = configPath.expanduser().resolve()
     if not resolved.exists():
-        raise FileNotFoundError(f"Generation training config missing: {resolved}")
+        raise FileNotFoundError(
+            f"Generation training config missing: {resolved}"
+        )
 
     payload = yaml.safe_load(resolved.read_text(encoding="utf-8")) or {}
     pathsSection = payload.get("paths", {})
@@ -315,10 +327,17 @@ def loadGenerationConfig(
     paths = _loadGenerationPaths(resolved, pathsSection)
     
     # Get network config path (must exist if provided)
-    networkConfigPath = _optionalExistingPath(resolved, pathsSection.get("network-config"))
+    networkConfigPath = _optionalExistingPath(
+        resolved,
+        pathsSection.get("network-config"),
+    )
     
     hyperparameters = GenerationTrainingHyperparameters(
-        batchSize=_int(trainingSection, "batch-size", GENERATION_DEFAULT_BATCH_SIZE),
+        batchSize=_int(
+            trainingSection,
+            "batch-size",
+            GENERATION_DEFAULT_BATCH_SIZE,
+        ),
         epochs=_int(trainingSection, "epochs", GENERATION_DEFAULT_EPOCHS),
         device=str(trainingSection.get("device", "auto")),
         validationSplit=_float(
@@ -331,26 +350,35 @@ def loadGenerationConfig(
             "early-stopping-patience",
             GENERATION_DEFAULT_EARLY_STOPPING_PATIENCE,
         ),
-        maxPromptLength=_int(trainingSection, "max-length", GENERATION_DEFAULT_MAX_LENGTH),
-        modelName=str(trainingSection.get("model-name", GENERATION_DEFAULT_MODEL_NAME)),
+        maxPromptLength=_int(
+            trainingSection,
+            "max-length",
+            GENERATION_DEFAULT_MAX_LENGTH,
+        ),
+        modelName=str(
+            trainingSection.get("model-name", GENERATION_DEFAULT_MODEL_NAME)
+        ),
         resumeCheckpoint=_optionalExistingPath(
             resolved,
             trainingSection.get("resume-checkpoint"),
         ),
         MM_memoryLimitGB=_float(trainingSection, "MM-memory-limit-gb", 0.0),
-        maxSamples=_optionalInt(trainingSection, "max-samples"),
         gradientAccumulation=_int(trainingSection, "gradient-accumulation", 1),
-        rotateDataset=_bool(trainingSection, "rotate-dataset", False),
-        motionSplitFrames=_optionalInt(
+        maxSamplesPerEpoch=_optionalInt(
             trainingSection,
-            "motion-split-frames",
+            "max-samples-per-epoch",
         ),
-        motionDownsampleTargetFrames=_optionalInt(
+        fixedTrainChunk=_bool(
             trainingSection,
-            "motion-downsample-target-frames",
+            "fixed-train-chunk",
+            False,
         ),
         # Learning Rate Configuration
-        learningRate=_float(trainingSection, "learning-rate", GENERATION_DEFAULT_LEARNING_RATE),
+        learningRate=_float(
+            trainingSection,
+            "learning-rate",
+            GENERATION_DEFAULT_LEARNING_RATE,
+        ),
         lrMin=_float(trainingSection, "lr-min", 1e-7),
         lrWarmupEpochs=_int(trainingSection, "lr-warmup-epochs", 0),
         lrSchedule=str(trainingSection.get("lr-schedule", "cosine")),
@@ -364,7 +392,10 @@ def loadGenerationConfig(
     )
 
 
-def _loadGenerationPaths(configPath: Path, section: Dict[str, Any]) -> GenerationTrainingPaths:
+def _loadGenerationPaths(
+    configPath: Path,
+    section: Dict[str, Any],
+) -> GenerationTrainingPaths:
     """Load paths section from config."""
     datasetRoot = _resolveExistingPath(
         configPath,
@@ -380,11 +411,18 @@ def _loadGenerationPaths(configPath: Path, section: Dict[str, Any]) -> Generatio
     if checkpointDir is None:
         checkpointDir = Path("output/generation_checkpoints")
         checkpointDir.mkdir(parents=True, exist_ok=True)
+    validationIndices = _optionalResolvedPath(
+        configPath,
+        section.get("validation-indices"),
+    )
+    if validationIndices is None:
+        validationIndices = checkpointDir / "validation_indices.json"
 
     return GenerationTrainingPaths(
         datasetRoot=datasetRoot,
         clipCheckpoint=clipCheckpoint,
         checkpointDir=checkpointDir,
+        validationIndices=validationIndices,
     )
 
 
@@ -446,7 +484,10 @@ def loadBuilderConfig(configPath: Path) -> DatasetBuilderConfig:
         convertedRoot=convertedRoot,
     )
 
-    animationExtensionRaw = _checkValue(processingSection, "animation-extension")
+    animationExtensionRaw = _checkValue(
+        processingSection,
+        "animation-extension",
+    )
     promptExtensionRaw = _checkValue(processingSection, "prompt-text-extension")
     fallbackFpsRaw = _checkValue(processingSection, "fallback-fps")
 
@@ -456,6 +497,86 @@ def loadBuilderConfig(configPath: Path) -> DatasetBuilderConfig:
         fallbackFps=int(fallbackFpsRaw) if fallbackFpsRaw is not None else 60,
     )
     return DatasetBuilderConfig(paths=paths, processing=processing)
+
+
+# ==============================================================================
+# PREPROCESS DATASET CONFIG
+# ==============================================================================
+
+
+def loadPreprocessConfig(configPath: Path) -> PreprocessDatasetConfig:
+    """
+    Load the dataset preprocessing configuration from a YAML file.
+
+    Parameters
+    ----------
+    configPath : Path
+        Configuration file to parse.
+
+    Returns
+    -------
+    PreprocessDatasetConfig
+        Parsed preprocessing configuration.
+    """
+    if not configPath.exists():
+        raise FileNotFoundError(f"Missing configuration file: {configPath}")
+    payload = yaml.safe_load(configPath.read_text(encoding="utf-8")) or {}
+    pathsSection = payload.get("paths", {})
+    processingSection = payload.get("processing", {})
+
+    inputRoot = _resolvePath(configPath, _require(pathsSection, "input-root"))
+    outputRoot = _resolvePath(configPath, _require(pathsSection, "output-root"))
+    outputRoot.mkdir(parents=True, exist_ok=True)
+
+    processing = PreprocessDatasetProcessing(
+        modelName=str(
+            processingSection.get("model-name", DEFAULT_MODEL_NAME),
+        ),
+        maxPromptLength=_int(
+            processingSection,
+            "max-length",
+            DEFAULT_PROMPT_MAX_LENGTH,
+        ),
+        shardSize=_int(
+            processingSection,
+            "shard-size",
+            PREPROCESS_DEFAULT_SHARD_SIZE,
+        ),
+        splitFrames=_optionalInt(processingSection, "split-frames"),
+        downsampleTargetFrames=_optionalInt(
+            processingSection,
+            "downsample-target-frames",
+        ),
+        maxSegmentFrames=_optionalInt(
+            processingSection,
+            "max-segment-frames",
+        ),
+    )
+    _validatePreprocessSettings(processing)
+    return PreprocessDatasetConfig(
+        paths=PreprocessDatasetPaths(
+            inputRoot=inputRoot,
+            outputRoot=outputRoot,
+        ),
+        processing=processing,
+    )
+
+
+def _validatePreprocessSettings(
+    processing: PreprocessDatasetProcessing,
+) -> None:
+    """
+    Validate preprocessing settings for conflicting options.
+
+    Parameters
+    ----------
+    processing : PreprocessDatasetProcessing
+        Processing settings to validate.
+    """
+    if processing.splitFrames and processing.downsampleTargetFrames:
+        raise ValueError(
+            "Only one of split-frames or downsample-target-frames may be set."
+        )
 
 
 def _resolvePath(configPath: Path, rawValue: str) -> Path:
@@ -504,12 +625,15 @@ def _float(section: Dict[str, Any], key: str, default: float) -> float:
 def _bool(section: Dict[str, Any], key: str, default: bool) -> bool:
     """Get a boolean value with default."""
     if key not in section:
-        return default
+        return bool(default)
     value = section[key]
     if isinstance(value, bool):
         return value
+    if isinstance(value, (int, float)):
+        return bool(value)
     if isinstance(value, str):
-        return value.lower() in ("true", "1", "yes")
+        normalized = value.strip().lower()
+        return normalized in {"1", "true", "yes", "y", "on"}
     return bool(value)
 
 
@@ -535,6 +659,21 @@ def _optionalPath(configPath: Path, rawValue: Optional[str]) -> Optional[Path]:
     if not candidate.is_absolute():
         candidate = (configPath.parent / candidate).resolve()
     candidate.mkdir(parents=True, exist_ok=True)
+    return candidate
+
+
+def _optionalResolvedPath(
+    configPath: Path,
+    rawValue: Optional[str],
+) -> Optional[Path]:
+    """
+    Resolve an optional path without creating directories.
+    """
+    if rawValue in (None, ""):
+        return None
+    candidate = Path(rawValue).expanduser()
+    if not candidate.is_absolute():
+        candidate = (configPath.parent / candidate).resolve()
     return candidate
 
 

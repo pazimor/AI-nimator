@@ -143,14 +143,11 @@ class ClipTrainingPaths:
 
     Attributes
     ----------
-    promptRoot : Path
-        Directory containing prompt.json files.
-    animationRoot : Path
-        Directory containing animation payloads.
+    datasetRoot : Path
+        Root directory containing preprocessed dataset shards.
     """
 
-    promptRoot: Path
-    animationRoot: Path
+    datasetRoot: Path
 
 
 @dataclass(frozen=True)
@@ -180,10 +177,6 @@ class ClipTrainingHyperparameters:
         Path to a checkpoint file to resume training from.
     gradientAccumulation : int
         Number of batches to accumulate before optimizer step.
-    maxSamples : Optional[int]
-        Maximum number of samples per epoch (for dataset rotation).
-    rotateDataset : bool
-        Whether to rotate through dataset chunks each epoch.
     MM_memoryLimitGB : float
         Maximum memory usage in GB before triggering cleanup (0 to disable).
     weightDecay : float
@@ -213,8 +206,6 @@ class ClipTrainingHyperparameters:
     checkpointDir: Optional[Path] = None
     resumeCheckpoint: Optional[Path] = None
     gradientAccumulation: int = 1
-    maxSamples: Optional[int] = None
-    rotateDataset: bool = False
     MM_memoryLimitGB: float = 0.0
     weightDecay: float = 0.0
     

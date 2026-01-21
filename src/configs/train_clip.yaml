@@ -1,6 +1,6 @@
 paths:
-  dataset-root: "/Users/pazimor/dataset"
-  checkpoint-dir: output/checkpoints
+  dataset-root: "/Users/pazimor/dataset_preprocessed"
+  checkpoint-dir: output/clip
   # Network architecture is loaded from network.yaml
   network-config: "src/configs/network.yaml"
 
@@ -8,19 +8,17 @@ paths:
 # Profile: Mac (32GB RAM, MPS GPU)
 # ============================================
 training:
-  epochs: 100
+  epochs: 500
   device: mps
-  max-length: 64
+  max-length: 256
   model-name: xlm-roberta-base
   validation-split: 0.1
-  early-stopping-patience: 15
-  batch-size: 2
-  gradient-accumulation: 2
-  max-samples: null
-  rotate-dataset: false
+  early-stopping-patience: 100
+  batch-size: 8
+  gradient-accumulation: 16
   MM-memory-limit-gb: 25.0
   weight-decay: 0.01
-  resume-checkpoint: output/checkpoints/best_model.pt
+  # resume-checkpoint: output/clip/best_model.pt
   
   # Learning Rate Configuration
   learning-rate: 0.0001      # Initial/base learning rate
@@ -34,16 +32,14 @@ training:
 # Use with: --profile spark
 # ============================================
 spark:
-  epochs: 50
+  epochs: 100
   device: cuda
-  max-length: 64
+  max-length: 256
   model-name: xlm-roberta-base
   validation-split: 0.1
-  early-stopping-patience: 10
+  early-stopping-patience: 15
   batch-size: 64
-  gradient-accumulation: 1
-  max-samples: null
-  rotate-dataset: false
+  gradient-accumulation: 2
   MM-memory-limit-gb: 0.0
   weight-decay: 0.01
   

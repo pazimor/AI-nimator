@@ -1,36 +1,35 @@
 paths:
-  dataset-root: "/Volumes/Code assets/dataset"
-  clip-checkpoint: "output/checkpoints/best_model-128.pt"
-  checkpoint-dir: "output/generation_checkpoints"
+  dataset-root: "/Users/pazimor/dataset_preprocessed"
+  clip-checkpoint: "output/clip/best_model-512.pt"
+  checkpoint-dir: "output/generation"
   # Network architecture is loaded from network.yaml
   network-config: "network.yaml"
+  validation-indices: "output/generation/validation_indices.json"
 
 # ============================================
 # Profile: Mac (32GB RAM, MPS GPU)
 # ============================================
 training:
-  epochs: 50
+  epochs: 1000
   device: mps
-  max-length: 32
+  max-length: 256
   model-name: xlm-roberta-base
-  validation-split: 0.1
-  early-stopping-patience: 50
-  batch-size: 2
-  gradient-accumulation: 8
-  max-samples: 2000
-  rotate-dataset: true
-  # Motion length controls (null disables)
-  motion-split-frames: null  # Example: 1024
-  motion-downsample-target-frames: null  # Example: 2048
+  validation-split: 0.01
+  early-stopping-patience: 30
+  batch-size: 8
+  gradient-accumulation: 1
+  max-samples-per-epoch: 10000
   MM-memory-limit-gb: 20.0
-  resume-checkpoint: output/generation_checkpoints/best_model.pt
+  resume-checkpoint: output/generation/best_model.pt
   
   # Learning Rate Configuration
-  learning-rate: 0.001       # Initial/base learning rate
+  learning-rate: 0.01       # Initial/base learning rate
   lr-min: 0.000001            # Minimum LR floor (1e-6)
-  lr-warmup-epochs: 10        # Warmup epochs (0 to disable)
+  lr-warmup-epochs: 1        # Warmup epochs (0 to disable)
   lr-schedule: cosine         # Schedule type: constant, cosine, linear, step
   # lr-decay-epochs: 500      # Optional: decay phase length (default: epochs - warmup)
+  geodesic-weight: 0.1
+  geodesic-weight-schedule: timestep
 
 # ============================================
 # Profile: DGX Spark (128GB RAM, GB10 GPU)
@@ -39,22 +38,20 @@ training:
 spark:
   epochs: 200
   device: cuda
-  max-length: 32
+  max-length: 256
   model-name: xlm-roberta-base
-  validation-split: 0.1
+  validation-split: 0.01
   early-stopping-patience: 30
-  batch-size: 32
+  batch-size: 8 # replace with 32 after benchmarking
   gradient-accumulation: 1
-  max-samples: null
-  rotate-dataset: false
-  # Motion length controls (null disables)
-  motion-split-frames: null  # Example: 1024
-  motion-downsample-target-frames: null  # Example: 2048
+  max-samples-per-epoch: 10000 # replace to null after benchmarking
   MM-memory-limit-gb: 0.0
-  resume-checkpoint: output/generation_checkpoints/best_model.pt
+  resume-checkpoint: output/generation/best_model.pt
   
   # Learning Rate Configuration
   learning-rate: 0.001
   lr-min: 0.00001
   lr-warmup-epochs: 20
   lr-schedule: cosine
+  geodesic-weight: 0.1
+  geodesic-weight-schedule: timestep
