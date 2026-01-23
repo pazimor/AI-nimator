@@ -18,7 +18,7 @@ training:
   gradient-accumulation: 16
   MM-memory-limit-gb: 25.0
   weight-decay: 0.01
-  # resume-checkpoint: output/clip/best_model.pt
+  resume-checkpoint: output/clip/best_model.pt
   
   # Learning Rate Configuration
   learning-rate: 0.0001      # Initial/base learning rate
@@ -26,25 +26,3 @@ training:
   lr-warmup-epochs: 3         # Warmup epochs (0 to disable)
   lr-schedule: cosine         # Schedule type: constant, cosine, linear, step
   # lr-decay-epochs: 90       # Optional: decay phase length
-
-# ============================================
-# Profile: DGX Spark (128GB RAM, GB10 GPU)
-# Use with: --profile spark
-# ============================================
-spark:
-  epochs: 100
-  device: cuda
-  max-length: 256
-  model-name: xlm-roberta-base
-  validation-split: 0.1
-  early-stopping-patience: 15
-  batch-size: 64
-  gradient-accumulation: 2
-  MM-memory-limit-gb: 0.0
-  weight-decay: 0.01
-  
-  # Learning Rate Configuration
-  learning-rate: 0.0001
-  lr-min: 0.000001
-  lr-warmup-epochs: 5
-  lr-schedule: cosine

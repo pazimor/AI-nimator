@@ -122,11 +122,15 @@ def _runTraining(
         profile=profile,
     )
     LOGGER.info(
-        "Network config: embed_dim=%d, num_heads=%d, num_layers=%d, "
-        "diffusion_steps=%d",
+        "Network config: embed_dim=%d, heads=%d, layers=%d, spatial=%d, "
+        "channels=%d, repr=%s, mode=%s, steps=%d",
         networkConfig.embedDim,
         networkConfig.generation.numHeads,
         networkConfig.generation.numLayers,
+        networkConfig.generation.numSpatialLayers,
+        networkConfig.generation.motionChannels,
+        networkConfig.generation.rotationRepr,
+        networkConfig.generation.spatiotemporalMode,
         networkConfig.generation.diffusionSteps,
     )
 
@@ -135,6 +139,10 @@ def _runTraining(
         embedDim=networkConfig.embedDim,
         numHeads=networkConfig.generation.numHeads,
         numLayers=networkConfig.generation.numLayers,
+        numSpatialLayers=networkConfig.generation.numSpatialLayers,
+        motionChannels=networkConfig.generation.motionChannels,
+        rotationRepr=networkConfig.generation.rotationRepr,
+        spatiotemporalMode=networkConfig.generation.spatiotemporalMode,
         numBones=networkConfig.generation.numBones,
         diffusionSteps=networkConfig.generation.diffusionSteps,
         modelName=config.training.modelName,

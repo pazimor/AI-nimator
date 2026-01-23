@@ -10,6 +10,31 @@ This repo uses Poetry.
 poetry install
 ```
 
+### GPU install (NVIDIA / AMD)
+
+Poetry installs CPU-only PyTorch by default. If you want GPU acceleration,
+install the correct PyTorch wheel inside the Poetry environment.
+
+1) Create the env:
+```bash
+poetry install
+```
+
+2) Install the right PyTorch build (use the exact command from
+https://pytorch.org/get-started/locally/):
+```bash
+# NVIDIA (CUDA example)
+poetry run python -m pip install torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/cu121
+
+# AMD (ROCm, Linux only - replace rocmX.Y)
+poetry run python -m pip install torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/rocmX.Y
+```
+
+Note: AMD ROCm wheels are Linux-only; on Windows/macOS you will need CPU
+or Apple MPS (if available).
+
 ## Configuration
 
 Main config files:

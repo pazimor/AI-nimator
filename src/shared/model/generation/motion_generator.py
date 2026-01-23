@@ -20,6 +20,16 @@ from src.shared.model.layers.correction import (
     Smoothing,
     VelocityRegularization,
 )
+from src.shared.constants.rotation import (
+    DEFAULT_ROTATION_REPR,
+    ROTATION_CHANNELS_ROT6D,
+    ROTATION_KIND_AXIS_ANGLE,
+    ROTATION_REPR_AXIS_ANGLE,
+    ROTATION_REPR_ROT6D,
+    normalizeRotationRepr,
+)
+from src.shared.quaternion import Rotation
+from src.shared.types.network import DEFAULT_SPATIOTEMPORAL_MODE
 
 
 class MotionGenerator(nn.Module):
@@ -35,6 +45,10 @@ class MotionGenerator(nn.Module):
         embedDim: int = 64,
         numHeads: int = 4,
         numLayers: int = 6,
+        numSpatialLayers: int = 1,
+        motionChannels: int = ROTATION_CHANNELS_ROT6D,
+        rotationRepr: str = DEFAULT_ROTATION_REPR,
+        spatiotemporalMode: str = DEFAULT_SPATIOTEMPORAL_MODE,
         numBones: int = 65,
         diffusionSteps: int = 1000,
         modelName: str = "xlm-roberta-base",
@@ -55,6 +69,14 @@ class MotionGenerator(nn.Module):
             Number of attention heads, by default 4.
         numLayers : int, optional
             Number of denoising layers, by default 6.
+        numSpatialLayers : int, optional
+            Number of spatial GCN blocks, by default 1.
+        motionChannels : int, optional
+            Motion channels per bone, by default 6.
+        rotationRepr : str, optional
+            Rotation representation, by default "rot6d".
+        spatiotemporalMode : str, optional
+            Spatio-temporal strategy, by default "flat".
         numBones : int, optional
             Number of skeleton bones, by default 65.
         diffusionSteps : int, optional
@@ -75,6 +97,10 @@ class MotionGenerator(nn.Module):
         super().__init__()
         self.embedDim = embedDim
         self.numBones = numBones
+        self.motionChannels = motionChannels
+        rotationRepr = normalizeRotationRepr(rotationRepr)
+        self.rotationRepr = rotationRepr
+        self.spatiotemporalMode = spatiotemporalMode
         self.diffusionSteps = diffusionSteps
         self.geodesicWeight = geodesicWeight
         self.geodesicWeightSchedule = geodesicWeightSchedule
@@ -95,12 +121,18 @@ class MotionGenerator(nn.Module):
             embedDim=embedDim,
             numHeads=numHeads,
             numLayers=numLayers,
+            numSpatialLayers=numSpatialLayers,
+            motionChannels=motionChannels,
+            spatiotemporalMode=spatiotemporalMode,
             numBones=numBones,
         )
 
         # Post-processing (inference only)
         self.renorm = Renormalization()
-        self.smoothing = Smoothing(channels=numBones * 6, kernel_size=smoothingKernel)
+        self.smoothing = Smoothing(
+            channels=numBones * motionChannels,
+            kernel_size=smoothingKernel,
+        )
         self.velocityReg = VelocityRegularization(max_velocity=maxVelocity)
 
     def forward(
@@ -126,7 +158,7 @@ class MotionGenerator(nn.Module):
         tags : Optional[list[Optional[str]]]
             Batch of tag strings. Can be None or contain None elements.
         noisyMotion : torch.Tensor
-            Noisy motion shaped (batch, frames, bones, 6).
+            Noisy motion shaped (batch, frames, bones, channels).
         timesteps : torch.Tensor
             Diffusion timesteps shaped (batch,).
         targetNoise : Optional[torch.Tensor], optional
@@ -188,6 +220,7 @@ class MotionGenerator(nn.Module):
                     targetMotion=targetMotion,
                     geodesicWeight=self.geodesicWeight,
                     geodesicWeightSchedule=self.geodesicWeightSchedule,
+                    rotationRepr=self.rotationRepr,
                     timesteps=timesteps,
                     numTimesteps=self.ddim.num_timesteps,
                     motionMask=motionMask,
@@ -247,7 +280,13 @@ class MotionGenerator(nn.Module):
         textEmbeds, _ = self.clip.encodeText(inputIds, attentionMask)
 
         # Initialize random noise
-        x = torch.randn(1, numFrames, self.numBones, 6, device=device)
+        x = torch.randn(
+            1,
+            numFrames,
+            self.numBones,
+            self.motionChannels,
+            device=device,
+        )
 
         # DDIM sampling with fewer steps
         stepRatio = self.diffusionSteps // ddimSteps
@@ -268,16 +307,16 @@ class MotionGenerator(nn.Module):
             x = self._ddimStep(x, predictedNoise, t, timestepSequence, i)
 
         # Post-process: apply corrections
-        motion6d = x
+        motion = x
 
-        # Reshape for smoothing: (batch, frames, bones * 6)
-        batch, frames, bones, channels = motion6d.shape
-        motionFlat = motion6d.view(batch, frames, bones * channels)
+        # Reshape for smoothing: (batch, frames, bones * channels)
+        batch, frames, bones, channels = motion.shape
+        motionFlat = motion.view(batch, frames, bones * channels)
         smoothed = self.smoothing(motionFlat)
-        motion6d = smoothed.view(batch, frames, bones, channels)
+        motion = smoothed.view(batch, frames, bones, channels)
 
-        # Convert 6D to quaternions
-        motionQuat = self._sixdToQuaternion(motion6d)
+        # Convert to quaternions
+        motionQuat = self._rotationToQuaternion(motion)
 
         # Apply velocity regularization
         motionQuat = self.velocityReg(motionQuat)
@@ -360,6 +399,46 @@ class MotionGenerator(nn.Module):
 
         # Convert rotation matrix to quaternion
         return self._rotationMatrixToQuaternion(rotMat)
+
+    def _rotationToQuaternion(self, rotation: torch.Tensor) -> torch.Tensor:
+        """
+        Convert rotation representation to quaternion.
+
+        Parameters
+        ----------
+        rotation : torch.Tensor
+            Rotation representation shaped (..., C).
+
+        Returns
+        -------
+        torch.Tensor
+            Quaternion shaped (..., 4) in (w, x, y, z) order.
+        """
+        if self.rotationRepr == ROTATION_REPR_ROT6D:
+            return self._sixdToQuaternion(rotation)
+        if self.rotationRepr == ROTATION_REPR_AXIS_ANGLE:
+            return self._axisAngleToQuaternion(rotation)
+        raise ValueError(f"Unknown rotation repr: {self.rotationRepr}")
+
+    def _axisAngleToQuaternion(self, axisAngle: torch.Tensor) -> torch.Tensor:
+        """
+        Convert axis-angle rotations to quaternions.
+
+        Parameters
+        ----------
+        axisAngle : torch.Tensor
+            Axis-angle rotations shaped (..., 3).
+
+        Returns
+        -------
+        torch.Tensor
+            Quaternion shaped (..., 4) in (w, x, y, z) order.
+        """
+        quatXyzw = Rotation(
+            axisAngle,
+            kind=ROTATION_KIND_AXIS_ANGLE,
+        ).quat
+        return torch.cat((quatXyzw[..., 3:], quatXyzw[..., :3]), dim=-1)
 
     def _rotationMatrixToQuaternion(self, rotMat: torch.Tensor) -> torch.Tensor:
         """

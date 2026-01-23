@@ -14,7 +14,12 @@ from src.shared.model.layers.positional import RoPE
 from src.shared.model.layers.spatial_gcn import SpatialGCNBlock
 from src.shared.model.layers.temporal import TemporalLayer
 from src.shared.model.layers.transform import TransformLayer
+from src.shared.constants.rotation import ROTATION_CHANNELS_ROT6D
 from src.shared.types.generation import VALID_TAGS
+from src.shared.types.network import (
+    DEFAULT_SPATIOTEMPORAL_MODE,
+    SPATIOTEMPORAL_MODE_FACTORIZED,
+)
 
 
 class TimestepEmbedding(nn.Module):
@@ -220,8 +225,9 @@ class MotionDenoiser(nn.Module):
         embedDim: int = 64,
         numHeads: int = 4,
         numLayers: int = 6,
+        spatiotemporalMode: str = DEFAULT_SPATIOTEMPORAL_MODE,
         numBones: int = 65,
-        motionChannels: int = 6,
+        motionChannels: int = ROTATION_CHANNELS_ROT6D,
         dropout: float = 0.1,
         numSpatialLayers: int = 1,
     ) -> None:
@@ -236,10 +242,12 @@ class MotionDenoiser(nn.Module):
             Number of attention heads, by default 4.
         numLayers : int, optional
             Number of denoising blocks, by default 6.
+        spatiotemporalMode : str, optional
+            Spatio-temporal strategy, by default "flat".
         numBones : int, optional
             Number of skeleton bones, by default 65.
         motionChannels : int, optional
-            Channels per bone (6D rotation), by default 6.
+            Channels per bone, by default 6.
         dropout : float, optional
             Dropout rate, by default 0.1.
         numSpatialLayers : int, optional
@@ -249,6 +257,7 @@ class MotionDenoiser(nn.Module):
         self.embedDim = embedDim
         self.numBones = numBones
         self.motionChannels = motionChannels
+        self.spatiotemporalMode = spatiotemporalMode
 
         # Input projections
         self.boneProj = nn.Linear(motionChannels, embedDim)
@@ -274,6 +283,16 @@ class MotionDenoiser(nn.Module):
             ]
         )
 
+        # Factorized temporal blocks (per bone sequence).
+        self.boneTemporalBlocks = nn.ModuleList([])
+        if spatiotemporalMode == SPATIOTEMPORAL_MODE_FACTORIZED:
+            self.boneTemporalBlocks = nn.ModuleList(
+                [
+                    DenoiserBlock(embedDim, numHeads, condDim, dropout)
+                    for _ in range(numLayers)
+                ]
+            )
+
         # Denoising blocks
         self.blocks = nn.ModuleList([
             DenoiserBlock(embedDim, numHeads, condDim, dropout)
@@ -298,7 +317,7 @@ class MotionDenoiser(nn.Module):
         Parameters
         ----------
         noisyMotion : torch.Tensor
-            Noisy motion shaped (batch, frames, bones, 6).
+            Noisy motion shaped (batch, frames, bones, channels).
         textEmbedding : torch.Tensor
             CLIP text embedding shaped (batch, embedDim).
         tags : Optional[list[Optional[str]]]
@@ -311,7 +330,7 @@ class MotionDenoiser(nn.Module):
         Returns
         -------
         torch.Tensor
-            Predicted noise shaped (batch, frames, bones, 6).
+            Predicted noise shaped (batch, frames, bones, channels).
         """
         batch, frames, bones, channels = noisyMotion.shape
 
@@ -319,6 +338,14 @@ class MotionDenoiser(nn.Module):
         boneH = self.boneProj(noisyMotion)
         for block in self.spatialBlocks:
             boneH = block(boneH)
+
+        # Get conditioning embeddings
+        timeEmb = self.timestepEmbed(timesteps)
+        tagEmb = self.tagEmbed(tags)
+        cond = torch.cat([timeEmb, tagEmb], dim=-1)
+
+        # Optional factorized temporal modeling per bone.
+        boneH = self._applyFactorizedTemporal(boneH, cond, mask)
 
         # Flatten per-frame features after spatial mixing.
         motionH = boneH.reshape(batch, frames, bones * self.embedDim)
@@ -328,11 +355,6 @@ class MotionDenoiser(nn.Module):
         # Expand text embedding to sequence length and add
         textH = textH.unsqueeze(1).expand(-1, frames, -1)
         h = motionH + textH
-
-        # Get conditioning embeddings
-        timeEmb = self.timestepEmbed(timesteps)
-        tagEmb = self.tagEmbed(tags)
-        cond = torch.cat([timeEmb, tagEmb], dim=-1)
 
         # Apply denoising blocks
         for block in self.blocks:
@@ -344,3 +366,68 @@ class MotionDenoiser(nn.Module):
 
         # Reshape to (batch, frames, bones, channels)
         return output.view(batch, frames, bones, channels)
+
+    def _applyFactorizedTemporal(
+        self,
+        boneH: torch.Tensor,
+        cond: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Apply temporal blocks per bone sequence when enabled.
+
+        Parameters
+        ----------
+        boneH : torch.Tensor
+            Bone embeddings shaped (batch, frames, bones, embedDim).
+        cond : torch.Tensor
+            Conditioning embeddings shaped (batch, condDim).
+        mask : Optional[torch.Tensor]
+            Temporal padding mask shaped (batch, frames).
+
+        Returns
+        -------
+        torch.Tensor
+            Updated bone embeddings shaped (batch, frames, bones, embedDim).
+        """
+        if (
+            self.spatiotemporalMode != SPATIOTEMPORAL_MODE_FACTORIZED
+            or not self.boneTemporalBlocks
+        ):
+            return boneH
+        batch, frames, bones, embedDim = boneH.shape
+        boneSeq = boneH.permute(0, 2, 1, 3).reshape(
+            batch * bones,
+            frames,
+            embedDim,
+        )
+        condExpanded = cond.repeat_interleave(bones, dim=0)
+        maskExpanded = self._repeatMask(mask, bones)
+        for block in self.boneTemporalBlocks:
+            boneSeq = block(boneSeq, condExpanded, maskExpanded)
+        boneSeq = boneSeq.reshape(batch, bones, frames, embedDim)
+        return boneSeq.permute(0, 2, 1, 3)
+
+    def _repeatMask(
+        self,
+        mask: Optional[torch.Tensor],
+        bones: int,
+    ) -> Optional[torch.Tensor]:
+        """
+        Repeat temporal mask per bone when factorized.
+
+        Parameters
+        ----------
+        mask : Optional[torch.Tensor]
+            Temporal padding mask shaped (batch, frames).
+        bones : int
+            Number of bones.
+
+        Returns
+        -------
+        Optional[torch.Tensor]
+            Repeated mask shaped (batch * bones, frames).
+        """
+        if mask is None:
+            return None
+        return mask.repeat_interleave(bones, dim=0)

@@ -6,6 +6,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from src.shared.constants.rotation import (
+    DEFAULT_ROTATION_REPR,
+    ROTATION_CHANNELS_ROT6D,
+)
+
+SPATIOTEMPORAL_MODE_FLAT = "flat"
+SPATIOTEMPORAL_MODE_FACTORIZED = "factorized"
+DEFAULT_SPATIOTEMPORAL_MODE = SPATIOTEMPORAL_MODE_FLAT
+
 
 @dataclass(frozen=True)
 class LearningRateHyperparameters:
@@ -61,6 +70,14 @@ class GenerationNetworkConfig:
         Number of attention heads in the denoiser.
     numLayers : int
         Number of denoising transformer layers.
+    numSpatialLayers : int
+        Number of spatial GCN blocks applied per frame.
+    motionChannels : int
+        Motion channels per bone (depends on rotation representation).
+    rotationRepr : str
+        Rotation representation used by the model.
+    spatiotemporalMode : str
+        Spatio-temporal strategy ("flat" or "factorized").
     numBones : int
         Number of skeleton bones in the dataset.
     diffusionSteps : int
@@ -69,6 +86,10 @@ class GenerationNetworkConfig:
     
     numHeads: int = 4
     numLayers: int = 6
+    numSpatialLayers: int = 1
+    motionChannels: int = ROTATION_CHANNELS_ROT6D
+    rotationRepr: str = DEFAULT_ROTATION_REPR
+    spatiotemporalMode: str = DEFAULT_SPATIOTEMPORAL_MODE
     numBones: int = 22
     diffusionSteps: int = 1000
 

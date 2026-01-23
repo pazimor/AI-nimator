@@ -23,7 +23,11 @@ default:
   # Generation Denoiser Architecture
   generation:
     num-heads: 8
-    num-layers: 4
+    num-layers: 2
+    num-spatial-layers: 1
+    motion-channels: 3 # 6 | 3 
+    rotation-repr: axis-angle # rot6d | axis-angle
+    spatiotemporal-mode: factorized #flat | factorized
     num-bones: 22
     diffusion-steps: 1000
 
@@ -41,5 +45,9 @@ spark:
   generation:
     num-heads: 8
     num-layers: 8
+    num-spatial-layers: 1
+    motion-channels: 6
+    rotation-repr: rot6d
+    spatiotemporal-mode: flat
     num-bones: 22
     diffusion-steps: 500

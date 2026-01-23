@@ -16,6 +16,11 @@ from src.shared.constants.clip import (
     DEFAULT_PROMPT_MAX_LENGTH,
     DEFAULT_VALIDATION_SPLIT,
 )
+from src.shared.constants.rotation import (
+    ROTATION_CHANNELS_ROT6D,
+    normalizeRotationRepr,
+    resolveRotationChannels,
+)
 from src.shared.types import (
     ClipTrainingConfig,
     ClipTrainingHyperparameters,
@@ -35,6 +40,9 @@ from src.shared.types.network import (
     GenerationNetworkConfig,
     LearningRateHyperparameters,
     NetworkConfig,
+    DEFAULT_SPATIOTEMPORAL_MODE,
+    SPATIOTEMPORAL_MODE_FACTORIZED,
+    SPATIOTEMPORAL_MODE_FLAT,
 )
 
 # Generation default values
@@ -103,6 +111,16 @@ def _parseNetworkConfig(section: Dict[str, Any]) -> NetworkConfig:
     """Parse network configuration from YAML section."""
     clipSection = section.get("clip", {})
     generationSection = section.get("generation", {})
+    rotationRepr = normalizeRotationRepr(
+        generationSection.get("rotation-repr")
+    )
+    motionChannels = _resolveMotionChannels(
+        generationSection,
+        rotationRepr,
+    )
+    spatiotemporalMode = _normalizeSpatiotemporalMode(
+        generationSection.get("spatiotemporal-mode")
+    )
     
     return NetworkConfig(
         embedDim=int(section.get("embed-dim", 128)),
@@ -113,10 +131,58 @@ def _parseNetworkConfig(section: Dict[str, Any]) -> NetworkConfig:
         generation=GenerationNetworkConfig(
             numHeads=int(generationSection.get("num-heads", 4)),
             numLayers=int(generationSection.get("num-layers", 6)),
+            numSpatialLayers=int(
+                generationSection.get("num-spatial-layers", 1)
+            ),
+            motionChannels=motionChannels,
+            rotationRepr=rotationRepr,
+            spatiotemporalMode=spatiotemporalMode,
             numBones=int(generationSection.get("num-bones", 22)),
             diffusionSteps=int(generationSection.get("diffusion-steps", 1000)),
         ),
     )
+
+
+def _resolveMotionChannels(
+    generationSection: Dict[str, Any],
+    rotationRepr: str,
+) -> int:
+    """Resolve motion channels from config and rotation representation."""
+    defaultChannels = resolveRotationChannels(
+        rotationRepr,
+        ROTATION_CHANNELS_ROT6D,
+    )
+    channelsValue = generationSection.get("motion-channels")
+    if channelsValue is None:
+        return defaultChannels
+    motionChannels = int(channelsValue)
+    expected = resolveRotationChannels(rotationRepr, motionChannels)
+    if motionChannels != expected:
+        LOGGER.warning(
+            "motion-channels=%s does not match rotation-repr=%s (using %s)",
+            motionChannels,
+            rotationRepr,
+            expected,
+        )
+        return expected
+    return motionChannels
+
+
+def _normalizeSpatiotemporalMode(mode: Any) -> str:
+    """Normalize spatio-temporal mode."""
+    if mode is None:
+        return DEFAULT_SPATIOTEMPORAL_MODE
+    normalized = str(mode).strip().lower()
+    if normalized in (
+        SPATIOTEMPORAL_MODE_FLAT,
+        SPATIOTEMPORAL_MODE_FACTORIZED,
+    ):
+        return normalized
+    LOGGER.warning(
+        "Unknown spatiotemporal mode '%s', using default",
+        normalized,
+    )
+    return DEFAULT_SPATIOTEMPORAL_MODE
 
 
 def _defaultNetworkConfig() -> NetworkConfig:
@@ -237,9 +303,10 @@ def loadTrainingConfig(
             resolved,
             pathsSection.get("checkpoint-dir"),
         ),
-        resumeCheckpoint=_optionalExistingPath(
+        resumeCheckpoint=_optionalExistingPathOrNone(
             resolved,
             trainingSection.get("resume-checkpoint"),
+            "resume-checkpoint",
         ),
         gradientAccumulation=_int(trainingSection, "gradient-accumulation", 1),
         MM_memoryLimitGB=_float(trainingSection, "MM-memory-limit-gb", 0.0),
@@ -358,9 +425,10 @@ def loadGenerationConfig(
         modelName=str(
             trainingSection.get("model-name", GENERATION_DEFAULT_MODEL_NAME)
         ),
-        resumeCheckpoint=_optionalExistingPath(
+        resumeCheckpoint=_optionalExistingPathOrNone(
             resolved,
             trainingSection.get("resume-checkpoint"),
+            "resume-checkpoint",
         ),
         MM_memoryLimitGB=_float(trainingSection, "MM-memory-limit-gb", 0.0),
         gradientAccumulation=_int(trainingSection, "gradient-accumulation", 1),
@@ -711,6 +779,46 @@ def _optionalExistingPath(
     raise FileNotFoundError(
         f"Configured resume-checkpoint does not exist. Tried: {attempted}",
     )
+
+
+
+def _optionalExistingPathOrNone(
+    configPath: Path,
+    rawValue: Optional[str],
+    label: str,
+) -> Optional[Path]:
+    """
+    Resolve an optional path and return None when missing.
+
+    Parameters
+    ----------
+    configPath : Path
+        Path to the configuration file used as an anchor.
+    rawValue : Optional[str]
+        User-provided path value from the YAML file.
+    label : str
+        Label for warning messages.
+
+    Returns
+    -------
+    Optional[Path]
+        Resolved path or None when missing.
+    """
+    if rawValue in (None, ""):
+        return None
+    candidates = list(
+        _candidatePaths(configPath.parent, str(rawValue))
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    attempted = ", ".join(str(c) for c in candidates)
+    LOGGER.warning(
+        "Optional %s does not exist. Tried: %s",
+        label,
+        attempted,
+    )
+    return None
 
 
 def _resolveExistingPath(

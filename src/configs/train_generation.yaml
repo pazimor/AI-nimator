@@ -11,19 +11,19 @@ paths:
 # ============================================
 training:
   epochs: 1000
-  device: mps
+  device: auto
   max-length: 256
   model-name: xlm-roberta-base
   validation-split: 0.01
-  early-stopping-patience: 30
-  batch-size: 8
+  early-stopping-patience: 10
+  batch-size: 2
   gradient-accumulation: 1
-  max-samples-per-epoch: 10000
+  max-samples-per-epoch: 5
   MM-memory-limit-gb: 20.0
   resume-checkpoint: output/generation/best_model.pt
   
   # Learning Rate Configuration
-  learning-rate: 0.01       # Initial/base learning rate
+  learning-rate: 0.0001       # Initial/base learning rate
   lr-min: 0.000001            # Minimum LR floor (1e-6)
   lr-warmup-epochs: 1        # Warmup epochs (0 to disable)
   lr-schedule: cosine         # Schedule type: constant, cosine, linear, step
@@ -53,5 +53,5 @@ spark:
   lr-min: 0.00001
   lr-warmup-epochs: 20
   lr-schedule: cosine
-  geodesic-weight: 0.1
-  geodesic-weight-schedule: timestep
+  geodesic-weight: 0.3
+  geodesic-weight-schedule: none

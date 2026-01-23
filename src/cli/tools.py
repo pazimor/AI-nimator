@@ -8,6 +8,8 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from src.shared.constants.rotation import ROTATION_CHANNELS_ROT6D
+
 
 def _formatSize(numBytes: int) -> str:
     """Format bytes to human readable size."""
@@ -253,7 +255,7 @@ def shapeCheck(
     batchSize: int,
     frames: int,
     device: str,
-    motionChannels: int,
+    motionChannels: Optional[int],
     full: bool,
     modelName: str,
     maxLength: int,
@@ -273,8 +275,8 @@ def shapeCheck(
         Number of frames for dummy motion.
     device : str
         Torch device string (cpu, cuda, mps, auto).
-    motionChannels : int
-        Channels per bone (default 6).
+    motionChannels : Optional[int]
+        Channels per bone (None uses network config).
     full : bool
         If True, include CLIP text encoder and quaternion conversion.
     modelName : str
@@ -290,8 +292,18 @@ def shapeCheck(
     embedDim = networkConfig.embedDim
     numHeads = networkConfig.generation.numHeads
     numLayers = networkConfig.generation.numLayers
+    numSpatialLayers = networkConfig.generation.numSpatialLayers
     numBones = networkConfig.generation.numBones
+    rotationRepr = networkConfig.generation.rotationRepr
+    spatiotemporalMode = networkConfig.generation.spatiotemporalMode
     diffusionSteps = networkConfig.generation.diffusionSteps
+    if motionChannels is None:
+        motionChannels = networkConfig.generation.motionChannels
+    elif motionChannels != networkConfig.generation.motionChannels:
+        print(
+            "⚠️  motion-channels override ignored; using network config."
+        )
+        motionChannels = networkConfig.generation.motionChannels
 
     if embedDim % numHeads != 0:
         print(
@@ -305,15 +317,20 @@ def shapeCheck(
     print("=" * 60)
     print(f"network.yaml: {networkConfigPath} (profile={networkProfile})")
     print(
-        "D=%d H=%d L=%d K=%d C=%d T=%d device=%s"
-        % (embedDim, numHeads, numLayers, numBones, motionChannels, frames, resolvedDevice)
-    )
-    if motionChannels != 6 and full:
-        print(
-            "❌ Full check requires motionChannels=6 (6D rotations). "
-            f"Got motionChannels={motionChannels}."
+        "D=%d H=%d L=%d S=%d K=%d C=%d R=%s M=%s T=%d device=%s"
+        % (
+            embedDim,
+            numHeads,
+            numLayers,
+            numSpatialLayers,
+            numBones,
+            motionChannels,
+            rotationRepr,
+            spatiotemporalMode,
+            frames,
+            resolvedDevice,
         )
-        sys.exit(1)
+    )
 
     tags = [None] * batchSize
     timesteps = torch.randint(
@@ -339,6 +356,10 @@ def shapeCheck(
                 embedDim=embedDim,
                 numHeads=numHeads,
                 numLayers=numLayers,
+                numSpatialLayers=numSpatialLayers,
+                motionChannels=motionChannels,
+                rotationRepr=rotationRepr,
+                spatiotemporalMode=spatiotemporalMode,
                 numBones=numBones,
                 diffusionSteps=diffusionSteps,
                 modelName=modelName,
@@ -378,10 +399,14 @@ def shapeCheck(
                 )
                 sys.exit(1)
 
-            motionFlat = predictedNoise.view(batchSize, frames, numBones * motionChannels)
+            motionFlat = predictedNoise.view(
+                batchSize,
+                frames,
+                numBones * motionChannels,
+            )
             smoothed = model.smoothing(motionFlat)
-            motion6d = smoothed.view(batchSize, frames, numBones, motionChannels)
-            motionQuat = model._sixdToQuaternion(motion6d)
+            motion = smoothed.view(batchSize, frames, numBones, motionChannels)
+            motionQuat = model._rotationToQuaternion(motion)
             motionQuat = model.velocityReg(motionQuat)
 
             expectedQuat = (batchSize, frames, numBones, 4)
@@ -404,6 +429,8 @@ def shapeCheck(
                 embedDim=embedDim,
                 numHeads=numHeads,
                 numLayers=numLayers,
+                numSpatialLayers=numSpatialLayers,
+                spatiotemporalMode=spatiotemporalMode,
                 numBones=numBones,
                 motionChannels=motionChannels,
             ).to(resolvedDevice)
@@ -426,14 +453,18 @@ def shapeCheck(
                 )
                 sys.exit(1)
 
-            motionFlat = predictedNoise.view(batchSize, frames, numBones * motionChannels)
+            motionFlat = predictedNoise.view(
+                batchSize,
+                frames,
+                numBones * motionChannels,
+            )
             smoothing = Smoothing(channels=numBones * motionChannels).to(resolvedDevice)
             smoothed = smoothing(motionFlat)
-            motion6d = smoothed.view(batchSize, frames, numBones, motionChannels)
-            if motionChannels == 6:
+            motion = smoothed.view(batchSize, frames, numBones, motionChannels)
+            if motionChannels == ROTATION_CHANNELS_ROT6D:
                 renorm = Renormalization().to(resolvedDevice)
                 velreg = VelocityRegularization().to(resolvedDevice)
-                rotMat = renorm(motion6d)
+                rotMat = renorm(motion)
                 rotMat = velreg(rotMat)
 
                 expectedRot = (batchSize, frames, numBones, 3, 3)
@@ -447,7 +478,7 @@ def shapeCheck(
             else:
                 print(
                     "⚠️  Fast check OK (denoiser + smoothing). "
-                    "Renormalization skipped because motionChannels!=6."
+                    "Renormalization skipped for non-6D rotations."
                 )
 
     print()
@@ -523,8 +554,8 @@ Exemples:
     shapeParser.add_argument(
         "--motion-channels",
         type=int,
-        default=6,
-        help="Channels par bone (6 par defaut)",
+        default=None,
+        help="Channels par bone (None = config)",
     )
     shapeParser.add_argument(
         "--full",

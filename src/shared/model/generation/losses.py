@@ -6,6 +6,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.shared.constants.rotation import (
+    DEFAULT_ROTATION_REPR,
+    ROTATION_KIND_AXIS_ANGLE,
+    ROTATION_REPR_AXIS_ANGLE,
+    ROTATION_REPR_ROT6D,
+)
+from src.shared.quaternion import Rotation
+
 DEFAULT_DIFFUSION_WEIGHT = 1.0
 DEFAULT_GEODESIC_WEIGHT = 0.1
 DEFAULT_VELOCITY_WEIGHT = 0.01
@@ -44,20 +52,23 @@ def diffusionLoss(
 def geodesicLoss(
     predicted: torch.Tensor,
     target: torch.Tensor,
+    rotationRepr: str = DEFAULT_ROTATION_REPR,
     eps: float = 1e-7,
     motionMask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
-    Geodesic loss for 6D rotation representations.
+    Geodesic loss for rotation representations.
 
     Computes loss based on the rotation matrix difference.
 
     Parameters
     ----------
     predicted : torch.Tensor
-        Predicted 6D rotations shaped (..., 6).
+        Predicted rotations shaped (..., C).
     target : torch.Tensor
-        Target 6D rotations shaped (..., 6).
+        Target rotations shaped (..., C).
+    rotationRepr : str, optional
+        Rotation representation, by default "rot6d".
     eps : float, optional
         Epsilon for numerical stability, by default 1e-7.
     motionMask : torch.Tensor | None, optional
@@ -68,9 +79,9 @@ def geodesicLoss(
     torch.Tensor
         Scalar geodesic loss.
     """
-    # Convert 6D to rotation matrices
-    predMat = _sixdToRotationMatrix(predicted)
-    targetMat = _sixdToRotationMatrix(target)
+    # Convert rotations to rotation matrices
+    predMat = _rotationToMatrix(predicted, rotationRepr)
+    targetMat = _rotationToMatrix(target, rotationRepr)
 
     # Compute R_pred^T @ R_target
     diff = torch.matmul(predMat.transpose(-2, -1), targetMat)
@@ -167,6 +178,7 @@ def combinedGenerationLoss(
     velocityWeight: float = DEFAULT_VELOCITY_WEIGHT,
     accelerationWeight: float = DEFAULT_ACCELERATION_WEIGHT,
     geodesicWeightSchedule: str = GEODESIC_SCHEDULE_NONE,
+    rotationRepr: str = DEFAULT_ROTATION_REPR,
     timesteps: torch.Tensor | None = None,
     numTimesteps: int | None = None,
     motionMask: torch.Tensor | None = None,
@@ -194,6 +206,8 @@ def combinedGenerationLoss(
         Weight for acceleration loss, by default 0.001.
     geodesicWeightSchedule : str, optional
         Schedule mode for geodesic weight, by default "none".
+    rotationRepr : str, optional
+        Rotation representation, by default "rot6d".
     timesteps : torch.Tensor | None, optional
         Diffusion timesteps for schedule-aware weighting.
     numTimesteps : int | None, optional
@@ -210,6 +224,7 @@ def combinedGenerationLoss(
     lossGeo = geodesicLoss(
         predictedMotion,
         targetMotion,
+        rotationRepr=rotationRepr,
         motionMask=motionMask,
     )
     geoWeight = _resolveGeodesicWeight(
@@ -321,3 +336,32 @@ def _sixdToRotationMatrix(sixd: torch.Tensor) -> torch.Tensor:
 
     # Stack into rotation matrix
     return torch.stack([b1, b2, b3], dim=-1)
+
+
+def _rotationToMatrix(
+    rotation: torch.Tensor,
+    rotationRepr: str,
+) -> torch.Tensor:
+    """
+    Convert rotation representation to rotation matrix.
+
+    Parameters
+    ----------
+    rotation : torch.Tensor
+        Rotations shaped (..., C).
+    rotationRepr : str
+        Rotation representation.
+
+    Returns
+    -------
+    torch.Tensor
+        Rotation matrix shaped (..., 3, 3).
+    """
+    if rotationRepr == ROTATION_REPR_ROT6D:
+        return _sixdToRotationMatrix(rotation)
+    if rotationRepr == ROTATION_REPR_AXIS_ANGLE:
+        return Rotation(
+            rotation,
+            kind=ROTATION_KIND_AXIS_ANGLE,
+        ).matrix
+    raise ValueError(f"Unknown rotation repr: {rotationRepr}")

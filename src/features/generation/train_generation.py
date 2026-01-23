@@ -31,6 +31,13 @@ if sys.platform == "darwin":
 from src.shared.model.generation.ddim import DDIM
 from src.shared.model.generation.motion_generator import MotionGenerator
 from src.shared.progress import TrainingProgressBar
+from src.shared.constants.rotation import (
+    ROTATION_CHANNELS_AXIS_ANGLE,
+    ROTATION_CHANNELS_ROT6D,
+    ROTATION_REPR_AXIS_ANGLE,
+    ROTATION_REPR_ROT6D,
+)
+from src.shared.quaternion import Rotation
 
 BatchDict = Mapping[str, object]
 LossComponents = dict[str, float]
@@ -42,11 +49,90 @@ LOSS_COMPONENT_KEYS = (
     "loss_acceleration",
 )
 LOSS_COMPONENT_LABELS = {
-    "loss_diffusion": "diff",
     "loss_geodesic": "geo",
-    "loss_velocity": "vel",
-    "loss_acceleration": "acc",
 }
+
+
+def prepareMotionRepresentation(
+    motion: torch.Tensor,
+    rotationRepr: str,
+) -> torch.Tensor:
+    """
+    Convert motion to the requested rotation representation.
+
+    Parameters
+    ----------
+    motion : torch.Tensor
+        Motion tensor shaped (batch, frames, bones, channels).
+    rotationRepr : str
+        Rotation representation.
+
+    Returns
+    -------
+    torch.Tensor
+        Motion tensor shaped (batch, frames, bones, outChannels).
+    """
+    if rotationRepr == ROTATION_REPR_ROT6D:
+        return motion
+    if rotationRepr == ROTATION_REPR_AXIS_ANGLE:
+        motionShape = motion.shape
+        if motionShape[-1] == ROTATION_CHANNELS_AXIS_ANGLE:
+            return motion
+        if motionShape[-1] != ROTATION_CHANNELS_ROT6D:
+            raise ValueError(
+                "Expected rot6d motion for axis-angle conversion, "
+                f"got {motionShape[-1]} channels."
+            )
+        flatMotion = motion.reshape(-1, motionShape[-1])
+        axisAngles = Rotation(
+            flatMotion,
+            kind=ROTATION_REPR_ROT6D,
+        ).axis_angle
+        return axisAngles.reshape(
+            motionShape[:-1] + (ROTATION_CHANNELS_AXIS_ANGLE,)
+        )
+    raise ValueError(f"Unknown rotation repr: {rotationRepr}")
+
+
+def ensureMotionChannels(
+    motion: torch.Tensor,
+    expectedChannels: int,
+) -> torch.Tensor:
+    """
+    Ensure motion tensor matches the expected channel count.
+
+    Parameters
+    ----------
+    motion : torch.Tensor
+        Motion tensor shaped (batch, frames, bones, channels).
+    expectedChannels : int
+        Expected channel count.
+
+    Returns
+    -------
+    torch.Tensor
+        Motion tensor with expected channel count.
+    """
+    currentChannels = motion.shape[-1]
+    if currentChannels == expectedChannels:
+        return motion
+    if (
+        expectedChannels == ROTATION_CHANNELS_AXIS_ANGLE
+        and currentChannels == ROTATION_CHANNELS_ROT6D
+    ):
+        motionShape = motion.shape
+        flatMotion = motion.reshape(-1, motionShape[-1])
+        axisAngles = Rotation(
+            flatMotion,
+            kind=ROTATION_REPR_ROT6D,
+        ).axis_angle
+        return axisAngles.reshape(
+            motionShape[:-1] + (ROTATION_CHANNELS_AXIS_ANGLE,)
+        )
+    raise ValueError(
+        "Motion channels mismatch: "
+        f"got {currentChannels}, expected {expectedChannels}."
+    )
 
 
 def _initLossComponents() -> LossComponents:
@@ -331,6 +417,8 @@ def _runBatch(
     if motionMask is not None:
         motionMask = motionMask.to(device)
     tags = batch["tag"]
+    motion = prepareMotionRepresentation(motion, model.rotationRepr)
+    motion = ensureMotionChannels(motion, model.motionChannels)
 
     # Delete batch reference early
     del batch
@@ -423,6 +511,8 @@ def _runBatchAccumulate(
     if motionMask is not None:
         motionMask = motionMask.to(device)
     tags = batch["tag"]
+    motion = prepareMotionRepresentation(motion, model.rotationRepr)
+    motion = ensureMotionChannels(motion, model.motionChannels)
 
     del batch
 
@@ -509,6 +599,8 @@ def evaluateValidation(
             if motionMask is not None:
                 motionMask = motionMask.to(device)
             tags = batch["tag"]
+            motion = prepareMotionRepresentation(motion, model.rotationRepr)
+            motion = ensureMotionChannels(motion, model.motionChannels)
 
             batchSize = motion.shape[0]
 
