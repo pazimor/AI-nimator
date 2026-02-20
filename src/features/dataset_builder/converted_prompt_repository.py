@@ -56,13 +56,11 @@ class ConvertedPromptRepository:
         payload = self._read_prompt_payload(promptPath)
         simple = self._extract_field(payload, ["Simple", "simple"])
         advanced = self._extract_field(payload, ["advanced", "Advanced"])
-        tag = self._extract_field(payload, ["tag", "Tag"])
-        if not any([simple, advanced, tag]):
+        if not any([simple, advanced]):
             return None
         entry = ConvertedPrompt(
             simple=simple,
             advanced=advanced,
-            tag=tag,
             promptIdentifier=self._prompt_identifier(promptPath),
         )
         keys = self._source_keys(source)

@@ -223,6 +223,7 @@ class DatasetManager:
         device: Optional[torch.device] = None,
         validationIndicesPath: Optional[Path] = None,
         maxSamplesPerEpoch: Optional[int] = None,
+        datasetFolders: Optional[List[str]] = None,
     ) -> None:
         self.datasetRoot = datasetRoot
         self.batchSize = batchSize
@@ -231,12 +232,15 @@ class DatasetManager:
         self.device = device
         self.validationIndicesPath = validationIndicesPath
         self.maxSamplesPerEpoch = maxSamplesPerEpoch
+        self.datasetFolders = datasetFolders
 
         self.memoryConfig = memoryConfig or MemoryManagerConfig()
         self.memoryManager = MemoryManager(self.memoryConfig, device)
 
         self._dataset: Optional[PreprocessedMotionDataset] = None
         self._totalSize: Optional[int] = None
+        self._activeIndices: Optional[List[int]] = None
+        self._activeIndexSet: Optional[set[int]] = None
         self._maxSamples: Optional[int] = None
         self._fixedValidationIndices: Optional[List[int]] = None
         self._fixedValidationIndexSet: Optional[set[int]] = None
@@ -257,7 +261,9 @@ class DatasetManager:
                 self.datasetRoot,
             )
             self._dataset = PreprocessedMotionDataset(self.datasetRoot)
-            self._totalSize = len(self._dataset)
+            self._activeIndices = self._buildActiveIndices(self._dataset)
+            self._activeIndexSet = set(self._activeIndices)
+            self._totalSize = len(self._activeIndices)
             self._maxSamples = None
             LOGGER.info(
                 "MM: Dataset indexed: %d total samples",
@@ -275,6 +281,41 @@ class DatasetManager:
         """Get total dataset size."""
         self._ensureDataset()
         return self._totalSize or 0
+
+    def _buildActiveIndices(self, dataset: PreprocessedMotionDataset) -> List[int]:
+        """Build the list of sample indices active for this training run."""
+        totalIndices = list(range(len(dataset)))
+        if not self.datasetFolders:
+            return totalIndices
+        allowedFolders = {
+            self._normalizeFolderName(folder)
+            for folder in self.datasetFolders
+            if folder and folder.strip()
+        }
+        if not allowedFolders:
+            return totalIndices
+        filtered: List[int] = []
+        for index, entry in enumerate(dataset.indexEntries):
+            folder = self._normalizeFolderName(entry.datasetFolder)
+            if folder in allowedFolders:
+                filtered.append(index)
+        if not filtered:
+            requested = ", ".join(sorted(allowedFolders))
+            raise ValueError(
+                "No samples found for dataset folders: "
+                f"{requested}. Rebuild/preprocess dataset with folder metadata."
+            )
+        LOGGER.info(
+            "MM: Folder filter active (%d folders): %s -> %d samples",
+            len(allowedFolders),
+            ", ".join(sorted(allowedFolders)),
+            len(filtered),
+        )
+        return filtered
+
+    def _normalizeFolderName(self, value: str) -> str:
+        """Normalize folder labels for stable comparisons."""
+        return value.replace("\\", "/").strip().lower()
 
     @property
     def effectiveSamplesPerEpoch(self) -> int:
@@ -318,7 +359,10 @@ class DatasetManager:
         dataset = self._dataset
         if dataset is None:
             raise RuntimeError("Dataset not initialized.")
-        totalSize = self._totalSize or len(dataset)
+        activeIndices = self._activeIndices
+        if activeIndices is None:
+            activeIndices = list(range(len(dataset)))
+        totalSize = self._totalSize or len(activeIndices)
         chunkSize = self._getMaxSamples()
         valIndexSet = self._getFixedValidationIndexSet()
 
@@ -326,7 +370,7 @@ class DatasetManager:
             self.clearCache()
 
         if chunkSize >= totalSize:
-            indices = list(range(totalSize))
+            indices = activeIndices
             chunkInfo = f"all {totalSize} samples"
             return self._buildDataloaders(
                 indices,
@@ -339,13 +383,14 @@ class DatasetManager:
             chunkSize=chunkSize,
             epochIndex=epochIndex,
         )
+        mappedIndices = [activeIndices[idx] for idx in indices]
         chunkInfo = _formatChunkInfo(startIndex, chunkSize, totalSize)
         LOGGER.info(
             "MM: Loading chunk for epoch %d: %s",
             epochIndex + 1,
             chunkInfo,
         )
-        return self._buildDataloaders(indices, chunkInfo, valIndexSet)
+        return self._buildDataloaders(mappedIndices, chunkInfo, valIndexSet)
 
     def _buildDataloaders(
         self,
@@ -565,7 +610,10 @@ class DatasetManager:
             return None
         if not indices:
             return None
-        totalSize = self.totalSize
+        dataset = self._dataset
+        if dataset is None:
+            raise RuntimeError("Dataset not initialized.")
+        totalSize = len(dataset)
         if any(
             not isinstance(idx, int)
             or idx < 0
@@ -576,22 +624,35 @@ class DatasetManager:
                 "MM: Validation indices out of range, regenerating."
             )
             return None
-        return indices
+        activeIndexSet = self._activeIndexSet
+        if activeIndexSet is None:
+            return indices
+        filtered = sorted([idx for idx in indices if idx in activeIndexSet])
+        if not filtered:
+            LOGGER.warning(
+                "MM: Validation indices do not overlap selected dataset folders."
+            )
+            return None
+        return filtered
 
     def _createValidationIndices(self) -> List[int]:
         """
         Create a deterministic validation split for the full dataset.
         """
-        totalSize = self.totalSize
+        activeIndices = self._activeIndices
+        if activeIndices is None:
+            return []
+        totalSize = len(activeIndices)
         if totalSize <= 0:
             return []
         valSize = max(int(totalSize * self.validationSplit), MIN_SAMPLES)
         if totalSize > 1:
             valSize = min(valSize, totalSize - 1)
         generator = random.Random(DEFAULT_VALIDATION_SEED)
-        indices = list(range(totalSize))
-        generator.shuffle(indices)
-        return sorted(indices[:valSize])
+        positions = list(range(totalSize))
+        generator.shuffle(positions)
+        selectedPositions = sorted(positions[:valSize])
+        return sorted([activeIndices[pos] for pos in selectedPositions])
 
     def _saveValidationIndices(self, indices: List[int]) -> None:
         """

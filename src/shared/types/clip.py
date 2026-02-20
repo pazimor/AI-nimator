@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -18,12 +18,9 @@ class PromptFileDescriptor:
     ----------
     path : Path
         Filesystem path to the prompt JSON file.
-    tag : str
-        High-level label attached to the prompt file.
     """
 
     path: Path
-    tag: str
 
 
 @dataclass(frozen=True)
@@ -58,8 +55,6 @@ class ClipPromptSegment:
         Natural language description of the motion slice.
     sourceFile : str
         Original prompt source identifier.
-    tag : str
-        Dataset-level tag attached to the prompt file.
     metadata : Dict[str, object]
         Optional metadata extracted from the prompt file.
     """
@@ -68,7 +63,6 @@ class ClipPromptSegment:
     endFrame: int
     text: str
     sourceFile: str
-    tag: str
     metadata: Dict[str, object] = field(default_factory=dict)
 
 
@@ -81,8 +75,6 @@ class ClipDatasetRecord:
     ----------
     promptText : str
         Text that will be tokenized for CLIP alignment.
-    tag : str
-        Dataset-level tag for display or conditioning.
     animationPath : Path
         Path to the animation payload associated with this record.
     startFrame : int
@@ -96,7 +88,6 @@ class ClipDatasetRecord:
     """
 
     promptText: str
-    tag: str
     animationPath: Path
     startFrame: int
     endFrame: int
@@ -113,8 +104,6 @@ class MotionTextSample:
     ----------
     text : str
         User-facing textual description.
-    tag : str
-        Optional dataset tag.
     startFrame : int
         First frame index included.
     endFrame : int
@@ -128,7 +117,6 @@ class MotionTextSample:
     """
 
     text: str
-    tag: str
     startFrame: int
     endFrame: int
     motion: torch.Tensor
@@ -145,9 +133,12 @@ class ClipTrainingPaths:
     ----------
     datasetRoot : Path
         Root directory containing preprocessed dataset shards.
+    datasetFolders : Optional[List[str]]
+        Optional top-level folders to include during training.
     """
 
     datasetRoot: Path
+    datasetFolders: Optional[List[str]] = None
 
 
 @dataclass(frozen=True)
@@ -182,18 +173,10 @@ class ClipTrainingHyperparameters:
     weightDecay : float
         Weight decay for regularization.
     
-    Learning Rate Configuration
-    ---------------------------
+    Learning Rate
+    -------------
     learningRate : float
-        Initial/base learning rate.
-    lrMin : float
-        Minimum learning rate floor.
-    lrWarmupEpochs : int
-        Number of warmup epochs (0 to disable).
-    lrSchedule : str
-        Schedule type: "constant", "cosine", "linear", "step".
-    lrDecayEpochs : Optional[int]
-        Decay phase length (default: epochs - warmup).
+        Constant learning rate used during training.
     """
 
     batchSize: int
@@ -209,12 +192,8 @@ class ClipTrainingHyperparameters:
     MM_memoryLimitGB: float = 0.0
     weightDecay: float = 0.0
     
-    # Learning Rate Configuration
+    # Learning Rate
     learningRate: float = 0.001
-    lrMin: float = 1e-7
-    lrWarmupEpochs: int = 0
-    lrSchedule: str = "cosine"
-    lrDecayEpochs: Optional[int] = None
 
 
 @dataclass(frozen=True)

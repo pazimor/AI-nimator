@@ -33,6 +33,19 @@ def buildArgumentParser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable debug mode (fails on first error).",
     )
+    parser.add_argument(
+        "--custom-prompts",
+        dest="includeCustomPrompts",
+        action="store_true",
+        default=None,
+        help="Include converted custom prompts (#Simple/#Advanced).",
+    )
+    parser.add_argument(
+        "--no-custom-prompts",
+        dest="includeCustomPrompts",
+        action="store_false",
+        help="Disable converted custom prompts (#Simple/#Advanced).",
+    )
     return parser
 
 
@@ -48,8 +61,14 @@ def main() -> None:
     parser = buildArgumentParser()
     arguments = parser.parse_args()
     config = loadBuilderConfig(arguments.config)
+    includeCustomPrompts = (
+        arguments.includeCustomPrompts
+        if arguments.includeCustomPrompts is not None
+        else config.processing.includeCustomPrompts
+    )
     options = DatasetBuildOptions(
         debugMode=arguments.debug,
+        includeCustomPrompts=includeCustomPrompts,
     )
     builder = DatasetBuilder(config=config, options=options)
     report = builder.buildDataset()

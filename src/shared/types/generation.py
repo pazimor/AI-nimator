@@ -6,19 +6,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
-# Exhaustive list of valid tags for motion generation
-VALID_TAGS: List[str] = [
-    "Dance",
-    "Combat",
-    "Déplacement",
-    "Idle",
-    "Gesture",
-    "Acrobatie",
-    "Sport",
-    "Dégâts subit",
-    "Monture ou Véhicule",
-]
-
 
 @dataclass(frozen=True)
 class GenerationTrainingPaths:
@@ -35,12 +22,15 @@ class GenerationTrainingPaths:
         Directory to save generation model checkpoints.
     validationIndices : Optional[Path]
         Optional path for fixed validation indices.
+    datasetFolders : Optional[List[str]]
+        Optional top-level folders to include during training.
     """
 
     datasetRoot: Path
     clipCheckpoint: Path
     checkpointDir: Path
     validationIndices: Optional[Path] = None
+    datasetFolders: Optional[List[str]] = None
 
 
 @dataclass(frozen=True)
@@ -71,25 +61,23 @@ class GenerationTrainingHyperparameters:
     fixedTrainChunk : bool
         When True, reuse the same training chunk each epoch.
     
-    Learning Rate Configuration
-    ---------------------------
+    Learning Rate
+    -------------
     learningRate : float
-        Initial/base learning rate.
-    lrMin : float
-        Minimum learning rate floor.
-    lrWarmupEpochs : int
-        Number of warmup epochs (0 to disable).
-    lrSchedule : str
-        Schedule type: "constant", "cosine", "linear", "step".
-    lrDecayEpochs : Optional[int]
-        Decay phase length (default: epochs - warmup).
+        Constant learning rate used during training.
 
     Loss Configuration
     -----------------
-    geodesicWeight : float
-        Base geodesic loss weight.
-    geodesicWeightSchedule : str
-        Schedule mode for geodesic weighting.
+    xyzWeight : float
+        Base XYZ reconstruction loss weight.
+    xyzWeightSchedule : str
+        Schedule mode for XYZ weighting.
+    velXyzWeight : float
+        Velocity matching weight in joint XYZ space.
+    diffusionWeight : float
+        Weight for diffusion noise prediction loss.
+    accelerationWeight : float
+        Weight for acceleration regularization loss.
     """
 
     batchSize: int
@@ -105,14 +93,13 @@ class GenerationTrainingHyperparameters:
     maxSamplesPerEpoch: Optional[int] = None
     fixedTrainChunk: bool = False
     
-    # Learning Rate Configuration
+    # Learning Rate
     learningRate: float = 0.001
-    lrMin: float = 1e-7
-    lrWarmupEpochs: int = 0
-    lrSchedule: str = "cosine"
-    lrDecayEpochs: Optional[int] = None
-    geodesicWeight: float = 0.1
-    geodesicWeightSchedule: str = "none"
+    xyzWeight: float = 0.1
+    xyzWeightSchedule: str = "none"
+    velXyzWeight: float = 0.01
+    diffusionWeight: float = 1.0
+    accelerationWeight: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -146,8 +133,6 @@ class GenerationInferenceConfig:
         Path to the trained generation model checkpoint.
     prompt : str
         Text prompt describing the motion.
-    tag : Optional[str]
-        Categorical tag from the exhaustive list, if provided.
     frames : int
         Number of frames to generate.
     output : Path
@@ -160,7 +145,6 @@ class GenerationInferenceConfig:
 
     checkpoint: Path
     prompt: str
-    tag: Optional[str]
     frames: int
     output: Path
     device: str = "auto"
@@ -203,6 +187,8 @@ class GenerationOutputOptions:
         Destination path for the Collada export.
     fps : Optional[int]
         Optional frames per second override.
+    colladaInterpolation : str
+        Interpolation mode written in Collada samplers ("linear" or "step").
     zeroRootTranslation : bool
         Zero root translation during Collada export.
     anchorRootTranslation : bool
@@ -212,6 +198,7 @@ class GenerationOutputOptions:
     jsonPath: Path
     daePath: Path
     fps: Optional[int] = None
+    colladaInterpolation: str = "linear"
     zeroRootTranslation: bool = False
     anchorRootTranslation: bool = False
 
@@ -234,30 +221,3 @@ class GenerationTrainingResult:
     epochsRun: int
     finalLoss: float
     device: str
-
-
-def validateTag(tag: str) -> str:
-    """
-    Validate that a tag is in the exhaustive list.
-
-    Parameters
-    ----------
-    tag : str
-        Tag to validate.
-
-    Returns
-    -------
-    str
-        The validated tag.
-
-    Raises
-    ------
-    ValueError
-        Raised when the tag is not in the valid list.
-    """
-    if tag not in VALID_TAGS:
-        validList = ", ".join(f'"{t}"' for t in VALID_TAGS)
-        raise ValueError(
-            f'Invalid tag "{tag}". Must be one of: {validList}'
-        )
-    return tag

@@ -23,7 +23,6 @@ from src.shared.dataset_manager import (
     estimateModelBytes,
 )
 from src.shared.config_loader import loadNetworkConfig
-from src.shared.learning_rate import LearningRateScheduler, LearningRateConfig
 from src.shared.model.clip.core import ClipModel
 from src.shared.types import ClipTrainingConfig, ClipTrainingResult
 
@@ -55,6 +54,15 @@ def buildArgumentParser() -> argparse.ArgumentParser:
         default=None,
         help="Configuration profile to use (e.g., 'spark' for DGX Spark).",
     )
+    parser.add_argument(
+        "--dataset-folders",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated top-level dataset folders to include "
+            "(example: KIT,CMU,ACCAD)."
+        ),
+    )
     return parser
 
 
@@ -68,7 +76,11 @@ def main() -> None:
     try:
         configPath = _validateConfigPath(arguments.config)
         config = loadTrainingConfig(configPath, profile=arguments.profile)
-        result = _runTraining(config, profile=arguments.profile)
+        result = _runTraining(
+            config,
+            profile=arguments.profile,
+            datasetFolders=_parseFolderList(arguments.dataset_folders),
+        )
         parser.exit(
             0,
             f"Training finished with loss={result.finalLoss:.4f} "
@@ -82,6 +94,7 @@ def main() -> None:
 def _runTraining(
     config: ClipTrainingConfig,
     profile: Optional[str] = None,
+    datasetFolders: Optional[list[str]] = None,
 ) -> ClipTrainingResult:
     """
     Execute the end-to-end training workflow with early stopping.
@@ -137,30 +150,15 @@ def _runTraining(
         learningRate=config.training.learningRate,
         weightDecay=config.training.weightDecay,
     )
-    
-    # Learning rate scheduler with warmup
-    lrConfig = LearningRateConfig(
-        initialLR=config.training.learningRate,
-        minLR=config.training.lrMin,
-        warmupEpochs=config.training.lrWarmupEpochs,
-        scheduleType=config.training.lrSchedule,
-        decayEpochs=config.training.lrDecayEpochs,
-    )
-    scheduler = LearningRateScheduler(
-        optimizer=optimizer,
-        config=lrConfig,
-        totalEpochs=config.training.epochs,
-    )
-    LOGGER.info(
-        "Using LR scheduler: %d warmup epochs, schedule=%s, min_lr=%.2e",
-        config.training.lrWarmupEpochs,
-        config.training.lrSchedule,
-        config.training.lrMin,
-    )
 
     modelMemoryBytes = estimateModelBytes(model)
     memoryConfig = MemoryManagerConfig(
         MM_memoryLimitGB=config.training.MM_memoryLimitGB,
+    )
+    selectedFolders = (
+        datasetFolders
+        if datasetFolders is not None
+        else config.paths.datasetFolders
     )
     datasetManager = DatasetManager(
         datasetRoot=config.paths.datasetRoot,
@@ -169,6 +167,7 @@ def _runTraining(
         modelMemoryBytes=modelMemoryBytes,
         memoryConfig=memoryConfig,
         device=device,
+        datasetFolders=selectedFolders,
     )
     datasetManager.dataset.validateCompatibility(
         modelName=config.training.modelName,
@@ -239,7 +238,11 @@ def _runTraining(
 
         # Validation evaluation
         if valLoader is not None:
-            valLoss, retrieval = evaluateValidation(valLoader, model, device)
+            valLoss, retrieval = evaluateValidation(
+                valLoader,
+                model,
+                device,
+            )
             LOGGER.info("Epoch %s val loss: %.4f", epochsRun, valLoss)
             LOGGER.info(
                 "Retrieval: t2m@1=%.4f t2m@5=%.4f m2t@1=%.4f m2t@5=%.4f",
@@ -281,9 +284,7 @@ def _runTraining(
                 )
                 break
 
-        # Step LR scheduler
-        scheduler.step()
-        LOGGER.info("LR: %.6f", scheduler.getCurrentLR())
+        LOGGER.info("LR: %.6f", optimizer.param_groups[0]["lr"])
 
     finalLoss = bestValLoss if bestValLoss is not None else trainLoss
     return ClipTrainingResult(
@@ -291,6 +292,17 @@ def _runTraining(
         finalLoss=finalLoss,
         device=device.type,
     )
+
+
+def _parseFolderList(rawValue: str | None) -> list[str] | None:
+    """Parse comma-separated folder names from CLI."""
+    if rawValue is None:
+        return None
+    folders = [item.strip() for item in rawValue.split(",")]
+    normalized = [item for item in folders if item]
+    if not normalized:
+        return None
+    return normalized
 
 
 def _resolveDevice(choice: str) -> torch.device:

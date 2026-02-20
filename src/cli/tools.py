@@ -315,7 +315,6 @@ def shapeCheck(
         )
         sys.exit(1)
 
-    tags = [None] * batchSize
     timesteps = torch.randint(
         0,
         diffusionSteps,
@@ -341,6 +340,11 @@ def shapeCheck(
                 numLayers=numLayers,
                 numBones=numBones,
                 diffusionSteps=diffusionSteps,
+                numSpatialLayers=networkConfig.generation.numSpatialLayers,
+                numHierarchyLayers=networkConfig.generation.numHierarchyLayers,
+                numSpatioTemporalLayers=(
+                    networkConfig.generation.numSpatioTemporalLayers
+                ),
                 modelName=modelName,
                 clipCheckpoint=None,
             ).to(resolvedDevice)
@@ -364,7 +368,6 @@ def shapeCheck(
             outputs = model(
                 textInputIds=inputIds,
                 textAttentionMask=attentionMask,
-                tags=tags,
                 noisyMotion=noisyMotion,
                 timesteps=timesteps,
                 targetNoise=None,
@@ -415,7 +418,6 @@ def shapeCheck(
             predictedNoise = denoiser(
                 noisyMotion=noisyMotion,
                 textEmbedding=textEmbedding,
-                tags=tags,
                 timesteps=timesteps,
             )
 
@@ -538,6 +540,7 @@ Exemples:
     )
     shapeParser.add_argument(
         "--max-length",
+        dest="maxLength",
         type=int,
         default=64,
         help="Longueur max des prompts (si --full)",
@@ -561,7 +564,7 @@ Exemples:
             motionChannels=args.motion_channels,
             full=args.full,
             modelName=args.model_name,
-            maxLength=args.max_length,
+            maxLength=args.maxLength,
         )
     else:
         parser.print_help()

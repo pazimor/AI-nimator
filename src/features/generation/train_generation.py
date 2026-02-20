@@ -37,15 +37,17 @@ LossComponents = dict[str, float]
 LOGGER = logging.getLogger("generation.train")
 LOSS_COMPONENT_KEYS = (
     "loss_diffusion",
-    "loss_geodesic",
-    "loss_velocity",
+    "loss_xyz",
+    "loss_vel_xyz",
     "loss_acceleration",
+    "contrib_diffusion",
+    "contrib_xyz",
+    "contrib_vel_xyz",
+    "contrib_acceleration",
 )
 LOSS_COMPONENT_LABELS = {
-    "loss_diffusion": "diff",
-    "loss_geodesic": "geo",
-    "loss_velocity": "vel",
-    "loss_acceleration": "acc",
+    "loss_xyz": "xyz",
+    "loss_vel_xyz": "vel_xyz",
 }
 
 
@@ -252,7 +254,11 @@ def trainOneEpoch(
     ) as pbar:
         for batch in pbar:
             lossValue, lossComponents = _runBatchAccumulate(
-                batch, model, ddim, device, gradientAccumulation
+                batch,
+                model,
+                ddim,
+                device,
+                gradientAccumulation,
             )
             pbar.updateLoss(lossValue)
             _updateLossComponents(componentSums, lossComponents)
@@ -330,12 +336,11 @@ def _runBatch(
     motionMask = batch.get("motion_mask")
     if motionMask is not None:
         motionMask = motionMask.to(device)
-    tags = batch["tag"]
+    batchSize = motion.shape[0]
+    _ensureRotationOnlyInput(motion)
 
     # Delete batch reference early
     del batch
-
-    batchSize = motion.shape[0]
 
     # Sample random timesteps
     timesteps = torch.randint(
@@ -355,7 +360,6 @@ def _runBatch(
     outputs = model(
         textInputIds=inputIds,
         textAttentionMask=attentionMask,
-        tags=tags,
         noisyMotion=noisyMotion,
         timesteps=timesteps,
         targetNoise=noise,
@@ -364,7 +368,7 @@ def _runBatch(
     )
     
     # Delete inputs early
-    del inputIds, attentionMask, noisyMotion, tags, motion, motionMask
+    del inputIds, attentionMask, noisyMotion, motion, motionMask
 
     loss = outputs["loss"]
     lossComponents = _extractLossComponents(outputs)
@@ -422,11 +426,10 @@ def _runBatchAccumulate(
     motionMask = batch.get("motion_mask")
     if motionMask is not None:
         motionMask = motionMask.to(device)
-    tags = batch["tag"]
+    batchSize = motion.shape[0]
+    _ensureRotationOnlyInput(motion)
 
     del batch
-
-    batchSize = motion.shape[0]
 
     # Sample random timesteps
     timesteps = torch.randint(
@@ -446,7 +449,6 @@ def _runBatchAccumulate(
     outputs = model(
         textInputIds=inputIds,
         textAttentionMask=attentionMask,
-        tags=tags,
         noisyMotion=noisyMotion,
         timesteps=timesteps,
         targetNoise=noise,
@@ -454,7 +456,7 @@ def _runBatchAccumulate(
         motionMask=motionMask,
     )
     
-    del inputIds, attentionMask, noisyMotion, tags, motion, motionMask
+    del inputIds, attentionMask, noisyMotion, motion, motionMask
 
     loss = outputs["loss"]
     lossComponents = _extractLossComponents(outputs)
@@ -508,9 +510,8 @@ def evaluateValidation(
             motionMask = batch.get("motion_mask")
             if motionMask is not None:
                 motionMask = motionMask.to(device)
-            tags = batch["tag"]
-
             batchSize = motion.shape[0]
+            _ensureRotationOnlyInput(motion)
 
             timesteps = torch.randint(
                 0, ddim.num_timesteps,
@@ -524,7 +525,6 @@ def evaluateValidation(
             outputs = model(
                 textInputIds=inputIds,
                 textAttentionMask=attentionMask,
-                tags=tags,
                 noisyMotion=noisyMotion,
                 timesteps=timesteps,
                 targetNoise=noise,
@@ -556,6 +556,17 @@ def evaluateValidation(
     avgLoss = totalLoss / max(numBatches, 1)
     avgComponents = _averageLossComponents(componentSums, numBatches)
     return avgLoss, avgComponents
+
+
+def _ensureRotationOnlyInput(motion: torch.Tensor) -> None:
+    """
+    Ensure model inputs only contain 6D rotations (no translation channels).
+    """
+    if motion.shape[-1] != MotionGenerator.MOTION_ROTATION_CHANNELS:
+        raise ValueError(
+            "Expected motion input with 6 channels (rotation-only), "
+            f"got {motion.shape[-1]}."
+        )
 
 
 def saveCheckpoint(

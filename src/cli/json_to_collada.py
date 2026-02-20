@@ -49,6 +49,20 @@ def buildArgumentParser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--fps",
+        type=int,
+        default=None,
+        help="Override FPS used for Collada export.",
+    )
+    parser.add_argument(
+        "--collada-interpolation",
+        dest="collada_interpolation",
+        type=str,
+        choices=["linear", "step"],
+        default="linear",
+        help="Interpolation mode used in Collada samplers.",
+    )
+    parser.add_argument(
         "--zero_root_translation",
         action="store_true",
         help="Force pelvis translation to zero for all frames.",
@@ -70,6 +84,7 @@ def load_json_animation(file_path: Path) -> Dict[str, Any]:
 def convert_json_to_sample(
     data: Dict[str, Any],
     file_path: Path,
+    fps_override: int | None = None,
 ) -> AnimationSample:
     """
     Convert JSON data to AnimationSample.
@@ -80,6 +95,8 @@ def convert_json_to_sample(
     """
     meta = data.get("meta", {})
     fps = int(meta.get("fps", 30))
+    if fps_override is not None:
+        fps = int(fps_override)
     
     bones_data = data.get("bones", [])
     if not bones_data:
@@ -226,7 +243,11 @@ def main() -> None:
     LOGGER.info(f"Loading {input_path}...")
     try:
         data = load_json_animation(input_path)
-        sample = convert_json_to_sample(data, input_path)
+        sample = convert_json_to_sample(
+            data,
+            input_path,
+            fps_override=args.fps,
+        )
         
         # Load real config so AnimationRebuilder resolves paths correctly.
         config_path = Path("src/configs/dataset.yaml")
@@ -242,6 +263,7 @@ def main() -> None:
         rebuilder.exportCollada(
             sample,
             output_path,
+            interpolation=args.collada_interpolation,
             zeroRootTranslation=args.zero_root_translation,
             anchorRootTranslation=args.anchor_root_translation,
         )

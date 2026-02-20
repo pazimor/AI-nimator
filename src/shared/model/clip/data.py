@@ -35,16 +35,15 @@ def loadPromptFile(path: str | Path) -> List[ClipPromptSegment]:
     Returns
     -------
     List[ClipPromptSegment]
-        Parsed segments enriched with the file-level tag.
+        Parsed segments enriched with prompt metadata.
     """
-    tag, metadata, segments = loadPromptSegments(path)
+    metadata, segments = loadPromptSegments(path)
     return [
         ClipPromptSegment(
             startFrame=segment.startFrame,
             endFrame=segment.endFrame,
             text=segment.text,
             sourceFile=segment.sourceFile,
-            tag=tag,
             metadata=metadata,
         )
         for segment in segments
@@ -157,13 +156,12 @@ class MotionTextClipDataset(Dataset[MotionTextSample]):
                 record.endFrame,
             )
             raise
-        encoded = self._tokenize(record.tag, record.promptText)
+        encoded = self._tokenize(record.promptText)
         return {
             "input_ids": encoded["input_ids"],
             "attention_mask": encoded["attention_mask"],
             "motion": motionSlice,
             "time": torch.tensor([record.startFrame, record.endFrame]),
-            "tag": record.tag,
             "meta": meta,
         }
 
@@ -184,7 +182,6 @@ class MotionTextClipDataset(Dataset[MotionTextSample]):
                 records.append(
                     ClipDatasetRecord(
                         promptText=segment.text,
-                        tag=segment.tag,
                         animationPath=animationPath,
                         startFrame=segment.startFrame,
                         endFrame=segment.endFrame,
@@ -321,26 +318,6 @@ class MotionTextClipDataset(Dataset[MotionTextSample]):
             "hitRate": self._cacheHits / max(1, self._cacheHits + self._cacheMisses),
         }
 
-    @staticmethod
-    def _composeText(tag: str, promptText: str) -> str:
-        """
-        Prefix the prompt text with the dataset tag when provided.
-
-        Parameters
-        ----------
-        tag : str
-            Dataset-level tag.
-        promptText : str
-            Raw prompt text.
-
-        Returns
-        -------
-        str
-            Text ready to be tokenized.
-        """
-        tagPrefix = f"[Tag: {tag}] " if tag else ""
-        return f"{tagPrefix}{promptText}"
-
     def _sliceMotion(
         self,
         record: ClipDatasetRecord,
@@ -363,14 +340,12 @@ class MotionTextClipDataset(Dataset[MotionTextSample]):
         mergedMeta = meta | record.metadata
         return motionSlice, mergedMeta
 
-    def _tokenize(self, tag: str, promptText: str) -> Dict[str, torch.Tensor]:
+    def _tokenize(self, promptText: str) -> Dict[str, torch.Tensor]:
         """
-        Tokenize the composed text prompt.
+        Tokenize the prompt text.
 
         Parameters
         ----------
-        tag : str
-            Dataset-level tag.
         promptText : str
             Raw prompt text.
 
@@ -379,9 +354,8 @@ class MotionTextClipDataset(Dataset[MotionTextSample]):
         Dict[str, torch.Tensor]
             Tokenized tensors squeezed on the batch dimension.
         """
-        textContent = self._composeText(tag, promptText)
         encoded = self.tokenizer(
-            textContent,
+            promptText,
             padding="max_length",
             truncation=True,
             max_length=self.maxLength,
@@ -424,7 +398,6 @@ def motionTextCollate(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
         "motion": motionBatch,
         "motion_mask": motionMask,
         "time": torch.stack([item["time"] for item in batch]),
-        "tag": [item["tag"] for item in batch],
         "meta": [item["meta"] for item in batch],
     }
 

@@ -74,7 +74,6 @@ class CustomPromptRepository:
             "advanced": str(
                 parsed.get("advanced") or parsed.get("Advanced") or ""
             ),
-            "tag": str(parsed.get("tag") or parsed.get("Tag") or ""),
         }
         self.entries[normalized] = prompt
 
@@ -111,4 +110,3 @@ class CustomPromptRepository:
         if "." in normalized:
             normalized = normalized.split(".", 1)[0]
         return normalized.strip()
-

@@ -231,7 +231,7 @@ def _loadIndex(
                 shardOffset=int(entry["shardOffset"]),
                 frames=int(entry.get("frames", 0)),
                 sampleBytes=int(entry.get("sampleBytes", 0)),
-                tag=str(entry.get("tag", "")),
+                datasetFolder=_resolveDatasetFolder(entry),
                 sourceFile=str(entry.get("sourceFile", "")),
             ),
         )
@@ -253,3 +253,17 @@ def _optionalInt(payload: Dict[str, object], key: str) -> Optional[int]:
     if value in (None, "null"):
         return None
     return int(value)
+
+
+def _resolveDatasetFolder(entry: Dict[str, object]) -> str:
+    """Resolve dataset folder from index payload with backward compatibility."""
+    rawFolder = str(entry.get("datasetFolder", "")).strip()
+    if rawFolder:
+        return rawFolder
+    sourceFile = str(entry.get("sourceFile", "")).strip().replace("\\", "/")
+    if not sourceFile:
+        return ""
+    parts = [part for part in sourceFile.split("/") if part and part != "."]
+    if not parts:
+        return ""
+    return parts[0]

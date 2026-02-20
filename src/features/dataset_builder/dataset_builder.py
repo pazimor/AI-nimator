@@ -159,7 +159,7 @@ class DatasetBuilder:
             frameCount=frameCount,
         )
         convertedPrompt = self.convertedPrompts.find(sample.relativePath)
-        if convertedPrompt:
+        if convertedPrompt and self.options.includeCustomPrompts:
             promptSegments = (
                 self._convertedSegments(convertedPrompt, frameCount)
                 + promptSegments
@@ -168,8 +168,6 @@ class DatasetBuilder:
         self._writeJson(targetDir / "animation.json", payload)
         segmentsPayload = [asdict(segment) for segment in promptSegments]
         promptPayload: Dict[str, object] = {"segments": segmentsPayload}
-        if convertedPrompt and convertedPrompt.tag:
-            promptPayload["tag"] = convertedPrompt.tag
         self._writeJson(targetDir / "prompt.json", promptPayload)
 
     def _convertedSegments(

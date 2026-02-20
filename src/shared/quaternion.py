@@ -212,5 +212,8 @@ class Rotation:
         """
         Converts 3x3 rotation matrix to 6D representation.
         """
-        batch_dim = matrix.shape[:-2]
-        return matrix[..., :2].clone().reshape(batch_dim + (6,))
+        # Zhou et al. representation stores the first two *columns* of R:
+        # [R[:, 0], R[:, 1]] -> (r00, r10, r20, r01, r11, r21).
+        first_col = matrix[..., :, 0]
+        second_col = matrix[..., :, 1]
+        return torch.cat((first_col, second_col), dim=-1)

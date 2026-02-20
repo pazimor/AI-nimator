@@ -90,7 +90,12 @@ def trainOneEpoch(
         chunkInfo=chunkInfo,
     ) as pbar:
         for batch in pbar:
-            batchLoss, outputs = _runBatch(batch, model, optimizer, device)
+            batchLoss, outputs = _runBatch(
+                batch,
+                model,
+                optimizer,
+                device,
+            )
             pbar.updateLoss(batchLoss)
 
         return pbar.metrics.avgLoss
@@ -228,7 +233,10 @@ def trainOneEpochWithAccumulation(
     ) as pbar:
         for batchIndex, batch in enumerate(pbar):
             batchLoss, outputs = _runBatchAccumulate(
-                batch, model, device, accumulationSteps
+                batch,
+                model,
+                device,
+                accumulationSteps,
             )
             pbar.updateLoss(batchLoss)
 

@@ -50,6 +50,26 @@ def test_axis_angle_preserved_in_rot6d(tmp_path: Path) -> None:
     assert np.allclose(recovered, [np.pi / 2, 0.0, 0.0], atol=1e-3)
 
 
+def test_rot6d_roundtrip_preserves_random_rotations() -> None:
+    """
+    Random axis-angle rotations should survive axis-angle -> 6D -> axis-angle.
+    """
+    rng = np.random.default_rng(0)
+    axis_angles = rng.normal(size=(128, 3)).astype(np.float32)
+
+    rot6d = Rotation(axis_angles, kind="axis_angle").rot6d
+    recovered = Rotation(rot6d, kind="rot6d").axis_angle
+
+    ref_matrix = Rotation(axis_angles, kind="axis_angle").matrix
+    recovered_matrix = Rotation(recovered, kind="axis_angle").matrix
+
+    assert np.allclose(
+        ref_matrix.detach().cpu().numpy(),
+        recovered_matrix.detach().cpu().numpy(),
+        atol=1e-4,
+    )
+
+
 def test_root_translation_zeroing(tmp_path: Path) -> None:
     """Root translation must be zeroed when requested."""
     config = _makeConfig(tmp_path)

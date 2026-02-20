@@ -12,8 +12,9 @@ from src.shared.model.clip.core import ClipModel
 from src.shared.model.generation.ddim import DDIM
 from src.shared.model.generation.denoiser import MotionDenoiser
 from src.shared.model.generation.losses import (
-    DEFAULT_GEODESIC_WEIGHT,
-    GEODESIC_SCHEDULE_NONE,
+    DEFAULT_VELOCITY_XYZ_WEIGHT,
+    DEFAULT_XYZ_WEIGHT,
+    XYZ_SCHEDULE_NONE,
 )
 from src.shared.model.layers.correction import (
     Renormalization,
@@ -29,6 +30,7 @@ class MotionGenerator(nn.Module):
     Combines frozen CLIP text encoder with trainable diffusion denoiser
     and post-processing correction layers.
     """
+    MOTION_ROTATION_CHANNELS = 6
 
     def __init__(
         self,
@@ -41,8 +43,14 @@ class MotionGenerator(nn.Module):
         clipCheckpoint: Optional[Path] = None,
         smoothingKernel: int = 3,
         maxVelocity: Optional[float] = None,
-        geodesicWeight: float = DEFAULT_GEODESIC_WEIGHT,
-        geodesicWeightSchedule: str = GEODESIC_SCHEDULE_NONE,
+        xyzWeight: float = DEFAULT_XYZ_WEIGHT,
+        xyzWeightSchedule: str = XYZ_SCHEDULE_NONE,
+        velXyzWeight: float = DEFAULT_VELOCITY_XYZ_WEIGHT,
+        diffusionWeight: float = 1.0,
+        accelerationWeight: float = 0.0,
+        numSpatialLayers: int = 1,
+        numHierarchyLayers: int = 1,
+        numSpatioTemporalLayers: int = 1,
     ) -> None:
         """
         Initialize MotionGenerator.
@@ -67,17 +75,32 @@ class MotionGenerator(nn.Module):
             Kernel size for temporal smoothing, by default 3.
         maxVelocity : Optional[float], optional
             Maximum velocity for regularization, by default None.
-        geodesicWeight : float, optional
-            Base geodesic loss weight, by default 0.1.
-        geodesicWeightSchedule : str, optional
-            Schedule for geodesic weighting, by default "none".
+        xyzWeight : float, optional
+            Base XYZ loss weight, by default 0.1.
+        xyzWeightSchedule : str, optional
+            Schedule for XYZ weighting, by default "none".
+        velXyzWeight : float, optional
+            Weight for velocity matching in XYZ space, by default 0.01.
+        diffusionWeight : float, optional
+            Weight for diffusion loss, by default 1.0.
+        accelerationWeight : float, optional
+            Weight for acceleration loss, by default 0.0.
+        numSpatialLayers : int, optional
+            Number of spatial GCN blocks.
+        numHierarchyLayers : int, optional
+            Number of directed bone hierarchy blocks.
+        numSpatioTemporalLayers : int, optional
+            Number of local spatio-temporal mixing blocks.
         """
         super().__init__()
         self.embedDim = embedDim
         self.numBones = numBones
         self.diffusionSteps = diffusionSteps
-        self.geodesicWeight = geodesicWeight
-        self.geodesicWeightSchedule = geodesicWeightSchedule
+        self.xyzWeight = xyzWeight
+        self.xyzWeightSchedule = xyzWeightSchedule
+        self.velXyzWeight = velXyzWeight
+        self.diffusionWeight = diffusionWeight
+        self.accelerationWeight = accelerationWeight
 
         # CLIP text encoder (frozen)
         self.clip = ClipModel(
@@ -96,6 +119,9 @@ class MotionGenerator(nn.Module):
             numHeads=numHeads,
             numLayers=numLayers,
             numBones=numBones,
+            numSpatialLayers=numSpatialLayers,
+            numHierarchyLayers=numHierarchyLayers,
+            numSpatioTemporalLayers=numSpatioTemporalLayers,
         )
 
         # Post-processing (inference only)
@@ -107,7 +133,6 @@ class MotionGenerator(nn.Module):
         self,
         textInputIds: torch.Tensor,
         textAttentionMask: torch.Tensor,
-        tags: Optional[list[Optional[str]]],
         noisyMotion: torch.Tensor,
         timesteps: torch.Tensor,
         targetNoise: Optional[torch.Tensor] = None,
@@ -123,8 +148,6 @@ class MotionGenerator(nn.Module):
             Tokenized text input IDs.
         textAttentionMask : torch.Tensor
             Text attention mask.
-        tags : Optional[list[Optional[str]]]
-            Batch of tag strings. Can be None or contain None elements.
         noisyMotion : torch.Tensor
             Noisy motion shaped (batch, frames, bones, 6).
         timesteps : torch.Tensor
@@ -149,6 +172,12 @@ class MotionGenerator(nn.Module):
             )
 
         # Predict noise
+        if noisyMotion.shape[-1] != self.MOTION_ROTATION_CHANNELS:
+            raise ValueError(
+                "Expected rotation-only motion with 6 channels "
+                "(no translation), got "
+                f"{noisyMotion.shape[-1]}."
+            )
         padMask = None
         if motionMask is not None:
             padMask = ~motionMask.bool()
@@ -156,7 +185,6 @@ class MotionGenerator(nn.Module):
         predictedNoise = self.denoiser(
             noisyMotion=noisyMotion,
             textEmbedding=textEmbeds,
-            tags=tags,
             timesteps=timesteps,
             mask=padMask,
         )
@@ -186,8 +214,11 @@ class MotionGenerator(nn.Module):
                     targetNoise=targetNoise,
                     predictedMotion=predictedMotion,
                     targetMotion=targetMotion,
-                    geodesicWeight=self.geodesicWeight,
-                    geodesicWeightSchedule=self.geodesicWeightSchedule,
+                    diffusionWeight=self.diffusionWeight,
+                    xyzWeight=self.xyzWeight,
+                    xyzWeightSchedule=self.xyzWeightSchedule,
+                    velocityXyzWeight=self.velXyzWeight,
+                    accelerationWeight=self.accelerationWeight,
                     timesteps=timesteps,
                     numTimesteps=self.ddim.num_timesteps,
                     motionMask=motionMask,
@@ -201,7 +232,6 @@ class MotionGenerator(nn.Module):
     def generate(
         self,
         prompt: str,
-        tag: Optional[str],
         numFrames: int,
         ddimSteps: int = 50,
         device: Optional[torch.device] = None,
@@ -213,8 +243,6 @@ class MotionGenerator(nn.Module):
         ----------
         prompt : str
             Text description of the motion.
-        tag : Optional[str]
-            Categorical tag for the motion. Can be None.
         numFrames : int
             Number of frames to generate.
         ddimSteps : int, optional
@@ -260,7 +288,6 @@ class MotionGenerator(nn.Module):
             predictedNoise = self.denoiser(
                 noisyMotion=x,
                 textEmbedding=textEmbeds,
-                tags=[tag],
                 timesteps=tBatch,
             )
 

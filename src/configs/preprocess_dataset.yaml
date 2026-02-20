@@ -1,6 +1,9 @@
 paths:
   input-root: "/Users/pazimor/dataset"
   output-root: "/Users/pazimor/dataset_preprocessed"
+  # Optional: list only the dataset folders to preprocess
+  include-folders: ["ACCAD", "BioMotionLab_NTroje", "BMLHandball", "BMLmovi", "CMU", "DFaust_67", "EKUT", "Eyes_Japan_Dataset", "HumanEva", "KIT", "MPI_HDM05", "MPI_Limits", "MPI_mosh", "SFU", "SSM_synced", "TotalCapture", "Transitions_mocap"]
+  
 
 processing:
   model-name: xlm-roberta-base

@@ -39,11 +39,12 @@ class DatasetBuildOptions:
     ----------
     debugMode : bool
         When True the builder raises immediately on the first error.
-    progressStyle : str
-        Either "auto", "rich", "tqdm" or "none" to control progress display.
+    includeCustomPrompts : bool
+        When True include converted custom prompts (#Simple/#Advanced).
     """
 
     debugMode: bool = False
+    includeCustomPrompts: bool = True
 
 
 @dataclass
@@ -126,11 +127,14 @@ class DatasetBuilderProcessing:
         Extension enforced when loading textual prompts.
     fallbackFps : int
         Default FPS used when the source animation misses one.
+    includeCustomPrompts : bool
+        When True include converted custom prompts (#Simple/#Advanced).
     """
 
     animationExtension: str = ".npz"
     promptTextExtension: str = ".txt"
     fallbackFps: int = 60
+    includeCustomPrompts: bool = True
 
 
 @dataclass(frozen=True)
@@ -161,10 +165,13 @@ class PreprocessDatasetPaths:
         Root directory containing prompt.json and animation.json files.
     outputRoot : Path
         Destination directory for the preprocessed dataset.
+    includeFolders : Optional[List[str]]
+        Optional top-level folders to include (e.g., KIT, CMU).
     """
 
     inputRoot: Path
     outputRoot: Path
+    includeFolders: Optional[List[str]] = None
 
 
 @dataclass(frozen=True)
@@ -245,8 +252,8 @@ class PreprocessedSampleIndex:
         Frame count for the sample motion tensor.
     sampleBytes : int
         Approximate serialized size of the sample.
-    tag : str
-        Dataset tag associated with the sample.
+    datasetFolder : str
+        Top-level dataset folder (for selective training).
     sourceFile : str
         Source identifier for traceability.
     """
@@ -255,7 +262,7 @@ class PreprocessedSampleIndex:
     shardOffset: int
     frames: int
     sampleBytes: int
-    tag: str
+    datasetFolder: str
     sourceFile: str
 
 
@@ -345,7 +352,6 @@ class ConvertedPrompt:
 
     simple: str
     advanced: str
-    tag: str
     promptIdentifier: str
 
 

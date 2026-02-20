@@ -45,8 +45,11 @@ GENERATION_DEFAULT_VALIDATION_SPLIT = 0.1
 GENERATION_DEFAULT_EARLY_STOPPING_PATIENCE = 5
 GENERATION_DEFAULT_MAX_LENGTH = 64
 GENERATION_DEFAULT_MODEL_NAME = "xlm-roberta-base"
-GENERATION_DEFAULT_GEODESIC_WEIGHT = 0.1
-GENERATION_DEFAULT_GEODESIC_SCHEDULE = "none"
+GENERATION_DEFAULT_XYZ_WEIGHT = 0.1
+GENERATION_DEFAULT_XYZ_SCHEDULE = "none"
+GENERATION_DEFAULT_VEL_XYZ_WEIGHT = 0.01
+GENERATION_DEFAULT_DIFFUSION_WEIGHT = 1.0
+GENERATION_DEFAULT_ACCELERATION_WEIGHT = 0.0
 PREPROCESS_DEFAULT_SHARD_SIZE = 256
 
 LOGGER = logging.getLogger("shared.config.network")
@@ -115,6 +118,15 @@ def _parseNetworkConfig(section: Dict[str, Any]) -> NetworkConfig:
             numLayers=int(generationSection.get("num-layers", 6)),
             numBones=int(generationSection.get("num-bones", 22)),
             diffusionSteps=int(generationSection.get("diffusion-steps", 1000)),
+            numSpatialLayers=int(
+                generationSection.get("num-spatial-layers", 1)
+            ),
+            numHierarchyLayers=int(
+                generationSection.get("num-hierarchy-layers", 1)
+            ),
+            numSpatioTemporalLayers=int(
+                generationSection.get("num-spatio-temporal-layers", 1)
+            ),
         ),
     )
 
@@ -210,7 +222,6 @@ def loadTrainingConfig(
         resolved,
         pathsSection.get("network-config"),
     )
-    
     hyperparameters = ClipTrainingHyperparameters(
         batchSize=_int(trainingSection, "batch-size", DEFAULT_BATCH_SIZE),
         maxPromptLength=_int(
@@ -240,30 +251,17 @@ def loadTrainingConfig(
         resumeCheckpoint=_optionalExistingPath(
             resolved,
             trainingSection.get("resume-checkpoint"),
+            strict=False,
+            label="resume-checkpoint",
         ),
         gradientAccumulation=_int(trainingSection, "gradient-accumulation", 1),
         MM_memoryLimitGB=_float(trainingSection, "MM-memory-limit-gb", 0.0),
         weightDecay=_float(trainingSection, "weight-decay", 0.0),
-        # Learning Rate Configuration
+        # Learning Rate
         learningRate=_float(
             trainingSection,
             "learning-rate",
             DEFAULT_LEARNING_RATE,
-        ),
-        lrMin=_float(trainingSection, "lr-min", 1e-7),
-        lrWarmupEpochs=_int(trainingSection, "lr-warmup-epochs", 0),
-        lrSchedule=str(trainingSection.get("lr-schedule", "cosine")),
-        lrDecayEpochs=_optionalInt(trainingSection, "lr-decay-epochs"),
-        geodesicWeight=_float(
-            trainingSection,
-            "geodesic-weight",
-            GENERATION_DEFAULT_GEODESIC_WEIGHT,
-        ),
-        geodesicWeightSchedule=str(
-            trainingSection.get(
-                "geodesic-weight-schedule",
-                GENERATION_DEFAULT_GEODESIC_SCHEDULE,
-            )
         ),
     )
     return ClipTrainingConfig(
@@ -282,7 +280,11 @@ def _loadClipPaths(
         _require(section, "dataset-root"),
         "dataset-root",
     )
-    return ClipTrainingPaths(datasetRoot=resolvedDataset)
+    datasetFolders = _optionalStringList(section.get("dataset-folders"))
+    return ClipTrainingPaths(
+        datasetRoot=resolvedDataset,
+        datasetFolders=datasetFolders,
+    )
 
 
 # ==============================================================================
@@ -331,6 +333,32 @@ def loadGenerationConfig(
         resolved,
         pathsSection.get("network-config"),
     )
+    xyzWeight = _float(
+        trainingSection,
+        "xyz-weight",
+        GENERATION_DEFAULT_XYZ_WEIGHT,
+    )
+    xyzSchedule = str(
+        trainingSection.get(
+            "xyz-weight-schedule",
+            GENERATION_DEFAULT_XYZ_SCHEDULE,
+        ),
+    )
+    velXyzWeight = _float(
+        trainingSection,
+        "vel-xyz-weight",
+        GENERATION_DEFAULT_VEL_XYZ_WEIGHT,
+    )
+    diffusionWeight = _float(
+        trainingSection,
+        "diffusion-weight",
+        GENERATION_DEFAULT_DIFFUSION_WEIGHT,
+    )
+    accelerationWeight = _float(
+        trainingSection,
+        "acceleration-weight",
+        GENERATION_DEFAULT_ACCELERATION_WEIGHT,
+    )
     
     hyperparameters = GenerationTrainingHyperparameters(
         batchSize=_int(
@@ -361,6 +389,8 @@ def loadGenerationConfig(
         resumeCheckpoint=_optionalExistingPath(
             resolved,
             trainingSection.get("resume-checkpoint"),
+            strict=False,
+            label="resume-checkpoint",
         ),
         MM_memoryLimitGB=_float(trainingSection, "MM-memory-limit-gb", 0.0),
         gradientAccumulation=_int(trainingSection, "gradient-accumulation", 1),
@@ -373,16 +403,17 @@ def loadGenerationConfig(
             "fixed-train-chunk",
             False,
         ),
-        # Learning Rate Configuration
+        # Learning Rate
         learningRate=_float(
             trainingSection,
             "learning-rate",
             GENERATION_DEFAULT_LEARNING_RATE,
         ),
-        lrMin=_float(trainingSection, "lr-min", 1e-7),
-        lrWarmupEpochs=_int(trainingSection, "lr-warmup-epochs", 0),
-        lrSchedule=str(trainingSection.get("lr-schedule", "cosine")),
-        lrDecayEpochs=_optionalInt(trainingSection, "lr-decay-epochs"),
+        xyzWeight=xyzWeight,
+        xyzWeightSchedule=xyzSchedule,
+        velXyzWeight=velXyzWeight,
+        diffusionWeight=diffusionWeight,
+        accelerationWeight=accelerationWeight,
     )
 
     return GenerationTrainingConfig(
@@ -417,12 +448,14 @@ def _loadGenerationPaths(
     )
     if validationIndices is None:
         validationIndices = checkpointDir / "validation_indices.json"
+    datasetFolders = _optionalStringList(section.get("dataset-folders"))
 
     return GenerationTrainingPaths(
         datasetRoot=datasetRoot,
         clipCheckpoint=clipCheckpoint,
         checkpointDir=checkpointDir,
         validationIndices=validationIndices,
+        datasetFolders=datasetFolders,
     )
 
 
@@ -495,6 +528,11 @@ def loadBuilderConfig(configPath: Path) -> DatasetBuilderConfig:
         animationExtension=str(animationExtensionRaw or ".npz"),
         promptTextExtension=str(promptExtensionRaw or ".txt"),
         fallbackFps=int(fallbackFpsRaw) if fallbackFpsRaw is not None else 60,
+        includeCustomPrompts=_bool(
+            processingSection,
+            "include-custom-prompts",
+            True,
+        ),
     )
     return DatasetBuilderConfig(paths=paths, processing=processing)
 
@@ -527,6 +565,7 @@ def loadPreprocessConfig(configPath: Path) -> PreprocessDatasetConfig:
     inputRoot = _resolvePath(configPath, _require(pathsSection, "input-root"))
     outputRoot = _resolvePath(configPath, _require(pathsSection, "output-root"))
     outputRoot.mkdir(parents=True, exist_ok=True)
+    includeFolders = _optionalStringList(pathsSection.get("include-folders"))
 
     processing = PreprocessDatasetProcessing(
         modelName=str(
@@ -557,6 +596,7 @@ def loadPreprocessConfig(configPath: Path) -> PreprocessDatasetConfig:
         paths=PreprocessDatasetPaths(
             inputRoot=inputRoot,
             outputRoot=outputRoot,
+            includeFolders=includeFolders,
         ),
         processing=processing,
     )
@@ -637,6 +677,22 @@ def _bool(section: Dict[str, Any], key: str, default: bool) -> bool:
     return bool(value)
 
 
+def _optionalStringList(rawValue: Any) -> Optional[List[str]]:
+    """Normalize a raw config value into a list of non-empty strings."""
+    if rawValue in (None, ""):
+        return None
+    if isinstance(rawValue, str):
+        values = [item.strip() for item in rawValue.split(",")]
+    elif isinstance(rawValue, list):
+        values = [str(item).strip() for item in rawValue]
+    else:
+        values = [str(rawValue).strip()]
+    normalized = [item for item in values if item]
+    if not normalized:
+        return None
+    return normalized
+
+
 def _optionalPath(configPath: Path, rawValue: Optional[str]) -> Optional[Path]:
     """
     Resolve an optional path, creating the directory if it does not exist.
@@ -680,6 +736,8 @@ def _optionalResolvedPath(
 def _optionalExistingPath(
     configPath: Path,
     rawValue: Optional[str],
+    strict: bool = True,
+    label: str = "path",
 ) -> Optional[Path]:
     """
     Resolve an optional path that must exist if provided.
@@ -699,7 +757,7 @@ def _optionalExistingPath(
     Raises
     ------
     FileNotFoundError
-        Raised when the specified path does not exist.
+        Raised when the specified path does not exist and strict=True.
     """
     if rawValue in (None, ""):
         return None
@@ -707,9 +765,17 @@ def _optionalExistingPath(
     for candidate in candidates:
         if candidate.exists():
             return candidate
+    if not strict:
+        attempted = ", ".join(str(c) for c in candidates)
+        LOGGER.warning(
+            "Configured %s does not exist; ignoring. Tried: %s",
+            label,
+            attempted,
+        )
+        return None
     attempted = ", ".join(str(c) for c in candidates)
     raise FileNotFoundError(
-        f"Configured resume-checkpoint does not exist. Tried: {attempted}",
+        f"Configured {label} does not exist. Tried: {attempted}",
     )
 
 

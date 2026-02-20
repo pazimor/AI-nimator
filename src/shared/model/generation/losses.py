@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
-DEFAULT_DIFFUSION_WEIGHT = 1.0
-DEFAULT_GEODESIC_WEIGHT = 0.1
-DEFAULT_VELOCITY_WEIGHT = 0.01
-DEFAULT_ACCELERATION_WEIGHT = 0.001
-GEODESIC_SCHEDULE_NONE = "none"
-GEODESIC_SCHEDULE_TIMESTEP = "timestep"
-MIN_DIFFUSION_STEPS = 1
+from src.shared.constants.skeletons import (
+    SMPL22_BONE_ORDER,
+    SMPL22_DEFAULT_OFFSETS,
+    SMPL22_HIERARCHY,
+)
 
+DEFAULT_DIFFUSION_WEIGHT = 1.0
+DEFAULT_XYZ_WEIGHT = 0.1
+DEFAULT_VELOCITY_WEIGHT = 0.01
+DEFAULT_VELOCITY_XYZ_WEIGHT = 0.01
+DEFAULT_ACCELERATION_WEIGHT = 0.001
+XYZ_SCHEDULE_NONE = "none"
+XYZ_SCHEDULE_TIMESTEP = "timestep"
+MIN_DIFFUSION_STEPS = 1
+MIN_SIXD_CHANNELS = 6
 
 def diffusionLoss(
     predictedNoise: torch.Tensor,
@@ -41,49 +47,32 @@ def diffusionLoss(
     return _maskedMean(squaredError, motionMask)
 
 
-def geodesicLoss(
+def xyzLoss(
     predicted: torch.Tensor,
     target: torch.Tensor,
-    eps: float = 1e-7,
     motionMask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
-    Geodesic loss for 6D rotation representations.
-
-    Computes loss based on the rotation matrix difference.
+    XYZ reconstruction loss for 6D rotation representations.
 
     Parameters
     ----------
     predicted : torch.Tensor
-        Predicted 6D rotations shaped (..., 6).
+        Predicted 6D rotations shaped (batch, frames, bones, 6).
     target : torch.Tensor
-        Target 6D rotations shaped (..., 6).
-    eps : float, optional
-        Epsilon for numerical stability, by default 1e-7.
+        Target 6D rotations shaped (batch, frames, bones, 6).
     motionMask : torch.Tensor | None, optional
         Boolean mask indicating valid (non-padded) frames.
 
     Returns
     -------
     torch.Tensor
-        Scalar geodesic loss.
+        Scalar masked XYZ MSE.
     """
-    # Convert 6D to rotation matrices
-    predMat = _sixdToRotationMatrix(predicted)
-    targetMat = _sixdToRotationMatrix(target)
-
-    # Compute R_pred^T @ R_target
-    diff = torch.matmul(predMat.transpose(-2, -1), targetMat)
-
-    # Trace of rotation matrix
-    trace = diff[..., 0, 0] + diff[..., 1, 1] + diff[..., 2, 2]
-
-    # Geodesic distance: arccos((trace - 1) / 2)
-    cos = (trace - 1.0) / 2.0
-    cos = torch.clamp(cos, -1.0 + eps, 1.0 - eps)
-    angle = torch.acos(cos)
-
-    return _maskedMean(angle, motionMask)
+    predictedXYZ = _rot6dToJointXYZ(predicted)
+    targetXYZ = _rot6dToJointXYZ(target)
+    squaredError = (predictedXYZ - targetXYZ) ** 2
+    return _maskedMean(squaredError, motionMask)
 
 
 def velocityLoss(
@@ -117,6 +106,45 @@ def velocityLoss(
     if motionMask is not None:
         motionMask = motionMask[:, 1:] & motionMask[:, :-1]
     return weight * _maskedMean(velocity ** 2, motionMask)
+
+
+def velocityXyzLoss(
+    predictedMotion: torch.Tensor,
+    targetMotion: torch.Tensor,
+    weight: float = 1.0,
+    motionMask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Velocity matching loss in joint XYZ space (MDM-like vel_xyz term).
+
+    Parameters
+    ----------
+    predictedMotion : torch.Tensor
+        Predicted 6D rotations shaped (batch, frames, bones, 6).
+    targetMotion : torch.Tensor
+        Target 6D rotations shaped (batch, frames, bones, 6).
+    weight : float, optional
+        Loss weight, by default 1.0.
+    motionMask : torch.Tensor | None, optional
+        Boolean mask indicating valid (non-padded) frames.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar XYZ velocity matching loss.
+    """
+    if predictedMotion.shape[1] < 2:
+        return torch.tensor(0.0, device=predictedMotion.device)
+
+    predictedXyz = _rot6dToJointXYZ(predictedMotion)
+    targetXyz = _rot6dToJointXYZ(targetMotion)
+    predictedVelocity = predictedXyz[:, 1:] - predictedXyz[:, :-1]
+    targetVelocity = targetXyz[:, 1:] - targetXyz[:, :-1]
+    velocityError = (predictedVelocity - targetVelocity) ** 2
+
+    if motionMask is not None:
+        motionMask = motionMask[:, 1:] & motionMask[:, :-1]
+    return weight * _maskedMean(velocityError, motionMask)
 
 
 def accelerationLoss(
@@ -163,10 +191,11 @@ def combinedGenerationLoss(
     predictedMotion: torch.Tensor,
     targetMotion: torch.Tensor,
     diffusionWeight: float = DEFAULT_DIFFUSION_WEIGHT,
-    geodesicWeight: float = DEFAULT_GEODESIC_WEIGHT,
+    xyzWeight: float = DEFAULT_XYZ_WEIGHT,
     velocityWeight: float = DEFAULT_VELOCITY_WEIGHT,
+    velocityXyzWeight: float | None = None,
     accelerationWeight: float = DEFAULT_ACCELERATION_WEIGHT,
-    geodesicWeightSchedule: str = GEODESIC_SCHEDULE_NONE,
+    xyzWeightSchedule: str = XYZ_SCHEDULE_NONE,
     timesteps: torch.Tensor | None = None,
     numTimesteps: int | None = None,
     motionMask: torch.Tensor | None = None,
@@ -186,14 +215,17 @@ def combinedGenerationLoss(
         Ground truth motion.
     diffusionWeight : float, optional
         Weight for diffusion loss, by default 1.0.
-    geodesicWeight : float, optional
-        Weight for geodesic loss, by default 0.1.
+    xyzWeight : float, optional
+        Weight for XYZ reconstruction loss, by default 0.1.
     velocityWeight : float, optional
         Weight for velocity loss, by default 0.01.
+    velocityXyzWeight : float | None, optional
+        Weight for velocity matching loss in XYZ space.
+        When None, velocityWeight is used for backward compatibility.
     accelerationWeight : float, optional
         Weight for acceleration loss, by default 0.001.
-    geodesicWeightSchedule : str, optional
-        Schedule mode for geodesic weight, by default "none".
+    xyzWeightSchedule : str, optional
+        Schedule mode for XYZ weight, by default "none".
     timesteps : torch.Tensor | None, optional
         Diffusion timesteps for schedule-aware weighting.
     numTimesteps : int | None, optional
@@ -207,21 +239,27 @@ def combinedGenerationLoss(
         Total loss and dictionary of individual loss components.
     """
     lossDiff = diffusionLoss(predictedNoise, targetNoise, motionMask)
-    lossGeo = geodesicLoss(
+    lossXyz = xyzLoss(
         predictedMotion,
         targetMotion,
         motionMask=motionMask,
     )
-    geoWeight = _resolveGeodesicWeight(
-        geodesicWeight,
-        geodesicWeightSchedule,
+    weightedXyz = _resolveXyzWeight(
+        xyzWeight,
+        xyzWeightSchedule,
         timesteps,
         numTimesteps,
         predictedNoise.device,
     )
-    lossVel = velocityLoss(
+    resolvedVelocityXyzWeight = (
+        velocityWeight
+        if velocityXyzWeight is None
+        else velocityXyzWeight
+    )
+    lossVel = velocityXyzLoss(
         predictedMotion,
-        velocityWeight,
+        targetMotion,
+        resolvedVelocityXyzWeight,
         motionMask=motionMask,
     )
     lossAcc = accelerationLoss(
@@ -232,22 +270,33 @@ def combinedGenerationLoss(
 
     total = (
         diffusionWeight * lossDiff
-        + geoWeight * lossGeo
+        + weightedXyz * lossXyz
         + lossVel
         + lossAcc
     )
 
+    contribDiffusion = (diffusionWeight * lossDiff).detach()
+    contribXyz = (weightedXyz * lossXyz).detach()
+    contribVelXyz = lossVel.detach()
+    contribAcceleration = lossAcc.detach()
+
     components = {
         "loss_diffusion": lossDiff.detach(),
-        "loss_geodesic": lossGeo.detach(),
+        "loss_xyz": lossXyz.detach(),
+        "loss_vel_xyz": lossVel.detach(),
+        # Backward-compatibility alias used in older logs/consumers.
         "loss_velocity": lossVel.detach(),
         "loss_acceleration": lossAcc.detach(),
+        "contrib_diffusion": contribDiffusion,
+        "contrib_xyz": contribXyz,
+        "contrib_vel_xyz": contribVelXyz,
+        "contrib_acceleration": contribAcceleration,
     }
 
     return total, components
 
 
-def _resolveGeodesicWeight(
+def _resolveXyzWeight(
     baseWeight: float,
     schedule: str,
     timesteps: torch.Tensor | None,
@@ -255,18 +304,17 @@ def _resolveGeodesicWeight(
     device: torch.device,
 ) -> torch.Tensor:
     """
-    Resolve geodesic weight based on schedule and timesteps.
+    Resolve XYZ weight based on schedule and timesteps.
     """
-    if schedule == GEODESIC_SCHEDULE_NONE:
+    if schedule == XYZ_SCHEDULE_NONE:
         return torch.tensor(baseWeight, device=device)
-    if schedule == GEODESIC_SCHEDULE_TIMESTEP:
+    if schedule == XYZ_SCHEDULE_TIMESTEP:
         if timesteps is None or numTimesteps is None:
             return torch.tensor(baseWeight, device=device)
         denom = max(numTimesteps - 1, MIN_DIFFUSION_STEPS)
         weights = 1.0 - (timesteps.float() / float(denom))
         return weights.mean() * baseWeight
-    raise ValueError(f"Unknown geodesic schedule: {schedule}")
-
+    raise ValueError(f"Unknown XYZ schedule: {schedule}")
 
 def _maskedMean(
     values: torch.Tensor,
@@ -321,3 +369,96 @@ def _sixdToRotationMatrix(sixd: torch.Tensor) -> torch.Tensor:
 
     # Stack into rotation matrix
     return torch.stack([b1, b2, b3], dim=-1)
+
+
+def _rot6dToJointXYZ(rot6d: torch.Tensor) -> torch.Tensor:
+    """
+    Convert local 6D rotations to global joint XYZ via FK.
+
+    Parameters
+    ----------
+    rot6d : torch.Tensor
+        Tensor shaped (batch, frames, bones, 6).
+
+    Returns
+    -------
+    torch.Tensor
+        Global joint positions shaped (batch, frames, bones, 3).
+    """
+    if rot6d.dim() != 4 or rot6d.shape[-1] != MIN_SIXD_CHANNELS:
+        raise ValueError(
+            "Expected rot6d shape (batch, frames, bones, 6), got "
+            f"{tuple(rot6d.shape)}"
+        )
+
+    batchSize, frameCount, boneCount, _ = rot6d.shape
+    parentIndices, offsets = _smpl22KinematicParams(
+        boneCount,
+        rot6d.device,
+        rot6d.dtype,
+    )
+    localRotations = _sixdToRotationMatrix(rot6d)
+
+    globalRotations: list[torch.Tensor] = []
+    globalPositions: list[torch.Tensor] = []
+
+    for boneIndex in range(boneCount):
+        localRotation = localRotations[:, :, boneIndex]
+        if parentIndices[boneIndex] < 0:
+            globalRotations.append(localRotation)
+            rootOffset = offsets[boneIndex].view(1, 1, 3)
+            rootOffset = rootOffset.expand(batchSize, frameCount, 3)
+            globalPositions.append(rootOffset)
+            continue
+
+        parentIndex = parentIndices[boneIndex]
+        parentRotation = globalRotations[parentIndex]
+        parentPosition = globalPositions[parentIndex]
+        globalRotation = torch.matmul(parentRotation, localRotation)
+        childOffset = offsets[boneIndex].view(1, 1, 3, 1)
+        childOffset = torch.matmul(parentRotation, childOffset).squeeze(-1)
+        globalRotations.append(globalRotation)
+        globalPositions.append(parentPosition + childOffset)
+
+    return torch.stack(globalPositions, dim=2)
+
+
+def _smpl22KinematicParams(
+    boneCount: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[list[int], torch.Tensor]:
+    """
+    Return parent indices and offsets for the first SMPL22 joints.
+    """
+    maxBones = len(SMPL22_BONE_ORDER)
+    if boneCount > maxBones:
+        raise ValueError(
+            f"Unsupported boneCount={boneCount}, max supported is {maxBones}"
+        )
+
+    boneNames = SMPL22_BONE_ORDER[:boneCount]
+    indexByName = {name: idx for idx, name in enumerate(boneNames)}
+    parentIndices: list[int] = []
+    offsetValues: list[list[float]] = []
+
+    for boneName in boneNames:
+        parentName = SMPL22_HIERARCHY[boneName]
+        if parentName is None:
+            parentIndices.append(-1)
+        else:
+            parentIndex = indexByName.get(parentName)
+            if parentIndex is None:
+                raise ValueError(
+                    "Invalid skeleton order: parent "
+                    f"{parentName} missing for {boneName}"
+                )
+            parentIndices.append(parentIndex)
+        offsetValues.append(SMPL22_DEFAULT_OFFSETS[boneName])
+
+    offsets = torch.tensor(
+        offsetValues,
+        device=device,
+        dtype=dtype,
+    )
+    return parentIndices, offsets

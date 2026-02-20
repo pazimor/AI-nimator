@@ -1,10 +1,15 @@
 paths:
   dataset-root: "/Users/pazimor/dataset_preprocessed"
-  clip-checkpoint: "output/clip/best_model-512.pt"
+  # Optional: train only on selected preprocessed dataset folders.
+  # Ex: ["KIT", "CMU", "ACCAD"]
+  dataset-folders: ["ACCAD"]
+  clip-checkpoint: "output/clip/best_model-512-quat.pt"
   checkpoint-dir: "output/generation"
   # Network architecture is loaded from network.yaml
   network-config: "network.yaml"
-  validation-indices: "output/generation/validation_indices.json"
+  # Use an ACCAD-specific split file to avoid reusing stale indices
+  # generated from another dataset scope.
+  validation-indices: "output/generation/validation_indices_accad.json"
 
 # ============================================
 # Profile: Mac (32GB RAM, MPS GPU)
@@ -16,20 +21,18 @@ training:
   model-name: xlm-roberta-base
   validation-split: 0.01
   early-stopping-patience: 30
-  batch-size: 8
-  gradient-accumulation: 1
+  batch-size: 4
+  gradient-accumulation: 2
   max-samples-per-epoch: 10000
   MM-memory-limit-gb: 20.0
   resume-checkpoint: output/generation/best_model.pt
   
-  # Learning Rate Configuration
-  learning-rate: 0.01       # Initial/base learning rate
-  lr-min: 0.000001            # Minimum LR floor (1e-6)
-  lr-warmup-epochs: 1        # Warmup epochs (0 to disable)
-  lr-schedule: cosine         # Schedule type: constant, cosine, linear, step
-  # lr-decay-epochs: 500      # Optional: decay phase length (default: epochs - warmup)
-  geodesic-weight: 0.1
-  geodesic-weight-schedule: timestep
+  learning-rate: 0.00005
+  xyz-weight: 10.0
+  xyz-weight-schedule: timestep
+  vel-xyz-weight: 1.0
+  diffusion-weight: 1.0
+  acceleration-weight: 0.02
 
 # ============================================
 # Profile: DGX Spark (128GB RAM, GB10 GPU)
@@ -45,13 +48,12 @@ spark:
   batch-size: 8 # replace with 32 after benchmarking
   gradient-accumulation: 1
   max-samples-per-epoch: 10000 # replace to null after benchmarking
-  MM-memory-limit-gb: 0.0
-  resume-checkpoint: output/generation/best_model.pt
+  MM-memory-limit-gb: 100.0
+  # resume-checkpoint: output/generation/best_model.pt
   
-  # Learning Rate Configuration
   learning-rate: 0.001
-  lr-min: 0.00001
-  lr-warmup-epochs: 20
-  lr-schedule: cosine
-  geodesic-weight: 0.1
-  geodesic-weight-schedule: timestep
+  xyz-weight: 10.0
+  xyz-weight-schedule: timestep
+  vel-xyz-weight: 1.0
+  diffusion-weight: 1.0
+  acceleration-weight: 0.02

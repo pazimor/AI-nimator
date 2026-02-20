@@ -24,7 +24,6 @@ from src.shared.constants.preprocessed import (
     PREPROCESSED_MIN_FRAME_COUNT,
     PREPROCESSED_PROMPT_FILENAME,
     PREPROCESSED_SHARDS_DIRNAME,
-    PREPROCESSED_TAG_PREFIX_TEMPLATE,
 )
 from src.shared.types import (
     PreprocessDatasetConfig,
@@ -38,7 +37,6 @@ MANIFEST_FILENAME = PREPROCESSED_MANIFEST_FILENAME
 INDEX_FILENAME = PREPROCESSED_INDEX_FILENAME
 SHARDS_DIRNAME = PREPROCESSED_SHARDS_DIRNAME
 MANIFEST_VERSION = PREPROCESSED_MANIFEST_VERSION
-TAG_PREFIX_TEMPLATE = PREPROCESSED_TAG_PREFIX_TEMPLATE
 MIN_FRAME_COUNT = PREPROCESSED_MIN_FRAME_COUNT
 
 
@@ -63,7 +61,7 @@ class DatasetPreprocessor:
             shardSize=config.processing.shardSize,
         )
 
-    def run(self) -> None:
+    def run(self, includeFolders: Optional[List[str]] = None) -> None:
         """
         Execute preprocessing and write shards + manifest.
 
@@ -72,7 +70,11 @@ class DatasetPreprocessor:
         None
             Results are written to disk.
         """
-        promptFiles = self._listPromptFiles(self.config.paths.inputRoot)
+        folders = includeFolders or self.config.paths.includeFolders
+        promptFiles = self._listPromptFiles(
+            self.config.paths.inputRoot,
+            includeFolders=folders,
+        )
         reporter = TqdmProgressReporter(
             total=len(promptFiles),
             description="Dataset preprocess",
@@ -83,7 +85,11 @@ class DatasetPreprocessor:
         reporter.close()
         self._writer.finalize(self._buildManifest())
 
-    def _listPromptFiles(self, root: Path) -> List[Path]:
+    def _listPromptFiles(
+        self,
+        root: Path,
+        includeFolders: Optional[List[str]] = None,
+    ) -> List[Path]:
         """
         Return sorted prompt.json files under a root.
 
@@ -92,12 +98,26 @@ class DatasetPreprocessor:
         root : Path
             Dataset root directory.
 
+        includeFolders : Optional[List[str]]
+            Optional list of top-level folders to include.
+
         Returns
         -------
         List[Path]
             Sorted list of prompt.json files.
         """
-        return sorted(root.rglob(PROMPT_FILENAME))
+        promptFiles = sorted(root.rglob(PROMPT_FILENAME))
+        if not includeFolders:
+            return promptFiles
+        allowed = {folder.strip().lower() for folder in includeFolders if folder.strip()}
+        if not allowed:
+            return promptFiles
+        filtered: List[Path] = []
+        for promptPath in promptFiles:
+            topLevelFolder = _extractTopLevelFolder(promptPath, root)
+            if topLevelFolder.lower() in allowed:
+                filtered.append(promptPath)
+        return filtered
 
     def _processPromptFile(self, promptPath: Path) -> None:
         """
@@ -108,7 +128,11 @@ class DatasetPreprocessor:
         promptPath : Path
             Path to the prompt.json file.
         """
-        tag, promptMeta, segments = loadPromptSegments(promptPath)
+        promptMeta, segments = loadPromptSegments(promptPath)
+        datasetFolder = _extractTopLevelFolder(
+            promptPath,
+            self.config.paths.inputRoot,
+        )
         animationPath = _resolveAnimationPath(
             promptPath,
             self.config.paths.inputRoot,
@@ -120,7 +144,7 @@ class DatasetPreprocessor:
                     segmentText=segment.text,
                     segmentStart=segment.startFrame,
                     segmentEnd=segment.endFrame,
-                    tag=tag,
+                    datasetFolder=datasetFolder,
                     promptMeta=promptMeta,
                     motion=motion,
                     motionMeta=motionMeta,
@@ -135,7 +159,7 @@ class DatasetPreprocessor:
         segmentText: str,
         segmentStart: int,
         segmentEnd: int,
-        tag: str,
+        datasetFolder: str,
         promptMeta: Dict[str, object],
         motion: torch.Tensor,
         motionMeta: Dict[str, object],
@@ -152,8 +176,8 @@ class DatasetPreprocessor:
             Start frame for the segment.
         segmentEnd : int
             End frame for the segment.
-        tag : str
-            Dataset tag string.
+        datasetFolder : str
+            Top-level dataset folder (e.g. KIT, CMU).
         promptMeta : Dict[str, object]
             Prompt-level metadata.
         motion : torch.Tensor
@@ -181,7 +205,6 @@ class DatasetPreprocessor:
                 continue
             sample = self._buildSample(
                 text=segmentText,
-                tag=tag,
                 motionSlice=motionSlice,
                 windowStart=windowStart,
                 windowEnd=windowEnd,
@@ -192,14 +215,13 @@ class DatasetPreprocessor:
                 sample=sample,
                 frames=motionSlice.shape[0],
                 sampleBytes=sampleBytes,
-                tag=tag,
+                datasetFolder=datasetFolder,
                 sourceFile=sourceFile,
             )
 
     def _buildSample(
         self,
         text: str,
-        tag: str,
         motionSlice: torch.Tensor,
         windowStart: int,
         windowEnd: int,
@@ -212,8 +234,6 @@ class DatasetPreprocessor:
         ----------
         text : str
             Raw prompt text.
-        tag : str
-            Dataset tag.
         motionSlice : torch.Tensor
             Motion tensor for the window.
         windowStart : int
@@ -231,7 +251,6 @@ class DatasetPreprocessor:
         encoded = _tokenizeText(
             self.tokenizer,
             text,
-            tag,
             self.config.processing.maxPromptLength,
         )
         return {
@@ -239,7 +258,6 @@ class DatasetPreprocessor:
             "attention_mask": encoded["attention_mask"],
             "motion": motionSlice,
             "time": torch.tensor([windowStart, windowEnd]),
-            "tag": tag,
             "meta": mergedMeta,
         }
 
@@ -295,7 +313,7 @@ class ShardWriter:
         sample: Dict[str, object],
         frames: int,
         sampleBytes: int,
-        tag: str,
+        datasetFolder: str,
         sourceFile: str,
     ) -> None:
         """
@@ -309,8 +327,8 @@ class ShardWriter:
             Frame count for the sample.
         sampleBytes : int
             Estimated sample size in bytes.
-        tag : str
-            Dataset tag for the sample.
+        datasetFolder : str
+            Top-level dataset folder (e.g. KIT, CMU).
         sourceFile : str
             Source identifier for traceability.
         """
@@ -323,7 +341,7 @@ class ShardWriter:
                 shardOffset=shardOffset,
                 frames=frames,
                 sampleBytes=sampleBytes,
-                tag=tag,
+                datasetFolder=datasetFolder,
                 sourceFile=sourceFile,
             ),
         )
@@ -491,6 +509,17 @@ def _resolveAnimationPath(promptPath: Path, datasetRoot: Path) -> Path:
     raise FileNotFoundError(f"No animation file found next to {promptPath}")
 
 
+def _extractTopLevelFolder(path: Path, root: Path) -> str:
+    """Return the first directory component relative to `root`."""
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        relative = path
+    if not relative.parts:
+        return ""
+    return str(relative.parts[0])
+
+
 def _buildWindows(
     startFrame: int,
     endFrame: int,
@@ -584,11 +613,10 @@ def _isFramesValid(frames: int, maxFrames: Optional[int]) -> bool:
 def _tokenizeText(
     tokenizer: XLMRobertaTokenizerFast,
     text: str,
-    tag: str,
     maxPromptLength: int,
 ) -> Dict[str, torch.Tensor]:
     """
-    Tokenize text with an optional tag prefix.
+    Tokenize text.
 
     Parameters
     ----------
@@ -596,14 +624,11 @@ def _tokenizeText(
         Tokenizer instance.
     text : str
         Prompt text.
-    tag : str
-        Dataset tag.
     maxPromptLength : int
         Token length for truncation and padding.
     """
-    composed = _composeText(tag, text)
     encoded = tokenizer(
-        composed,
+        text,
         padding="max_length",
         truncation=True,
         max_length=maxPromptLength,
@@ -613,22 +638,6 @@ def _tokenizeText(
         "input_ids": encoded["input_ids"].squeeze(0),
         "attention_mask": encoded["attention_mask"].squeeze(0),
     }
-
-
-def _composeText(tag: str, text: str) -> str:
-    """
-    Compose prompt text with optional tag prefix.
-
-    Parameters
-    ----------
-    tag : str
-        Dataset tag.
-    text : str
-        Prompt text.
-    """
-    if tag:
-        return f"{TAG_PREFIX_TEMPLATE.format(tag=tag)}{text}"
-    return text
 
 
 def _estimateSampleBytes(sample: Dict[str, object]) -> int:

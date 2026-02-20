@@ -22,10 +22,13 @@ default:
   
   # Generation Denoiser Architecture
   generation:
-    num-heads: 8
+    num-heads: 2
     num-layers: 4
     num-bones: 22
     diffusion-steps: 1000
+    num-spatial-layers: 1
+    num-hierarchy-layers: 1
+    num-spatio-temporal-layers: 1
 
 # ============================================
 # Profile: DGX Spark (128GB RAM, GB10 GPU)
@@ -43,3 +46,6 @@ spark:
     num-layers: 8
     num-bones: 22
     diffusion-steps: 500
+    num-spatial-layers: 2
+    num-hierarchy-layers: 2
+    num-spatio-temporal-layers: 2

@@ -8,13 +8,17 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from src.shared.constants.skeletons import (
+    SMPL22_BONE_ORDER,
+    SMPL22_HIERARCHY,
+    SMPL24_BONE_ORDER,
+)
 from src.shared.model.layers.attention import MultiHeadAttention
 from src.shared.model.layers.normalization import AdaLN, FiLM
 from src.shared.model.layers.positional import RoPE
 from src.shared.model.layers.spatial_gcn import SpatialGCNBlock
 from src.shared.model.layers.temporal import TemporalLayer
 from src.shared.model.layers.transform import TransformLayer
-from src.shared.types.generation import VALID_TAGS
 
 
 class TimestepEmbedding(nn.Module):
@@ -73,64 +77,6 @@ class TimestepEmbedding(nn.Module):
         return self.mlp(embedding)
 
 
-class TagEmbedding(nn.Module):
-    """
-    Learnable embedding for categorical motion tags.
-
-    Maps the 9 valid tags to dense embeddings. Supports None/missing tags
-    by using a learnable default embedding.
-    """
-
-    def __init__(self, embedDim: int) -> None:
-        """
-        Initialize TagEmbedding.
-
-        Parameters
-        ----------
-        embedDim : int
-            Dimension of the output embedding.
-        """
-        super().__init__()
-        self.embedDim = embedDim
-        self.numTags = len(VALID_TAGS)
-        self.tagToIdx = {tag: idx for idx, tag in enumerate(VALID_TAGS)}
-        # +1 for the default/no-tag embedding at index 0
-        self.embedding = nn.Embedding(self.numTags + 1, embedDim)
-        # Index 0 is reserved for "no tag" / None
-        self.defaultIdx = self.numTags
-
-    def forward(self, tags: Optional[list[Optional[str]]]) -> torch.Tensor:
-        """
-        Embed a batch of tag strings.
-
-        Parameters
-        ----------
-        tags : Optional[list[Optional[str]]]
-            List of tag strings, can contain None for missing tags.
-            If the entire list is None, returns default embeddings.
-
-        Returns
-        -------
-        torch.Tensor
-            Tag embeddings shaped (batch_size, embedDim).
-        """
-        device = self.embedding.weight.device
-        
-        if tags is None:
-            # Return a single default embedding (will be broadcast)
-            return self.embedding(torch.tensor([self.defaultIdx], device=device))
-        
-        indices = []
-        for tag in tags:
-            if tag is None or tag == "":
-                indices.append(self.defaultIdx)
-            else:
-                indices.append(self.tagToIdx.get(tag, self.defaultIdx))
-        
-        indexTensor = torch.tensor(indices, dtype=torch.long, device=device)
-        return self.embedding(indexTensor)
-
-
 class DenoiserBlock(nn.Module):
     """
     Single denoising transformer block.
@@ -155,7 +101,7 @@ class DenoiserBlock(nn.Module):
         numHeads : int
             Number of attention heads.
         condDim : int
-            Dimension of conditioning embeddings (tag + timestep).
+            Dimension of conditioning embeddings (timestep).
         dropout : float, optional
             Dropout rate, by default 0.1.
         """
@@ -199,7 +145,12 @@ class DenoiserBlock(nn.Module):
         h = self.rope(h)
 
         # Multi-head attention for temporal relationships
-        h = h + self.attention(self.norm(h))
+        attnMask = None
+        if mask is not None:
+            # Convert key padding mask (True = pad) to attention keep-mask
+            # expected by MultiHeadAttention (True = keep, False = mask).
+            attnMask = (~mask).unsqueeze(1).unsqueeze(2)
+        h = h + self.attention(self.norm(h), mask=attnMask)
 
         # Transform layer with AdaLN conditioning
         h = self.adalnCondition(h, cond)
@@ -208,11 +159,125 @@ class DenoiserBlock(nn.Module):
         return h
 
 
+def _buildHierarchyAdjacency(numBones: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build directed hierarchy adjacency matrices for parent/child aggregation.
+    """
+    if numBones == len(SMPL22_BONE_ORDER):
+        boneOrder = SMPL22_BONE_ORDER
+        hierarchy: dict[str, Optional[str]] = dict(SMPL22_HIERARCHY)
+    elif numBones == len(SMPL24_BONE_ORDER):
+        boneOrder = SMPL24_BONE_ORDER
+        hierarchy = dict(SMPL22_HIERARCHY)
+        hierarchy["leftHand"] = "leftWrist"
+        hierarchy["rightHand"] = "rightWrist"
+    else:
+        identity = torch.eye(numBones, dtype=torch.float32)
+        return identity, identity
+
+    index = {name: idx for idx, name in enumerate(boneOrder)}
+    parentAdj = torch.eye(numBones, dtype=torch.float32)
+    childAdj = torch.eye(numBones, dtype=torch.float32)
+
+    for child, parent in hierarchy.items():
+        if parent is None:
+            continue
+        childIdx = index.get(child)
+        parentIdx = index.get(parent)
+        if childIdx is None or parentIdx is None:
+            continue
+        parentAdj[childIdx, parentIdx] = 1.0
+        childAdj[parentIdx, childIdx] = 1.0
+
+    parentDegree = parentAdj.sum(dim=1, keepdim=True).clamp(min=1.0)
+    childDegree = childAdj.sum(dim=1, keepdim=True).clamp(min=1.0)
+    return parentAdj / parentDegree, childAdj / childDegree
+
+
+class BoneHierarchyBlock(nn.Module):
+    """
+    Directed hierarchy mixing block over bones for each frame.
+    """
+
+    def __init__(
+        self,
+        numBones: int,
+        embedDim: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        parentAdj, childAdj = _buildHierarchyAdjacency(numBones)
+        self.register_buffer("parentAdjacency", parentAdj)
+        self.register_buffer("childAdjacency", childAdj)
+        self.selfLinear = nn.Linear(embedDim, embedDim)
+        self.parentLinear = nn.Linear(embedDim, embedDim)
+        self.childLinear = nn.Linear(embedDim, embedDim)
+        self.activation = nn.SiLU()
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(embedDim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply directed parent/child aggregation.
+        """
+        batch, frames, bones, embedDim = x.shape
+        h = x.reshape(batch * frames, bones, embedDim)
+        parentMix = torch.matmul(self.parentAdjacency, h)
+        childMix = torch.matmul(self.childAdjacency, h)
+        mixed = (
+            self.selfLinear(h)
+            + self.parentLinear(parentMix)
+            + self.childLinear(childMix)
+        )
+        mixed = self.activation(mixed)
+        mixed = self.dropout(mixed)
+        mixed = self.norm(mixed)
+        mixed = mixed.reshape(batch, frames, bones, embedDim)
+        return x + mixed
+
+
+class SpatioTemporalMixBlock(nn.Module):
+    """
+    Local spatio-temporal mixing over (frames, bones) right after split.
+    """
+
+    def __init__(self, embedDim: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.depthwiseConv = nn.Conv2d(
+            in_channels=embedDim,
+            out_channels=embedDim,
+            kernel_size=(3, 3),
+            padding=(1, 1),
+            groups=embedDim,
+        )
+        self.pointwiseConv = nn.Conv2d(
+            in_channels=embedDim,
+            out_channels=embedDim,
+            kernel_size=1,
+        )
+        self.activation = nn.SiLU()
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(embedDim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply depthwise separable 2D conv on temporal and skeletal axes.
+        """
+        h = x.permute(0, 3, 1, 2)
+        h = self.depthwiseConv(h)
+        h = self.activation(h)
+        h = self.pointwiseConv(h)
+        h = h.permute(0, 2, 3, 1)
+        h = self.dropout(h)
+        h = self.norm(h)
+        return x + h
+
+
 class MotionDenoiser(nn.Module):
     """
     Main diffusion denoiser network for motion generation.
 
-    Takes noisy motion, text embedding, tag, and timestep to predict noise.
+    Takes noisy motion, text embedding, and timestep to predict noise.
     """
 
     def __init__(
@@ -224,6 +289,8 @@ class MotionDenoiser(nn.Module):
         motionChannels: int = 6,
         dropout: float = 0.1,
         numSpatialLayers: int = 1,
+        numHierarchyLayers: int = 1,
+        numSpatioTemporalLayers: int = 1,
     ) -> None:
         """
         Initialize MotionDenoiser.
@@ -244,6 +311,10 @@ class MotionDenoiser(nn.Module):
             Dropout rate, by default 0.1.
         numSpatialLayers : int, optional
             Number of spatial GCN blocks, by default 1.
+        numHierarchyLayers : int, optional
+            Number of directed hierarchy blocks after bone split.
+        numSpatioTemporalLayers : int, optional
+            Number of local spatio-temporal mixing blocks.
         """
         super().__init__()
         self.embedDim = embedDim
@@ -254,13 +325,29 @@ class MotionDenoiser(nn.Module):
         self.boneProj = nn.Linear(motionChannels, embedDim)
         self.frameProj = nn.Linear(numBones * embedDim, embedDim)
         self.textProj = nn.Linear(embedDim, embedDim)
+        self.textAdapter = nn.Sequential(
+            nn.LayerNorm(embedDim),
+            nn.Linear(embedDim, embedDim * 2),
+            nn.SiLU(),
+            nn.Linear(embedDim * 2, embedDim),
+        )
 
         # Conditioning embeddings
         self.timestepEmbed = TimestepEmbedding(embedDim)
-        self.tagEmbed = TagEmbedding(embedDim)
 
-        # Conditioning dimension: tag + timestep
-        condDim = embedDim * 2
+        # Conditioning dimension: timestep
+        condDim = embedDim
+
+        self.hierarchyBlocks = nn.ModuleList(
+            [
+                BoneHierarchyBlock(
+                    numBones=numBones,
+                    embedDim=embedDim,
+                    dropout=dropout,
+                )
+                for _ in range(numHierarchyLayers)
+            ]
+        )
 
         # Spatial blocks (GCN over bones per frame)
         self.spatialBlocks = nn.ModuleList(
@@ -271,6 +358,13 @@ class MotionDenoiser(nn.Module):
                     dropout=dropout,
                 )
                 for _ in range(numSpatialLayers)
+            ]
+        )
+
+        self.spatioTemporalBlocks = nn.ModuleList(
+            [
+                SpatioTemporalMixBlock(embedDim=embedDim, dropout=dropout)
+                for _ in range(numSpatioTemporalLayers)
             ]
         )
 
@@ -288,7 +382,6 @@ class MotionDenoiser(nn.Module):
         self,
         noisyMotion: torch.Tensor,
         textEmbedding: torch.Tensor,
-        tags: Optional[list[Optional[str]]],
         timesteps: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -301,8 +394,6 @@ class MotionDenoiser(nn.Module):
             Noisy motion shaped (batch, frames, bones, 6).
         textEmbedding : torch.Tensor
             CLIP text embedding shaped (batch, embedDim).
-        tags : Optional[list[Optional[str]]]
-            List of tag strings for the batch. Can be None or contain None elements.
         timesteps : torch.Tensor
             Diffusion timesteps shaped (batch,).
         mask : Optional[torch.Tensor], optional
@@ -315,24 +406,27 @@ class MotionDenoiser(nn.Module):
         """
         batch, frames, bones, channels = noisyMotion.shape
 
-        # Bone-wise projection + spatial GCN.
+        # Bone-wise projection, hierarchy, spatial and spatio-temporal mixing.
         boneH = self.boneProj(noisyMotion)
+        for block in self.hierarchyBlocks:
+            boneH = block(boneH)
         for block in self.spatialBlocks:
+            boneH = block(boneH)
+        for block in self.spatioTemporalBlocks:
             boneH = block(boneH)
 
         # Flatten per-frame features after spatial mixing.
         motionH = boneH.reshape(batch, frames, bones * self.embedDim)
         motionH = self.frameProj(motionH)
         textH = self.textProj(textEmbedding)
+        textH = textH + self.textAdapter(textH)
 
         # Expand text embedding to sequence length and add
         textH = textH.unsqueeze(1).expand(-1, frames, -1)
         h = motionH + textH
 
         # Get conditioning embeddings
-        timeEmb = self.timestepEmbed(timesteps)
-        tagEmb = self.tagEmbed(tags)
-        cond = torch.cat([timeEmb, tagEmb], dim=-1)
+        cond = self.timestepEmbed(timesteps)
 
         # Apply denoising blocks
         for block in self.blocks:

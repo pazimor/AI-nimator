@@ -17,7 +17,7 @@ MotionPayload = Tuple[torch.Tensor, Dict[str, object]]
 
 def loadPromptSegments(
     path: str | Path,
-) -> tuple[str, Dict[str, object], List[PromptSegment]]:
+) -> tuple[Dict[str, object], List[PromptSegment]]:
     """
     Return prompt segments plus file-level metadata.
 
@@ -28,17 +28,16 @@ def loadPromptSegments(
 
     Returns
     -------
-    tuple[str, Dict[str, object], List[PromptSegment]]
-        File tag, metadata, and parsed prompt segments.
+    tuple[Dict[str, object], List[PromptSegment]]
+        Metadata and parsed prompt segments.
     """
     payload = _readJsonLike(path)
-    tag = str(payload.get("tag", "") or "")
     metadata = payload.get("meta", {}) or {}
     segments = [
         _segmentFromDict(rawSegment)
         for rawSegment in payload.get("segments", [])
     ]
-    return tag, metadata, segments
+    return metadata, segments
 
 
 def loadAnimationPayload(

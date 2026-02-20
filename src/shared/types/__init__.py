@@ -37,7 +37,6 @@ from .datasets import (
     PromptSample,
 )
 from .generation import (
-    VALID_TAGS,
     GenerationInferenceConfig,
     GenerationModelSettings,
     GenerationOutputOptions,
@@ -45,7 +44,6 @@ from .generation import (
     GenerationTrainingHyperparameters,
     GenerationTrainingPaths,
     GenerationTrainingResult,
-    validateTag,
 )
 from .network import (
     ClipNetworkConfig,
@@ -110,7 +108,6 @@ __all__ = [
     "PreprocessedDatasetManifest",
     "PreprocessedDatasetShardInfo",
     "PreprocessedSampleIndex",
-    "VALID_TAGS",
     "GenerationInferenceConfig",
     "GenerationModelSettings",
     "GenerationOutputOptions",
@@ -118,7 +115,6 @@ __all__ = [
     "GenerationTrainingHyperparameters",
     "GenerationTrainingPaths",
     "GenerationTrainingResult",
-    "validateTag",
     # Network and LR types
     "ClipNetworkConfig",
     "GenerationNetworkConfig",

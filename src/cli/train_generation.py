@@ -23,7 +23,6 @@ from src.shared.dataset_manager import (
     estimateModelBytes,
 )
 from src.shared.config_loader import loadNetworkConfig
-from src.shared.learning_rate import LearningRateScheduler, LearningRateConfig
 from src.shared.model.generation.ddim import DDIM
 from src.shared.model.generation.motion_generator import MotionGenerator
 from src.shared.types import GenerationTrainingConfig, GenerationTrainingResult
@@ -57,6 +56,15 @@ def buildArgumentParser() -> argparse.ArgumentParser:
         help="Configuration profile to use (e.g., 'spark' for DGX Spark). "
              "If not specified, uses 'training' section.",
     )
+    parser.add_argument(
+        "--dataset-folders",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated top-level dataset folders to include "
+            "(example: KIT,CMU,ACCAD)."
+        ),
+    )
     return parser
 
 
@@ -71,7 +79,11 @@ def main() -> None:
         config = loadGenerationConfig(configPath, profile=arguments.profile)
         if arguments.profile:
             LOGGER.info("Using profile: %s", arguments.profile)
-        result = _runTraining(config, profile=arguments.profile)
+        result = _runTraining(
+            config,
+            profile=arguments.profile,
+            datasetFolders=_parseFolderList(arguments.dataset_folders),
+        )
         
         parser.exit(
             0,
@@ -86,6 +98,7 @@ def main() -> None:
 def _runTraining(
     config: GenerationTrainingConfig,
     profile: Optional[str] = None,
+    datasetFolders: Optional[list[str]] = None,
 ) -> GenerationTrainingResult:
     """
     Execute the end-to-end training workflow.
@@ -139,17 +152,50 @@ def _runTraining(
         diffusionSteps=networkConfig.generation.diffusionSteps,
         modelName=config.training.modelName,
         clipCheckpoint=config.paths.clipCheckpoint,
-        geodesicWeight=config.training.geodesicWeight,
-        geodesicWeightSchedule=config.training.geodesicWeightSchedule,
+        xyzWeight=config.training.xyzWeight,
+        xyzWeightSchedule=config.training.xyzWeightSchedule,
+        velXyzWeight=config.training.velXyzWeight,
+        diffusionWeight=config.training.diffusionWeight,
+        accelerationWeight=config.training.accelerationWeight,
+        numSpatialLayers=networkConfig.generation.numSpatialLayers,
+        numHierarchyLayers=networkConfig.generation.numHierarchyLayers,
+        numSpatioTemporalLayers=networkConfig.generation.numSpatioTemporalLayers,
     ).to(device)
     LOGGER.info(
         "Model initialized with CLIP from %s",
         config.paths.clipCheckpoint,
     )
+    LOGGER.info(
+        "Rotation-only training input enabled (6D joints, no root "
+        "translation fed to the network)."
+    )
+    xyzSchedule = config.training.xyzWeightSchedule.lower()
+    effectiveXyzWeight = config.training.xyzWeight
+    if xyzSchedule == "timestep":
+        effectiveXyzWeight *= 0.5
+    LOGGER.info(
+        "XYZ optimization: base_weight=%.4f, schedule=%s, "
+        "approx_effective_weight=%.4f",
+        config.training.xyzWeight,
+        config.training.xyzWeightSchedule,
+        effectiveXyzWeight,
+    )
+    LOGGER.info(
+        "Loss weights: diffusion=%.4f, xyz=%.4f, vel_xyz=%.4f, acc=%.4f",
+        config.training.diffusionWeight,
+        config.training.xyzWeight,
+        config.training.velXyzWeight,
+        config.training.accelerationWeight,
+    )
 
     modelMemoryBytes = estimateModelBytes(model)
     memoryConfig = MemoryManagerConfig(
         MM_memoryLimitGB=config.training.MM_memoryLimitGB,
+    )
+    selectedFolders = (
+        datasetFolders
+        if datasetFolders is not None
+        else config.paths.datasetFolders
     )
     datasetManager = DatasetManager(
         datasetRoot=config.paths.datasetRoot,
@@ -160,6 +206,7 @@ def _runTraining(
         device=device,
         validationIndicesPath=config.paths.validationIndices,
         maxSamplesPerEpoch=config.training.maxSamplesPerEpoch,
+        datasetFolders=selectedFolders,
     )
     datasetManager.dataset.validateCompatibility(
         modelName=config.training.modelName,
@@ -177,20 +224,6 @@ def _runTraining(
     ddim = DDIM(
         num_timesteps=networkConfig.generation.diffusionSteps
     ).to(device)
-
-    # Learning rate scheduler with configurable warmup and decay
-    lrConfig = LearningRateConfig(
-        initialLR=config.training.learningRate,
-        minLR=config.training.lrMin,
-        warmupEpochs=config.training.lrWarmupEpochs,
-        scheduleType=config.training.lrSchedule,
-        decayEpochs=config.training.lrDecayEpochs,
-    )
-    scheduler = LearningRateScheduler(
-        optimizer=optimizer,
-        config=lrConfig,
-        totalEpochs=config.training.epochs,
-    )
 
     bestValLoss: Optional[float] = None
     epochsWithoutImprovement = 0
@@ -242,17 +275,9 @@ def _runTraining(
             chunkInfo=chunkInfo,
             memoryLimitGB=config.training.MM_memoryLimitGB,
         )
-        LOGGER.info(
-            "Epoch %s train loss: %.4f (lr=%.6f)",
-            epochIndex + 1,
-            trainLoss,
-            currentLr,
-        )
-        _logLossComponents("train", epochIndex + 1, trainComponents)
+        valLoss: Optional[float] = None
+        valComponents = _nanLossComponents()
         
-        # Update learning rate
-        scheduler.step()
-
         # Validation evaluation
         if valLoader is not None:
             valLoss, valComponents = evaluateValidation(
@@ -261,9 +286,6 @@ def _runTraining(
                 ddim,
                 device,
             )
-            LOGGER.info("Epoch %s val loss: %.4f", epochIndex + 1, valLoss)
-            _logLossComponents("val", epochIndex + 1, valComponents)
-
             # Checkpointing - save best model
             if bestValLoss is None or valLoss < bestValLoss:
                 bestValLoss = valLoss
@@ -283,17 +305,6 @@ def _runTraining(
                     epochsWithoutImprovement,
                 )
 
-            # Early stopping check
-            if (
-                epochsWithoutImprovement
-                >= config.training.earlyStoppingPatience
-            ):
-                LOGGER.info(
-                    "Early stopping triggered after %s epochs "
-                    "without improvement",
-                    epochsWithoutImprovement,
-                )
-                break
         else:
             # No validation, save periodically
             if (epochIndex + 1) % 10 == 0:
@@ -306,6 +317,26 @@ def _runTraining(
                 )
                 LOGGER.info("Saved checkpoint to %s", checkpointPath)
 
+        _logEpochSummary(
+            epoch=epochIndex + 1,
+            totalEpochs=config.training.epochs,
+            learningRate=currentLr,
+            trainComponents=trainComponents,
+            valComponents=valComponents,
+        )
+
+        if (
+            valLoader is not None
+            and epochsWithoutImprovement
+            >= config.training.earlyStoppingPatience
+        ):
+            LOGGER.info(
+                "Early stopping triggered after %s epochs without "
+                "improvement",
+                epochsWithoutImprovement,
+            )
+            break
+
     finalLoss = bestValLoss if bestValLoss is not None else trainLoss
     return GenerationTrainingResult(
         epochsRun=epochsRun,
@@ -314,34 +345,92 @@ def _runTraining(
     )
 
 
-def _logLossComponents(
-    phase: str,
+def _parseFolderList(rawValue: str | None) -> list[str] | None:
+    """Parse comma-separated folder names from CLI."""
+    if rawValue is None:
+        return None
+    folders = [item.strip() for item in rawValue.split(",")]
+    normalized = [item for item in folders if item]
+    if not normalized:
+        return None
+    return normalized
+
+
+def _nanLossComponents() -> dict[str, float]:
+    """Return NaN placeholders for epoch summary formatting."""
+    return {
+        "loss_diffusion": float("nan"),
+        "loss_xyz": float("nan"),
+        "loss_vel_xyz": float("nan"),
+        "loss_acceleration": float("nan"),
+        "contrib_diffusion": float("nan"),
+        "contrib_xyz": float("nan"),
+        "contrib_vel_xyz": float("nan"),
+        "contrib_acceleration": float("nan"),
+    }
+
+
+def _formatComponents(components: Mapping[str, float]) -> str:
+    """Format train/val component block for epoch summary log."""
+    return (
+        "diff= %.4f, xyz= %.4f, vel_xyz= %.4f, acc= %.4f"
+        % (
+            components.get("loss_diffusion", float("nan")),
+            components.get("loss_xyz", float("nan")),
+            components.get("loss_vel_xyz", float("nan")),
+            components.get("loss_acceleration", float("nan")),
+        )
+    )
+
+
+def _safePercent(numerator: float, denominator: float) -> float:
+    """Return a stable percentage value."""
+    if denominator <= 0.0 or numerator != numerator:
+        return float("nan")
+    return 100.0 * numerator / denominator
+
+
+def _formatImpact(components: Mapping[str, float]) -> str:
+    """Format weighted contribution ratios for each loss term."""
+    diff = components.get("contrib_diffusion", float("nan"))
+    xyz = components.get("contrib_xyz", float("nan"))
+    velXyz = components.get("contrib_vel_xyz", float("nan"))
+    acc = components.get("contrib_acceleration", float("nan"))
+    total = diff + xyz + velXyz + acc
+    return (
+        "diff= %.1f%%, xyz= %.1f%%, vel_xyz= %.1f%%, acc= %.1f%%"
+        % (
+            _safePercent(diff, total),
+            _safePercent(xyz, total),
+            _safePercent(velXyz, total),
+            _safePercent(acc, total),
+        )
+    )
+
+
+def _logEpochSummary(
     epoch: int,
-    components: Mapping[str, float],
+    totalEpochs: int,
+    learningRate: float,
+    trainComponents: Mapping[str, float],
+    valComponents: Mapping[str, float],
 ) -> None:
     """
-    Log loss component breakdown for the given phase.
-
-    Parameters
-    ----------
-    phase : str
-        Training phase label (e.g., "train", "val").
-    epoch : int
-        Current epoch number (1-based).
-    components : Mapping[str, float]
-        Loss component averages.
+    Log one compact epoch line following the requested format.
     """
-    if not components:
-        return
     LOGGER.info(
-        "Epoch %s %s components: diff=%.4f geo=%.4f "
-        "vel=%.4f acc=%.4f",
+        "epoch: %s/%s, lr = %.6f, train: [ %s ], val: [ %s ]",
         epoch,
-        phase,
-        components.get("loss_diffusion", 0.0),
-        components.get("loss_geodesic", 0.0),
-        components.get("loss_velocity", 0.0),
-        components.get("loss_acceleration", 0.0),
+        totalEpochs,
+        learningRate,
+        _formatComponents(trainComponents),
+        _formatComponents(valComponents),
+    )
+    LOGGER.info(
+        "epoch: %s impact train: [ %s ], val: [ %s ]",
+        epoch,
+        _formatImpact(trainComponents),
+        _formatImpact(valComponents),
     )
 
 

@@ -17,6 +17,12 @@ import logging
 import numpy as np
 
 LOGGER = logging.getLogger("converted Prompt Repository")
+COLLADA_INTERPOLATION_LINEAR = "LINEAR"
+COLLADA_INTERPOLATION_STEP = "STEP"
+SUPPORTED_COLLADA_INTERPOLATIONS = {
+    COLLADA_INTERPOLATION_LINEAR,
+    COLLADA_INTERPOLATION_STEP,
+}
 
 class AnimationRebuilder:
     """Convert AMASS pose parameters into the canonical JSON schema."""
@@ -200,6 +206,7 @@ class AnimationRebuilder:
         self,
         sample: AnimationSample,
         outputPath: Path,
+        interpolation: str = "linear",
         zeroRootTranslation: bool = False,
         anchorRootTranslation: bool = False,
     ) -> None:
@@ -212,6 +219,9 @@ class AnimationRebuilder:
             Animation data with SMPL axis-angles and extras.
         outputPath : Path
             Destination path for the .dae file.
+        interpolation : str, optional
+            Key interpolation mode written to Collada samplers.
+            Supported values: "linear", "step".
         zeroRootTranslation : bool, optional
             When True, forces pelvis translation to zero for all frames.
         anchorRootTranslation : bool, optional
@@ -314,6 +324,13 @@ class AnimationRebuilder:
             zeroRootTranslation,
             anchorRootTranslation,
         )
+        interpolationMode = interpolation.strip().upper()
+        if interpolationMode not in SUPPORTED_COLLADA_INTERPOLATIONS:
+            supported = ", ".join(sorted(SUPPORTED_COLLADA_INTERPOLATIONS))
+            raise ValueError(
+                "Unsupported Collada interpolation "
+                f"{interpolation!r}. Supported values: {supported}."
+            )
 
         for bone_name in SMPL22_BONE_ORDER:
             source_index = self.boneIndex.get(bone_name)
@@ -357,6 +374,7 @@ class AnimationRebuilder:
                 times_str,
                 time_count,
                 matrices_4x4,
+                interpolation=interpolationMode,
             )
 
         # Scene instance
@@ -523,6 +541,7 @@ class AnimationRebuilder:
         times_str: str,
         time_count: int,
         matrices: np.ndarray,
+        interpolation: str = "LINEAR",
     ) -> None:
         """
         Create a Collada animation channel for 4x4 matrix transforms.
@@ -620,7 +639,7 @@ class AnimationRebuilder:
             id=f"{anim_id}_interpolation_array",
             count=str(time_count),
         )
-        name_array.text = " ".join(["LINEAR"] * time_count)
+        name_array.text = " ".join([interpolation] * time_count)
         technique = ET.SubElement(source_interp, "technique_common")
         accessor = ET.SubElement(
             technique,

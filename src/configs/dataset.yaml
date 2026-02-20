@@ -8,3 +8,5 @@ processing:
   animation-extension: ".npz"
   prompt-text-extension: ".txt"
   fallback-fps: 60
+  # Include converted custom prompts (#Simple/#Advanced)
+  include-custom-prompts: true

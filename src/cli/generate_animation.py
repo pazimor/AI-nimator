@@ -15,7 +15,6 @@ from src.shared.types import (
     GenerationInferenceConfig,
     GenerationModelSettings,
     GenerationOutputOptions,
-    validateTag,
 )
 
 DEFAULT_GENERATION_CONFIG_PATH = Path("src/configs/train_generation.yaml")
@@ -23,6 +22,7 @@ DEFAULT_DATASET_CONFIG_PATH = Path("src/configs/dataset.yaml")
 DEFAULT_OUTPUT_PATH = Path("output/generated_animation")
 DEFAULT_DEVICE = "auto"
 DEFAULT_DDIM_STEPS = 50
+DEFAULT_OUTPUT_FPS = 24
 
 JSON_SUFFIX = ".json"
 DAE_SUFFIX = ".dae"
@@ -69,12 +69,6 @@ def addCoreArguments(parser: argparse.ArgumentParser) -> None:
         help="Text prompt used for generation.",
     )
     parser.add_argument(
-        "--tag",
-        type=str,
-        default=None,
-        help="Optional tag label (must match the known list).",
-    )
-    parser.add_argument(
         "--frames",
         type=int,
         required=True,
@@ -93,6 +87,7 @@ def addOutputArguments(parser: argparse.ArgumentParser) -> None:
     """
     addOutputPathArguments(parser)
     addOutputFpsArgument(parser)
+    addOutputInterpolationArgument(parser)
     addTranslationArguments(parser)
 
 
@@ -137,8 +132,30 @@ def addOutputFpsArgument(parser: argparse.ArgumentParser) -> None:
         "--fps",
         dest="fps",
         type=int,
-        default=None,
-        help="Override FPS (defaults to dataset config fallback).",
+        default=DEFAULT_OUTPUT_FPS,
+        help="Output FPS (default: 24).",
+    )
+
+
+def addOutputInterpolationArgument(parser: argparse.ArgumentParser) -> None:
+    """
+    Register Collada interpolation mode argument.
+
+    Parameters
+    ----------
+    parser : argparse.ArgumentParser
+        Parser instance to update.
+    """
+    parser.add_argument(
+        "--collada-interpolation",
+        dest="colladaInterpolation",
+        type=str,
+        choices=["linear", "step"],
+        default="linear",
+        help=(
+            "Interpolation mode used for Collada keys "
+            "(linear or step)."
+        ),
     )
 
 
@@ -286,25 +303,6 @@ def resolveOutputPaths(outputPath: Path) -> tuple[Path, Path]:
     raise ValueError(f"Unsupported output suffix: {suffix}")
 
 
-def validateTagValue(tag: Optional[str]) -> Optional[str]:
-    """
-    Validate tag value when provided.
-
-    Parameters
-    ----------
-    tag : Optional[str]
-        Tag string from CLI.
-
-    Returns
-    -------
-    Optional[str]
-        Validated tag or None.
-    """
-    if tag is None:
-        return None
-    return validateTag(tag)
-
-
 def resolveModelSettings(
     configPath: Path,
     profile: Optional[str],
@@ -351,7 +349,6 @@ def resolveModelSettings(
 def buildInferenceConfig(
     arguments: argparse.Namespace,
     jsonPath: Path,
-    tagValue: Optional[str],
 ) -> GenerationInferenceConfig:
     """
     Build inference config from CLI arguments.
@@ -362,8 +359,6 @@ def buildInferenceConfig(
         Parsed CLI arguments.
     jsonPath : Path
         Output JSON path for the inference config.
-    tagValue : Optional[str]
-        Validated tag value.
 
     Returns
     -------
@@ -373,7 +368,6 @@ def buildInferenceConfig(
     return GenerationInferenceConfig(
         checkpoint=arguments.checkpoint,
         prompt=arguments.prompt,
-        tag=tagValue,
         frames=arguments.frames,
         output=jsonPath,
         device=arguments.device,
@@ -385,6 +379,7 @@ def buildOutputOptions(
     jsonPath: Path,
     daePath: Path,
     fps: Optional[int],
+    colladaInterpolation: str,
     zeroRootTranslation: bool,
     anchorRootTranslation: bool,
 ) -> GenerationOutputOptions:
@@ -399,6 +394,8 @@ def buildOutputOptions(
         Destination Collada path.
     fps : Optional[int]
         Optional FPS override.
+    colladaInterpolation : str
+        Collada interpolation mode ("linear" or "step").
     zeroRootTranslation : bool
         Zero root translation flag.
     anchorRootTranslation : bool
@@ -413,6 +410,7 @@ def buildOutputOptions(
         jsonPath=jsonPath,
         daePath=daePath,
         fps=fps,
+        colladaInterpolation=colladaInterpolation,
         zeroRootTranslation=zeroRootTranslation,
         anchorRootTranslation=anchorRootTranslation,
     )
@@ -464,8 +462,7 @@ def buildGenerationInputs(
         Configs used by the generation pipeline.
     """
     jsonPath, daePath = resolveOutputPaths(arguments.outputPath)
-    tagValue = validateTagValue(arguments.tag)
-    inferenceConfig = buildInferenceConfig(arguments, jsonPath, tagValue)
+    inferenceConfig = buildInferenceConfig(arguments, jsonPath)
     modelSettings = resolveModelSettings(
         configPath=arguments.configPath,
         profile=arguments.profile,
@@ -477,6 +474,7 @@ def buildGenerationInputs(
         jsonPath=jsonPath,
         daePath=daePath,
         fps=arguments.fps,
+        colladaInterpolation=arguments.colladaInterpolation,
         zeroRootTranslation=arguments.zeroRootTranslation,
         anchorRootTranslation=arguments.anchorRootTranslation,
     )

@@ -37,7 +37,6 @@ DEVICE_CUDA = "cuda"
 DEVICE_MPS = "mps"
 
 EXTRA_PROMPT_KEY = "prompt"
-EXTRA_TAG_KEY = "tag"
 EXTRA_CHECKPOINT_KEY = "checkpoint"
 EXTRA_MODEL_NAME_KEY = "modelName"
 EXTRA_DDIM_STEPS_KEY = "ddimSteps"
@@ -289,6 +288,9 @@ def buildMotionGenerator(
         numLayers=networkConfig.generation.numLayers,
         numBones=networkConfig.generation.numBones,
         diffusionSteps=networkConfig.generation.diffusionSteps,
+        numSpatialLayers=networkConfig.generation.numSpatialLayers,
+        numHierarchyLayers=networkConfig.generation.numHierarchyLayers,
+        numSpatioTemporalLayers=networkConfig.generation.numSpatioTemporalLayers,
         modelName=modelName,
         clipCheckpoint=clipCheckpointPath,
     )
@@ -324,7 +326,7 @@ def generateMotionQuat(
     model : MotionGenerator
         Generation model.
     inferenceConfig : GenerationInferenceConfig
-        Prompt, tag, and sampling configuration.
+        Prompt and sampling configuration.
     device : torch.device
         Device for inference.
 
@@ -335,7 +337,6 @@ def generateMotionQuat(
     """
     return model.generate(
         prompt=inferenceConfig.prompt,
-        tag=inferenceConfig.tag,
         numFrames=inferenceConfig.frames,
         ddimSteps=inferenceConfig.ddimSteps,
         device=device,
@@ -466,8 +467,6 @@ def buildExtras(
         EXTRA_MODEL_NAME_KEY: modelSettings.modelName,
         EXTRA_DDIM_STEPS_KEY: inferenceConfig.ddimSteps,
     }
-    if inferenceConfig.tag is not None:
-        extras[EXTRA_TAG_KEY] = inferenceConfig.tag
     return extras
 
 
@@ -669,6 +668,7 @@ def exportAnimationOutputs(
     rebuilder: AnimationRebuilder,
     outputJsonPath: Path,
     outputDaePath: Path,
+    colladaInterpolation: str,
     zeroRootTranslation: bool,
     anchorRootTranslation: bool,
 ) -> None:
@@ -685,6 +685,8 @@ def exportAnimationOutputs(
         Destination JSON path.
     outputDaePath : Path
         Destination Collada path.
+    colladaInterpolation : str
+        Collada interpolation mode ("linear" or "step").
     zeroRootTranslation : bool
         Zero root translation when exporting Collada.
     anchorRootTranslation : bool
@@ -696,6 +698,7 @@ def exportAnimationOutputs(
     rebuilder.exportCollada(
         sample,
         outputDaePath,
+        interpolation=colladaInterpolation,
         zeroRootTranslation=zeroRootTranslation,
         anchorRootTranslation=anchorRootTranslation,
     )
@@ -737,6 +740,7 @@ def generateAndExport(
     exportAnimationOutputs(
         sample, rebuilder, outputOptions.jsonPath,
         outputOptions.daePath,
+        outputOptions.colladaInterpolation,
         outputOptions.zeroRootTranslation,
         outputOptions.anchorRootTranslation,
     )

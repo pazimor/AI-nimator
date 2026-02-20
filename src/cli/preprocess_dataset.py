@@ -31,6 +31,15 @@ def buildArgumentParser() -> argparse.ArgumentParser:
         default=DEFAULT_CONFIG_PATH,
         help="Path to the preprocessing YAML configuration file.",
     )
+    parser.add_argument(
+        "--include-folders",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated top-level folders to preprocess "
+            "(example: KIT,CMU,ACCAD)."
+        ),
+    )
     return parser
 
 
@@ -47,11 +56,23 @@ def main() -> None:
     arguments = parser.parse_args()
     config = loadPreprocessConfig(arguments.config)
     preprocessor = DatasetPreprocessor(config)
-    preprocessor.run()
+    includeFolders = _parseFolderList(arguments.include_folders)
+    preprocessor.run(includeFolders=includeFolders)
     parser.exit(
         0,
         f"Preprocessing finished. Output: {config.paths.outputRoot}\n",
     )
+
+
+def _parseFolderList(rawValue: str | None) -> list[str] | None:
+    """Parse comma-separated folder names from CLI."""
+    if rawValue is None:
+        return None
+    folders = [item.strip() for item in rawValue.split(",")]
+    normalized = [item for item in folders if item]
+    if not normalized:
+        return None
+    return normalized
 
 
 if __name__ == "__main__":
