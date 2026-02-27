@@ -287,16 +287,18 @@ def shapeCheck(
     resolvedDevice = _resolveDevice(device)
     networkConfig = loadNetworkConfig(Path(networkConfigPath), profile=networkProfile)
 
-    embedDim = networkConfig.embedDim
+    clipEmbedDim = networkConfig.embedDim
+    generationEmbedDim = networkConfig.generation.embedDim
     numHeads = networkConfig.generation.numHeads
     numLayers = networkConfig.generation.numLayers
     numBones = networkConfig.generation.numBones
     diffusionSteps = networkConfig.generation.diffusionSteps
 
-    if embedDim % numHeads != 0:
+    if generationEmbedDim % numHeads != 0:
         print(
-            "❌ Invalid config: embedDim must be divisible by numHeads "
-            f"(embedDim={embedDim}, numHeads={numHeads})."
+            "❌ Invalid config: generation embedDim must be divisible by "
+            "numHeads "
+            f"(embedDim={generationEmbedDim}, numHeads={numHeads})."
         )
         sys.exit(1)
 
@@ -305,8 +307,17 @@ def shapeCheck(
     print("=" * 60)
     print(f"network.yaml: {networkConfigPath} (profile={networkProfile})")
     print(
-        "D=%d H=%d L=%d K=%d C=%d T=%d device=%s"
-        % (embedDim, numHeads, numLayers, numBones, motionChannels, frames, resolvedDevice)
+        "clipD=%d genD=%d H=%d L=%d K=%d C=%d T=%d device=%s"
+        % (
+            clipEmbedDim,
+            generationEmbedDim,
+            numHeads,
+            numLayers,
+            numBones,
+            motionChannels,
+            frames,
+            resolvedDevice,
+        )
     )
     if motionChannels != 6 and full:
         print(
@@ -335,7 +346,8 @@ def shapeCheck(
             from src.shared.model.generation.motion_generator import MotionGenerator
 
             model = MotionGenerator(
-                embedDim=embedDim,
+                embedDim=clipEmbedDim,
+                generationEmbedDim=generationEmbedDim,
                 numHeads=numHeads,
                 numLayers=numLayers,
                 numBones=numBones,
@@ -404,17 +416,22 @@ def shapeCheck(
             )
 
             denoiser = MotionDenoiser(
-                embedDim=embedDim,
+                embedDim=generationEmbedDim,
                 numHeads=numHeads,
                 numLayers=numLayers,
                 numBones=numBones,
                 motionChannels=motionChannels,
+                textEmbedDim=clipEmbedDim,
             ).to(resolvedDevice)
             denoiser.eval()
 
             _printParamSummary("MotionDenoiser", denoiser)
 
-            textEmbedding = torch.randn(batchSize, embedDim, device=resolvedDevice)
+            textEmbedding = torch.randn(
+                batchSize,
+                clipEmbedDim,
+                device=resolvedDevice,
+            )
             predictedNoise = denoiser(
                 noisyMotion=noisyMotion,
                 textEmbedding=textEmbedding,

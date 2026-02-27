@@ -21,6 +21,10 @@ from src.shared.model.layers.correction import (
     Smoothing,
     VelocityRegularization,
 )
+from src.shared.types.generation import (
+    PREDICTION_TARGET_CHOICES,
+    PREDICTION_TARGET_EPSILON,
+)
 
 
 class MotionGenerator(nn.Module):
@@ -51,6 +55,9 @@ class MotionGenerator(nn.Module):
         numSpatialLayers: int = 1,
         numHierarchyLayers: int = 1,
         numSpatioTemporalLayers: int = 1,
+        maxPromptLength: int = 64,
+        generationEmbedDim: Optional[int] = None,
+        predictionTarget: str = PREDICTION_TARGET_EPSILON,
     ) -> None:
         """
         Initialize MotionGenerator.
@@ -58,7 +65,7 @@ class MotionGenerator(nn.Module):
         Parameters
         ----------
         embedDim : int, optional
-            Embedding dimension (must match CLIP), by default 64.
+            CLIP embedding dimension, by default 64.
         numHeads : int, optional
             Number of attention heads, by default 4.
         numLayers : int, optional
@@ -91,9 +98,29 @@ class MotionGenerator(nn.Module):
             Number of directed bone hierarchy blocks.
         numSpatioTemporalLayers : int, optional
             Number of local spatio-temporal mixing blocks.
+        maxPromptLength : int, optional
+            Tokenizer max length used during inference tokenization.
+        generationEmbedDim : Optional[int], optional
+            Internal denoiser width. When omitted, defaults to ``embedDim``
+            for backward compatibility.
+        predictionTarget : str, optional
+            Denoiser parameterization target ("epsilon" or "x0").
         """
         super().__init__()
+        resolvedPredictionTarget = str(predictionTarget).strip().lower()
+        if resolvedPredictionTarget not in PREDICTION_TARGET_CHOICES:
+            allowed = ", ".join(PREDICTION_TARGET_CHOICES)
+            raise ValueError(
+                "predictionTarget must be one of "
+                f"[{allowed}], got {predictionTarget!r}."
+            )
         self.embedDim = embedDim
+        self.generationEmbedDim = (
+            embedDim
+            if generationEmbedDim is None
+            else int(generationEmbedDim)
+        )
+        self.predictionTarget = resolvedPredictionTarget
         self.numBones = numBones
         self.diffusionSteps = diffusionSteps
         self.xyzWeight = xyzWeight
@@ -101,6 +128,7 @@ class MotionGenerator(nn.Module):
         self.velXyzWeight = velXyzWeight
         self.diffusionWeight = diffusionWeight
         self.accelerationWeight = accelerationWeight
+        self.maxPromptLength = max(1, int(maxPromptLength))
 
         # CLIP text encoder (frozen)
         self.clip = ClipModel(
@@ -115,13 +143,14 @@ class MotionGenerator(nn.Module):
         # Diffusion components
         self.ddim = DDIM(num_timesteps=diffusionSteps)
         self.denoiser = MotionDenoiser(
-            embedDim=embedDim,
+            embedDim=self.generationEmbedDim,
             numHeads=numHeads,
             numLayers=numLayers,
             numBones=numBones,
             numSpatialLayers=numSpatialLayers,
             numHierarchyLayers=numHierarchyLayers,
             numSpatioTemporalLayers=numSpatioTemporalLayers,
+            textEmbedDim=embedDim,
         )
 
         # Post-processing (inference only)
@@ -171,7 +200,7 @@ class MotionGenerator(nn.Module):
                 attentionMask=textAttentionMask,
             )
 
-        # Predict noise
+        # Predict denoiser output
         if noisyMotion.shape[-1] != self.MOTION_ROTATION_CHANNELS:
             raise ValueError(
                 "Expected rotation-only motion with 6 channels "
@@ -182,14 +211,22 @@ class MotionGenerator(nn.Module):
         if motionMask is not None:
             padMask = ~motionMask.bool()
 
-        predictedNoise = self.denoiser(
+        denoiserOutput = self.denoiser(
             noisyMotion=noisyMotion,
             textEmbedding=textEmbeds,
             timesteps=timesteps,
             mask=padMask,
         )
+        predictedNoise, predictedMotion = self._resolveModelPredictions(
+            noisyMotion=noisyMotion,
+            timesteps=timesteps,
+            modelOutput=denoiserOutput,
+        )
 
-        result = {"predicted_noise": predictedNoise}
+        result = {
+            "predicted_noise": predictedNoise,
+            "predicted_motion": predictedMotion,
+        }
 
         if targetNoise is not None:
             if targetMotion is None:
@@ -204,11 +241,6 @@ class MotionGenerator(nn.Module):
             else:
                 from src.shared.model.generation.losses import combinedGenerationLoss
 
-                predictedMotion = self.ddim.predict_start_from_noise(
-                    noisyMotion,
-                    timesteps,
-                    predictedNoise,
-                )
                 loss, components = combinedGenerationLoss(
                     predictedNoise=predictedNoise,
                     targetNoise=targetNoise,
@@ -219,6 +251,7 @@ class MotionGenerator(nn.Module):
                     xyzWeightSchedule=self.xyzWeightSchedule,
                     velocityXyzWeight=self.velXyzWeight,
                     accelerationWeight=self.accelerationWeight,
+                    predictionTarget=self.predictionTarget,
                     timesteps=timesteps,
                     numTimesteps=self.ddim.num_timesteps,
                     motionMask=motionMask,
@@ -265,7 +298,7 @@ class MotionGenerator(nn.Module):
             prompt,
             padding="max_length",
             truncation=True,
-            max_length=64,
+            max_length=self.maxPromptLength,
             return_tensors="pt",
         )
         inputIds = encoded["input_ids"].to(device)
@@ -284,11 +317,16 @@ class MotionGenerator(nn.Module):
         for i, t in enumerate(timestepSequence):
             tBatch = torch.full((1,), t, device=device, dtype=torch.long)
 
-            # Predict noise
-            predictedNoise = self.denoiser(
+            # Predict denoiser output, then resolve epsilon/x0 pair.
+            denoiserOutput = self.denoiser(
                 noisyMotion=x,
                 textEmbedding=textEmbeds,
                 timesteps=tBatch,
+            )
+            predictedNoise, _ = self._resolveModelPredictions(
+                noisyMotion=x,
+                timesteps=tBatch,
+                modelOutput=denoiserOutput,
             )
 
             # DDIM step
@@ -367,6 +405,37 @@ class MotionGenerator(nn.Module):
         xPrev = sqrtAlphaTprev * x0Pred + dirXt
 
         return xPrev
+
+    def _resolveModelPredictions(
+        self,
+        noisyMotion: torch.Tensor,
+        timesteps: torch.Tensor,
+        modelOutput: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Convert the denoiser output into both epsilon and x0 views.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            Predicted epsilon and predicted clean motion x0.
+        """
+        if self.predictionTarget == PREDICTION_TARGET_EPSILON:
+            predictedNoise = modelOutput
+            predictedMotion = self.ddim.predict_start_from_noise(
+                noisyMotion,
+                timesteps,
+                predictedNoise,
+            )
+            return predictedNoise, predictedMotion
+
+        predictedMotion = modelOutput
+        predictedNoise = self.ddim.predict_noise_from_start(
+            noisyMotion,
+            timesteps,
+            predictedMotion,
+        )
+        return predictedNoise, predictedMotion
 
     def _sixdToQuaternion(self, sixd: torch.Tensor) -> torch.Tensor:
         """

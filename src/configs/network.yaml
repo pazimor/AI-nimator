@@ -2,8 +2,8 @@
 # Network Architecture Configuration
 # ============================================
 # This file defines the neural network architecture for both
-# CLIP and Generation models. The embed-dim is shared between
-# both models to ensure compatibility.
+# CLIP and Generation models. The top-level embed-dim configures
+# CLIP, while generation.embed-dim can override the denoiser width.
 # ============================================
 
 
@@ -12,7 +12,7 @@
 # Default profile for local development
 # ============================================
 default:
-  # Shared embedding dimension (MUST be the same for CLIP and Generation)
+  # CLIP embedding dimension (must match the CLIP checkpoint output size)
   embed-dim: 512
   
   # CLIP Motion Encoder Architecture
@@ -22,13 +22,15 @@ default:
   
   # Generation Denoiser Architecture
   generation:
-    num-heads: 2
-    num-layers: 4
+    # Internal denoiser width (can be larger than the CLIP embed-dim)
+    embed-dim: 768
+    num-heads: 4
+    num-layers: 2
     num-bones: 22
-    diffusion-steps: 1000
+    diffusion-steps: 500
     num-spatial-layers: 1
     num-hierarchy-layers: 1
-    num-spatio-temporal-layers: 1
+    num-spatio-temporal-layers: 4
 
 # ============================================
 # Profile: DGX Spark (128GB RAM, GB10 GPU)
@@ -42,6 +44,7 @@ spark:
     motion-num-layers: 4
 
   generation:
+    embed-dim: 512
     num-heads: 8
     num-layers: 8
     num-bones: 22

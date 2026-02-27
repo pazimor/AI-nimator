@@ -3,7 +3,7 @@ paths:
   # Optional: train only on selected preprocessed dataset folders.
   # Ex: ["KIT", "CMU", "ACCAD"]
   # dataset-folders: ["ACCAD", "BioMotionLab_NTroje", "BMLHandball", "BMLmovi", "CMU", "DFaust_67", "EKUT", "Eyes_Japan_Dataset", "HumanEva", "KIT", "MPI_HDM05", "MPI_Limits", "MPI_mosh", "SFU", "SSM_synced", "TotalCapture", "Transitions_mocap"]
-  dataset-folders: ["ACCAD"]
+  dataset-folders: ["ACCAD"] # for quick preview
   checkpoint-dir: output/clip
   # Network architecture is loaded from network.yaml
   network-config: "src/configs/network.yaml"
@@ -25,7 +25,7 @@ training:
   # resume-checkpoint: output/clip/best_model.pt
   
   # Learning Rate (constant)
-  learning-rate: 0.0001
+  learning-rate: 0.00001
 
 # ============================================
 # Profile: DGX Spark (128GB RAM, GB10 GPU)

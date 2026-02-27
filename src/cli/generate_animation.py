@@ -331,7 +331,13 @@ def resolveModelSettings(
     GenerationModelSettings
         Normalized model settings.
     """
-    clipCheckpoint, networkConfig, modelName = loadInferenceSettings(
+    (
+        clipCheckpoint,
+        networkConfig,
+        modelName,
+        maxPromptLength,
+        predictionTarget,
+    ) = loadInferenceSettings(
         configPath,
         profile,
     )
@@ -343,6 +349,8 @@ def resolveModelSettings(
         clipCheckpoint=resolvedClip,
         networkConfigPath=resolvedNetwork,
         profile=profile,
+        maxPromptLength=maxPromptLength,
+        predictionTarget=predictionTarget,
     )
 
 

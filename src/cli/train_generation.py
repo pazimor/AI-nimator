@@ -65,6 +65,24 @@ def buildArgumentParser() -> argparse.ArgumentParser:
             "(example: KIT,CMU,ACCAD)."
         ),
     )
+    parser.add_argument(
+        "--overfit-samples",
+        type=int,
+        default=None,
+        help=(
+            "Enable overfit debug mode on a fixed subset size "
+            "(for example: 16)."
+        ),
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=None,
+        help=(
+            "Override the optimizer learning rate for this run. "
+            "This value is reapplied after resume."
+        ),
+    )
     return parser
 
 
@@ -77,12 +95,14 @@ def main() -> None:
     try:
         configPath = _validateConfigPath(arguments.config)
         config = loadGenerationConfig(configPath, profile=arguments.profile)
-        if arguments.profile:
-            LOGGER.info("Using profile: %s", arguments.profile)
+        selectedProfile = arguments.profile or "training"
+        LOGGER.info("Using profile: %s", selectedProfile)
         result = _runTraining(
             config,
             profile=arguments.profile,
             datasetFolders=_parseFolderList(arguments.dataset_folders),
+            overfitSamples=arguments.overfit_samples,
+            learningRateOverride=arguments.learning_rate,
         )
         
         parser.exit(
@@ -99,6 +119,8 @@ def _runTraining(
     config: GenerationTrainingConfig,
     profile: Optional[str] = None,
     datasetFolders: Optional[list[str]] = None,
+    overfitSamples: Optional[int] = None,
+    learningRateOverride: Optional[float] = None,
 ) -> GenerationTrainingResult:
     """
     Execute the end-to-end training workflow.
@@ -135,9 +157,10 @@ def _runTraining(
         profile=profile,
     )
     LOGGER.info(
-        "Network config: embed_dim=%d, num_heads=%d, num_layers=%d, "
-        "diffusion_steps=%d",
+        "Network config: clip_embed_dim=%d, gen_embed_dim=%d, "
+        "num_heads=%d, num_layers=%d, diffusion_steps=%d",
         networkConfig.embedDim,
+        networkConfig.generation.embedDim,
         networkConfig.generation.numHeads,
         networkConfig.generation.numLayers,
         networkConfig.generation.diffusionSteps,
@@ -146,6 +169,7 @@ def _runTraining(
     # Build model with network config
     model = MotionGenerator(
         embedDim=networkConfig.embedDim,
+        generationEmbedDim=networkConfig.generation.embedDim,
         numHeads=networkConfig.generation.numHeads,
         numLayers=networkConfig.generation.numLayers,
         numBones=networkConfig.generation.numBones,
@@ -160,6 +184,8 @@ def _runTraining(
         numSpatialLayers=networkConfig.generation.numSpatialLayers,
         numHierarchyLayers=networkConfig.generation.numHierarchyLayers,
         numSpatioTemporalLayers=networkConfig.generation.numSpatioTemporalLayers,
+        maxPromptLength=config.training.maxPromptLength,
+        predictionTarget=config.training.predictionTarget,
     ).to(device)
     LOGGER.info(
         "Model initialized with CLIP from %s",
@@ -187,11 +213,67 @@ def _runTraining(
         config.training.velXyzWeight,
         config.training.accelerationWeight,
     )
+    LOGGER.info(
+        "Diffusion parameterization: prediction_target=%s",
+        config.training.predictionTarget,
+    )
+    if config.training.accelerationWeight > 0.1:
+        LOGGER.warning(
+            "Acceleration weight %.4f is high for rotation-only 6D "
+            "training and can dominate optimization. Start near 0.02 "
+            "unless you have a measured reason to increase it.",
+            config.training.accelerationWeight,
+        )
 
     modelMemoryBytes = estimateModelBytes(model)
     memoryConfig = MemoryManagerConfig(
         MM_memoryLimitGB=config.training.MM_memoryLimitGB,
+        clearMpsCache=config.training.clearMpsCache,
     )
+    if not config.training.clearMpsCache:
+        LOGGER.info("MPS cache clearing disabled by config.")
+
+    requestedOverfitSamples = (
+        overfitSamples
+        if overfitSamples is not None
+        else config.training.overfitSamples
+    )
+    if (
+        requestedOverfitSamples is not None
+        and requestedOverfitSamples <= 0
+    ):
+        raise ValueError(
+            "overfit-samples must be a positive integer when provided."
+        )
+
+    useFixedTrainChunk = config.training.fixedTrainChunk
+    selectedValidationSplit = config.training.validationSplit
+    selectedMaxSamplesPerEpoch = config.training.maxSamplesPerEpoch
+    selectedValidationIndicesPath = config.paths.validationIndices
+    selectedResumeCheckpoint = config.training.resumeCheckpoint
+    selectedNumWorkers = config.training.numWorkers
+    if requestedOverfitSamples is not None:
+        useFixedTrainChunk = True
+        selectedValidationSplit = 0.0
+        selectedMaxSamplesPerEpoch = requestedOverfitSamples
+        selectedValidationIndicesPath = None
+        if selectedNumWorkers is None:
+            selectedNumWorkers = 0
+        LOGGER.info(
+            "Overfit mode enabled: %d samples, fixed chunk, "
+            "validation disabled.",
+            requestedOverfitSamples,
+        )
+        if selectedNumWorkers == 0:
+            LOGGER.info(
+                "Overfit mode: using num_workers=0 to avoid worker startup latency."
+            )
+    if selectedValidationSplit <= 0.0:
+        LOGGER.info(
+            "Validation disabled: periodic checkpoints are latest training "
+            "state only; they are not selected on validation."
+        )
+
     selectedFolders = (
         datasetFolders
         if datasetFolders is not None
@@ -200,13 +282,14 @@ def _runTraining(
     datasetManager = DatasetManager(
         datasetRoot=config.paths.datasetRoot,
         batchSize=config.training.batchSize,
-        validationSplit=config.training.validationSplit,
+        validationSplit=selectedValidationSplit,
         modelMemoryBytes=modelMemoryBytes,
         memoryConfig=memoryConfig,
         device=device,
-        validationIndicesPath=config.paths.validationIndices,
-        maxSamplesPerEpoch=config.training.maxSamplesPerEpoch,
+        validationIndicesPath=selectedValidationIndicesPath,
+        maxSamplesPerEpoch=selectedMaxSamplesPerEpoch,
         datasetFolders=selectedFolders,
+        numWorkers=selectedNumWorkers,
     )
     datasetManager.dataset.validateCompatibility(
         modelName=config.training.modelName,
@@ -214,10 +297,28 @@ def _runTraining(
     )
     LOGGER.info("Dataset indexed: %d total samples", datasetManager.totalSize)
 
+    selectedLearningRate = (
+        float(learningRateOverride)
+        if learningRateOverride is not None
+        else float(config.training.learningRate)
+    )
+    if selectedLearningRate <= 0.0:
+        raise ValueError("learning-rate must be strictly positive.")
+
     # Build optimizer
     optimizer = buildOptimizer(
         model=model,
-        learningRate=config.training.learningRate,
+        learningRate=selectedLearningRate,
+    )
+    learningRateSource = (
+        "cli override"
+        if learningRateOverride is not None
+        else "config"
+    )
+    LOGGER.info(
+        "Learning rate (%s): %.6f",
+        learningRateSource,
+        selectedLearningRate,
     )
 
     # Build DDIM scheduler and move to device
@@ -230,27 +331,50 @@ def _runTraining(
     startEpoch = 0
     trainLoss = 0.0
     epochsRun = 0
-    if config.training.fixedTrainChunk:
+    if useFixedTrainChunk:
         LOGGER.info("Using fixed training chunk for overfit testing.")
 
     # Resume from checkpoint if specified
-    if config.training.resumeCheckpoint is not None:
+    if selectedResumeCheckpoint is not None:
         LOGGER.info(
             "Resuming from checkpoint: %s",
-            config.training.resumeCheckpoint,
+            selectedResumeCheckpoint,
         )
-        resumedEpoch, resumedLoss = loadCheckpoint(
-            checkpointPath=config.training.resumeCheckpoint,
-            model=model,
-            optimizer=optimizer,
-        )
-        startEpoch = resumedEpoch
-        bestValLoss = resumedLoss
-        LOGGER.info(
-            "Resumed from epoch %s with loss %.4f",
-            resumedEpoch,
-            resumedLoss,
-        )
+        try:
+            resumedEpoch, resumedLoss = loadCheckpoint(
+                checkpointPath=selectedResumeCheckpoint,
+                model=model,
+                optimizer=optimizer,
+            )
+            startEpoch = resumedEpoch
+            bestValLoss = resumedLoss
+            LOGGER.info(
+                "Resumed from epoch %s with loss %.4f",
+                resumedEpoch,
+                resumedLoss,
+            )
+            resumedLearningRate = float(optimizer.param_groups[0]["lr"])
+            if abs(resumedLearningRate - selectedLearningRate) > 1e-12:
+                LOGGER.warning(
+                    "Checkpoint optimizer LR %.6f differs from requested "
+                    "LR %.6f. Reapplying requested LR.",
+                    resumedLearningRate,
+                    selectedLearningRate,
+                )
+            _setOptimizerLearningRate(optimizer, selectedLearningRate)
+            LOGGER.info(
+                "Learning rate after resume: %.6f",
+                float(optimizer.param_groups[0]["lr"]),
+            )
+        except RuntimeError as error:
+            firstLine = str(error).splitlines()[0]
+            LOGGER.warning(
+                "Skipping resume checkpoint due to incompatible checkpoint "
+                "state: %s",
+                firstLine,
+            )
+            startEpoch = 0
+            bestValLoss = None
 
     # Training loop
     for epochIndex in range(startEpoch, config.training.epochs):
@@ -258,7 +382,7 @@ def _runTraining(
         currentLr = optimizer.param_groups[0]["lr"]
         
         # Get dataloaders for this epoch (auto-rotating)
-        dataloaderIndex = 0 if config.training.fixedTrainChunk else epochIndex
+        dataloaderIndex = 0 if useFixedTrainChunk else epochIndex
         trainLoader, valLoader, chunkInfo = (
             datasetManager.getDataloadersForEpoch(dataloaderIndex)
         )
@@ -274,6 +398,7 @@ def _runTraining(
             totalEpochs=config.training.epochs,
             chunkInfo=chunkInfo,
             memoryLimitGB=config.training.MM_memoryLimitGB,
+            clearMpsCache=config.training.clearMpsCache,
         )
         valLoss: Optional[float] = None
         valComponents = _nanLossComponents()
@@ -315,7 +440,11 @@ def _runTraining(
                     loss=trainLoss,
                     checkpointDir=config.paths.checkpointDir,
                 )
-                LOGGER.info("Saved checkpoint to %s", checkpointPath)
+                LOGGER.info(
+                    "Saved periodic checkpoint to %s "
+                    "(validation disabled; not a best model)",
+                    checkpointPath,
+                )
 
         _logEpochSummary(
             epoch=epochIndex + 1,
@@ -356,6 +485,15 @@ def _parseFolderList(rawValue: str | None) -> list[str] | None:
     return normalized
 
 
+def _setOptimizerLearningRate(
+    optimizer: torch.optim.Optimizer,
+    learningRate: float,
+) -> None:
+    """Apply the requested learning rate to every optimizer param group."""
+    for paramGroup in optimizer.param_groups:
+        paramGroup["lr"] = learningRate
+
+
 def _nanLossComponents() -> dict[str, float]:
     """Return NaN placeholders for epoch summary formatting."""
     return {
@@ -372,6 +510,16 @@ def _nanLossComponents() -> dict[str, float]:
 
 def _formatComponents(components: Mapping[str, float]) -> str:
     """Format train/val component block for epoch summary log."""
+    if _componentsDisabled(
+        components,
+        (
+            "loss_diffusion",
+            "loss_xyz",
+            "loss_vel_xyz",
+            "loss_acceleration",
+        ),
+    ):
+        return "disabled"
     return (
         "diff= %.4f, xyz= %.4f, vel_xyz= %.4f, acc= %.4f"
         % (
@@ -392,6 +540,16 @@ def _safePercent(numerator: float, denominator: float) -> float:
 
 def _formatImpact(components: Mapping[str, float]) -> str:
     """Format weighted contribution ratios for each loss term."""
+    if _componentsDisabled(
+        components,
+        (
+            "contrib_diffusion",
+            "contrib_xyz",
+            "contrib_vel_xyz",
+            "contrib_acceleration",
+        ),
+    ):
+        return "disabled"
     diff = components.get("contrib_diffusion", float("nan"))
     xyz = components.get("contrib_xyz", float("nan"))
     velXyz = components.get("contrib_vel_xyz", float("nan"))
@@ -405,6 +563,18 @@ def _formatImpact(components: Mapping[str, float]) -> str:
             _safePercent(velXyz, total),
             _safePercent(acc, total),
         )
+    )
+
+
+def _componentsDisabled(
+    components: Mapping[str, float],
+    keys: tuple[str, ...],
+) -> bool:
+    """Detect placeholder metric blocks used when validation is disabled."""
+    return all(
+        components.get(key, float("nan"))
+        != components.get(key, float("nan"))
+        for key in keys
     )
 
 

@@ -94,6 +94,42 @@ class DDIM(nn.Module):
         
         return sqrt_recip_alphas_cumprod_t * x_t - sqrt_recipm1_alphas_cumprod_t * noise
 
+    def predict_noise_from_start(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        x_start: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Predict epsilon from x_t and a direct x_0 estimate.
+
+        Parameters
+        ----------
+        x_t : torch.Tensor
+            Noisy data at step t.
+        t : torch.Tensor
+            Timesteps.
+        x_start : torch.Tensor
+            Predicted clean sample x_0.
+
+        Returns
+        -------
+        torch.Tensor
+            Implied noise tensor epsilon.
+        """
+        sqrt_alphas_cumprod_t = self._extract(
+            self.sqrt_alphas_cumprod,
+            t,
+            x_t.shape,
+        )
+        sqrt_one_minus_alphas_cumprod_t = self._extract(
+            self.sqrt_one_minus_alphas_cumprod,
+            t,
+            x_t.shape,
+        )
+        denom = torch.clamp(sqrt_one_minus_alphas_cumprod_t, min=1e-8)
+        return (x_t - sqrt_alphas_cumprod_t * x_start) / denom
+
     def _extract(self, a: torch.Tensor, t: torch.Tensor, x_shape: torch.Size) -> torch.Tensor:
         """
         Extract values from a at indices t and reshape to match x_shape.

@@ -30,6 +30,10 @@ from src.shared.types import (
     GenerationTrainingHyperparameters,
     GenerationTrainingPaths,
 )
+from src.shared.types.generation import (
+    PREDICTION_TARGET_CHOICES,
+    PREDICTION_TARGET_EPSILON,
+)
 from src.shared.types.network import (
     ClipNetworkConfig,
     GenerationNetworkConfig,
@@ -106,15 +110,26 @@ def _parseNetworkConfig(section: Dict[str, Any]) -> NetworkConfig:
     """Parse network configuration from YAML section."""
     clipSection = section.get("clip", {})
     generationSection = section.get("generation", {})
-    
+    clipEmbedDim = int(section.get("embed-dim", 128))
+    generationEmbedDim = int(
+        generationSection.get("embed-dim", clipEmbedDim)
+    )
+    generationNumHeads = int(generationSection.get("num-heads", 4))
+    if generationEmbedDim % generationNumHeads != 0:
+        raise ValueError(
+            "generation.embed-dim must be divisible by generation.num-heads "
+            f"(embed-dim={generationEmbedDim}, num-heads={generationNumHeads})."
+        )
+
     return NetworkConfig(
-        embedDim=int(section.get("embed-dim", 128)),
+        embedDim=clipEmbedDim,
         clip=ClipNetworkConfig(
             motionNumHeads=int(clipSection.get("motion-num-heads", 4)),
             motionNumLayers=int(clipSection.get("motion-num-layers", 2)),
         ),
         generation=GenerationNetworkConfig(
-            numHeads=int(generationSection.get("num-heads", 4)),
+            embedDim=generationEmbedDim,
+            numHeads=generationNumHeads,
             numLayers=int(generationSection.get("num-layers", 6)),
             numBones=int(generationSection.get("num-bones", 22)),
             diffusionSteps=int(generationSection.get("diffusion-steps", 1000)),
@@ -136,7 +151,7 @@ def _defaultNetworkConfig() -> NetworkConfig:
     return NetworkConfig(
         embedDim=128,
         clip=ClipNetworkConfig(),
-        generation=GenerationNetworkConfig(),
+        generation=GenerationNetworkConfig(embedDim=128),
     )
 
 
@@ -359,6 +374,18 @@ def loadGenerationConfig(
         "acceleration-weight",
         GENERATION_DEFAULT_ACCELERATION_WEIGHT,
     )
+    predictionTarget = str(
+        trainingSection.get(
+            "prediction-target",
+            PREDICTION_TARGET_EPSILON,
+        )
+    ).strip().lower()
+    if predictionTarget not in PREDICTION_TARGET_CHOICES:
+        allowed = ", ".join(PREDICTION_TARGET_CHOICES)
+        raise ValueError(
+            "prediction-target must be one of "
+            f"[{allowed}], got {predictionTarget!r}."
+        )
     
     hyperparameters = GenerationTrainingHyperparameters(
         batchSize=_int(
@@ -403,6 +430,19 @@ def loadGenerationConfig(
             "fixed-train-chunk",
             False,
         ),
+        overfitSamples=_optionalInt(
+            trainingSection,
+            "overfit-samples",
+        ),
+        numWorkers=_optionalInt(
+            trainingSection,
+            "num-workers",
+        ),
+        clearMpsCache=_bool(
+            trainingSection,
+            "clear-mps-cache",
+            True,
+        ),
         # Learning Rate
         learningRate=_float(
             trainingSection,
@@ -414,6 +454,7 @@ def loadGenerationConfig(
         velXyzWeight=velXyzWeight,
         diffusionWeight=diffusionWeight,
         accelerationWeight=accelerationWeight,
+        predictionTarget=predictionTarget,
     )
 
     return GenerationTrainingConfig(

@@ -47,9 +47,12 @@ class MemoryManagerConfig:
     MM_memoryLimitGB : float
         Maximum memory usage in GB before triggering cleanup.
         Set to 0 to disable memory-based cleanup.
+    clearMpsCache : bool
+        When False, skip torch.mps.empty_cache() during cleanup.
     """
 
     MM_memoryLimitGB: float = 0.0
+    clearMpsCache: bool = True
 
     @property
     def MM_memoryLimitBytes(self) -> int:
@@ -176,7 +179,10 @@ class MemoryManager:
 
         if self.device is not None:
             if self.device.type == "mps":
-                if hasattr(torch.mps, "empty_cache"):
+                if (
+                    self.config.clearMpsCache
+                    and hasattr(torch.mps, "empty_cache")
+                ):
                     torch.mps.empty_cache()
             elif self.device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -224,6 +230,7 @@ class DatasetManager:
         validationIndicesPath: Optional[Path] = None,
         maxSamplesPerEpoch: Optional[int] = None,
         datasetFolders: Optional[List[str]] = None,
+        numWorkers: Optional[int] = None,
     ) -> None:
         self.datasetRoot = datasetRoot
         self.batchSize = batchSize
@@ -233,6 +240,7 @@ class DatasetManager:
         self.validationIndicesPath = validationIndicesPath
         self.maxSamplesPerEpoch = maxSamplesPerEpoch
         self.datasetFolders = datasetFolders
+        self.numWorkers = numWorkers
 
         self.memoryConfig = memoryConfig or MemoryManagerConfig()
         self.memoryManager = MemoryManager(self.memoryConfig, device)
@@ -431,7 +439,12 @@ class DatasetManager:
         shuffle: bool = True,
     ) -> DataLoader:
         """Create a dataloader with custom collation."""
-        numWorkers = _resolveNumWorkers()
+        numWorkers = (
+            self.numWorkers
+            if self.numWorkers is not None
+            else _resolveNumWorkers()
+        )
+        numWorkers = max(int(numWorkers), 0)
         pinMemory = self.device is not None and self.device.type == "cuda"
         persistentWorkers = numWorkers > 0
         prefetchFactor = DEFAULT_PREFETCH_FACTOR if numWorkers > 0 else None

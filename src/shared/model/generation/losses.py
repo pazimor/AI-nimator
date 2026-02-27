@@ -10,6 +10,10 @@ from src.shared.constants.skeletons import (
     SMPL22_DEFAULT_OFFSETS,
     SMPL22_HIERARCHY,
 )
+from src.shared.types.generation import (
+    PREDICTION_TARGET_EPSILON,
+    PREDICTION_TARGET_X0,
+)
 
 DEFAULT_DIFFUSION_WEIGHT = 1.0
 DEFAULT_XYZ_WEIGHT = 0.1
@@ -44,6 +48,32 @@ def diffusionLoss(
         Scalar MSE loss.
     """
     squaredError = (predictedNoise - targetNoise) ** 2
+    return _maskedMean(squaredError, motionMask)
+
+
+def startMotionLoss(
+    predictedMotion: torch.Tensor,
+    targetMotion: torch.Tensor,
+    motionMask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Direct MSE on predicted clean motion x0 (MDM-style target).
+
+    Parameters
+    ----------
+    predictedMotion : torch.Tensor
+        Predicted clean motion shaped (batch, frames, bones, 6).
+    targetMotion : torch.Tensor
+        Ground truth clean motion shaped (batch, frames, bones, 6).
+    motionMask : torch.Tensor | None, optional
+        Boolean mask indicating valid (non-padded) frames.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar masked MSE in raw motion space.
+    """
+    squaredError = (predictedMotion - targetMotion) ** 2
     return _maskedMean(squaredError, motionMask)
 
 
@@ -196,6 +226,7 @@ def combinedGenerationLoss(
     velocityXyzWeight: float | None = None,
     accelerationWeight: float = DEFAULT_ACCELERATION_WEIGHT,
     xyzWeightSchedule: str = XYZ_SCHEDULE_NONE,
+    predictionTarget: str = PREDICTION_TARGET_EPSILON,
     timesteps: torch.Tensor | None = None,
     numTimesteps: int | None = None,
     motionMask: torch.Tensor | None = None,
@@ -226,6 +257,8 @@ def combinedGenerationLoss(
         Weight for acceleration loss, by default 0.001.
     xyzWeightSchedule : str, optional
         Schedule mode for XYZ weight, by default "none".
+    predictionTarget : str, optional
+        Main denoiser target ("epsilon" or "x0").
     timesteps : torch.Tensor | None, optional
         Diffusion timesteps for schedule-aware weighting.
     numTimesteps : int | None, optional
@@ -238,7 +271,18 @@ def combinedGenerationLoss(
     tuple[torch.Tensor, dict[str, torch.Tensor]]
         Total loss and dictionary of individual loss components.
     """
-    lossDiff = diffusionLoss(predictedNoise, targetNoise, motionMask)
+    if predictionTarget == PREDICTION_TARGET_X0:
+        lossDiff = startMotionLoss(
+            predictedMotion,
+            targetMotion,
+            motionMask=motionMask,
+        )
+    elif predictionTarget == PREDICTION_TARGET_EPSILON:
+        lossDiff = diffusionLoss(predictedNoise, targetNoise, motionMask)
+    else:
+        raise ValueError(
+            f"Unknown predictionTarget: {predictionTarget!r}"
+        )
     lossXyz = xyzLoss(
         predictedMotion,
         targetMotion,

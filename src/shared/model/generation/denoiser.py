@@ -291,6 +291,7 @@ class MotionDenoiser(nn.Module):
         numSpatialLayers: int = 1,
         numHierarchyLayers: int = 1,
         numSpatioTemporalLayers: int = 1,
+        textEmbedDim: Optional[int] = None,
     ) -> None:
         """
         Initialize MotionDenoiser.
@@ -315,16 +316,27 @@ class MotionDenoiser(nn.Module):
             Number of directed hierarchy blocks after bone split.
         numSpatioTemporalLayers : int, optional
             Number of local spatio-temporal mixing blocks.
+        textEmbedDim : Optional[int], optional
+            Dimension of the incoming text embedding before projection.
+            Defaults to ``embedDim`` when omitted.
         """
         super().__init__()
+        if embedDim % numHeads != 0:
+            raise ValueError(
+                "Generation embedDim must be divisible by numHeads "
+                f"(embedDim={embedDim}, numHeads={numHeads})."
+            )
         self.embedDim = embedDim
+        self.textEmbedDim = (
+            embedDim if textEmbedDim is None else int(textEmbedDim)
+        )
         self.numBones = numBones
         self.motionChannels = motionChannels
 
         # Input projections
         self.boneProj = nn.Linear(motionChannels, embedDim)
         self.frameProj = nn.Linear(numBones * embedDim, embedDim)
-        self.textProj = nn.Linear(embedDim, embedDim)
+        self.textProj = nn.Linear(self.textEmbedDim, embedDim)
         self.textAdapter = nn.Sequential(
             nn.LayerNorm(embedDim),
             nn.Linear(embedDim, embedDim * 2),
@@ -393,7 +405,7 @@ class MotionDenoiser(nn.Module):
         noisyMotion : torch.Tensor
             Noisy motion shaped (batch, frames, bones, 6).
         textEmbedding : torch.Tensor
-            CLIP text embedding shaped (batch, embedDim).
+            Text embedding shaped (batch, textEmbedDim).
         timesteps : torch.Tensor
             Diffusion timesteps shaped (batch,).
         mask : Optional[torch.Tensor], optional

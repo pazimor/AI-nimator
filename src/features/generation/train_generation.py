@@ -12,6 +12,10 @@ from typing import Iterable, Mapping, Optional, Tuple
 import torch
 from torch.utils.data import DataLoader
 
+from src.shared.types.generation import (
+    PREDICTION_TARGET_EPSILON,
+)
+
 # Limit CPU threads to reduce memory usage
 os.environ.setdefault("OMP_NUM_THREADS", "2")
 os.environ.setdefault("MKL_NUM_THREADS", "2")
@@ -198,6 +202,7 @@ def trainOneEpoch(
     totalEpochs: int = 1,
     chunkInfo: Optional[str] = None,
     memoryLimitGB: float = 0.0,
+    clearMpsCache: bool = True,
 ) -> tuple[float, LossComponents]:
     """
     Run a single training epoch.
@@ -224,6 +229,8 @@ def trainOneEpoch(
         Optional description of current dataset chunk.
     memoryLimitGB : float
         Maximum memory usage in GB before triggering cleanup (0 = disabled).
+    clearMpsCache : bool
+        When False, skip explicit torch.mps.empty_cache() calls.
 
     Returns
     -------
@@ -237,7 +244,10 @@ def trainOneEpoch(
     componentSums = _initLossComponents()
     
     # Setup memory manager
-    memoryConfig = MemoryManagerConfig(MM_memoryLimitGB=memoryLimitGB)
+    memoryConfig = MemoryManagerConfig(
+        MM_memoryLimitGB=memoryLimitGB,
+        clearMpsCache=clearMpsCache,
+    )
     memoryManager = MemoryManager(memoryConfig, device)
     memoryManager.logMemoryStatus("epoch start")
 
@@ -284,14 +294,14 @@ def trainOneEpoch(
                 accumSteps = 0
                 
                 # Clear MPS cache after optimizer step
-                if device.type == "mps":
+                if clearMpsCache and device.type == "mps":
                     torch.mps.empty_cache()
                     
             # Check memory and cleanup if needed
             memoryManager.checkAndCleanup(numBatches)
 
         gc.collect()
-        if device.type == "mps":
+        if clearMpsCache and device.type == "mps":
             torch.mps.empty_cache()
         avgComponents = _averageLossComponents(componentSums, numBatches)
         return pbar.metrics.avgLoss, avgComponents
@@ -610,6 +620,11 @@ def saveCheckpoint(
             "denoiser_state_dict": model.denoiser.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "loss": loss,
+            "prediction_target": getattr(
+                model,
+                "predictionTarget",
+                PREDICTION_TARGET_EPSILON,
+            ),
         },
         checkpointPath,
     )
@@ -644,6 +659,33 @@ def loadCheckpoint(
         weights_only=False,
         map_location="cpu",
     )
+    checkpointPredictionTarget = checkpoint.get("prediction_target")
+    modelPredictionTarget = getattr(model, "predictionTarget", None)
+    if modelPredictionTarget is not None:
+        if checkpointPredictionTarget is None:
+            if (
+                optimizer is not None
+                and modelPredictionTarget != PREDICTION_TARGET_EPSILON
+            ):
+                raise RuntimeError(
+                    "Checkpoint is missing prediction_target metadata. "
+                    "It predates configurable diffusion parameterization "
+                    f"and cannot safely resume in {modelPredictionTarget!r} "
+                    "mode."
+                )
+        else:
+            checkpointPredictionTarget = str(
+                checkpointPredictionTarget
+            ).strip().lower()
+            if optimizer is not None:
+                if checkpointPredictionTarget != modelPredictionTarget:
+                    raise RuntimeError(
+                        "Checkpoint prediction_target "
+                        f"{checkpointPredictionTarget!r} does not match "
+                        f"configured mode {modelPredictionTarget!r}."
+                    )
+            else:
+                model.predictionTarget = checkpointPredictionTarget
 
     # Try to load full model state first, fallback to denoiser only
     if "model_state_dict" in checkpoint:

@@ -57,6 +57,8 @@ class GenerationNetworkConfig:
     
     Attributes
     ----------
+    embedDim : int
+        Hidden width of the generation denoiser.
     numHeads : int
         Number of attention heads in the denoiser.
     numLayers : int
@@ -73,6 +75,7 @@ class GenerationNetworkConfig:
         Number of local spatio-temporal blocks near bone split.
     """
     
+    embedDim: int = 128
     numHeads: int = 4
     numLayers: int = 6
     numBones: int = 22
@@ -87,16 +90,16 @@ class NetworkConfig:
     """
     Complete network architecture configuration.
     
-    Loaded from network.yaml and shared between CLIP and Generation.
+    Loaded from network.yaml.
     
     Attributes
     ----------
     embedDim : int
-        Shared embedding dimension (must match between CLIP and Generation).
+        CLIP embedding dimension used by the frozen text encoder.
     clip : ClipNetworkConfig
         CLIP motion encoder configuration.
     generation : GenerationNetworkConfig
-        Generation denoiser configuration.
+        Generation denoiser configuration, including its own width.
     """
     
     embedDim: int
