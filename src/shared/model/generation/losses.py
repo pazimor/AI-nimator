@@ -10,10 +10,6 @@ from src.shared.constants.skeletons import (
     SMPL22_DEFAULT_OFFSETS,
     SMPL22_HIERARCHY,
 )
-from src.shared.types.generation import (
-    PREDICTION_TARGET_EPSILON,
-    PREDICTION_TARGET_X0,
-)
 
 DEFAULT_DIFFUSION_WEIGHT = 1.0
 DEFAULT_XYZ_WEIGHT = 0.1
@@ -216,8 +212,6 @@ def accelerationLoss(
 
 
 def combinedGenerationLoss(
-    predictedNoise: torch.Tensor,
-    targetNoise: torch.Tensor,
     predictedMotion: torch.Tensor,
     targetMotion: torch.Tensor,
     diffusionWeight: float = DEFAULT_DIFFUSION_WEIGHT,
@@ -226,7 +220,6 @@ def combinedGenerationLoss(
     velocityXyzWeight: float | None = None,
     accelerationWeight: float = DEFAULT_ACCELERATION_WEIGHT,
     xyzWeightSchedule: str = XYZ_SCHEDULE_NONE,
-    predictionTarget: str = PREDICTION_TARGET_EPSILON,
     timesteps: torch.Tensor | None = None,
     numTimesteps: int | None = None,
     motionMask: torch.Tensor | None = None,
@@ -236,12 +229,8 @@ def combinedGenerationLoss(
 
     Parameters
     ----------
-    predictedNoise : torch.Tensor
-        Predicted noise from denoiser.
-    targetNoise : torch.Tensor
-        Ground truth noise.
     predictedMotion : torch.Tensor
-        Reconstructed motion (for regularization).
+        Predicted clean motion (x0) from the denoiser.
     targetMotion : torch.Tensor
         Ground truth motion.
     diffusionWeight : float, optional
@@ -257,8 +246,6 @@ def combinedGenerationLoss(
         Weight for acceleration loss, by default 0.001.
     xyzWeightSchedule : str, optional
         Schedule mode for XYZ weight, by default "none".
-    predictionTarget : str, optional
-        Main denoiser target ("epsilon" or "x0").
     timesteps : torch.Tensor | None, optional
         Diffusion timesteps for schedule-aware weighting.
     numTimesteps : int | None, optional
@@ -271,18 +258,11 @@ def combinedGenerationLoss(
     tuple[torch.Tensor, dict[str, torch.Tensor]]
         Total loss and dictionary of individual loss components.
     """
-    if predictionTarget == PREDICTION_TARGET_X0:
-        lossDiff = startMotionLoss(
-            predictedMotion,
-            targetMotion,
-            motionMask=motionMask,
-        )
-    elif predictionTarget == PREDICTION_TARGET_EPSILON:
-        lossDiff = diffusionLoss(predictedNoise, targetNoise, motionMask)
-    else:
-        raise ValueError(
-            f"Unknown predictionTarget: {predictionTarget!r}"
-        )
+    lossDiff = startMotionLoss(
+        predictedMotion,
+        targetMotion,
+        motionMask=motionMask,
+    )
     lossXyz = xyzLoss(
         predictedMotion,
         targetMotion,
@@ -293,7 +273,7 @@ def combinedGenerationLoss(
         xyzWeightSchedule,
         timesteps,
         numTimesteps,
-        predictedNoise.device,
+        predictedMotion.device,
     )
     resolvedVelocityXyzWeight = (
         velocityWeight
@@ -319,11 +299,6 @@ def combinedGenerationLoss(
         + lossAcc
     )
 
-    contribDiffusion = (diffusionWeight * lossDiff).detach()
-    contribXyz = (weightedXyz * lossXyz).detach()
-    contribVelXyz = lossVel.detach()
-    contribAcceleration = lossAcc.detach()
-
     components = {
         "loss_diffusion": lossDiff.detach(),
         "loss_xyz": lossXyz.detach(),
@@ -331,10 +306,6 @@ def combinedGenerationLoss(
         # Backward-compatibility alias used in older logs/consumers.
         "loss_velocity": lossVel.detach(),
         "loss_acceleration": lossAcc.detach(),
-        "contrib_diffusion": contribDiffusion,
-        "contrib_xyz": contribXyz,
-        "contrib_vel_xyz": contribVelXyz,
-        "contrib_acceleration": contribAcceleration,
     }
 
     return total, components

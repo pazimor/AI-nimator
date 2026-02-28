@@ -51,13 +51,9 @@ def test_combinedLoss_reports_xyz_component() -> None:
     targetMotion = _randomMotion(batchSize=1, frameCount=4)
     predictedMotion = targetMotion.clone()
     predictedMotion[:, :, 0, 0] = predictedMotion[:, :, 0, 0] + 0.2
-    targetNoise = torch.zeros_like(targetMotion)
-    predictedNoise = torch.zeros_like(targetMotion)
     mask = torch.ones(targetMotion.shape[:2], dtype=torch.bool)
 
     totalLoss, components = combinedGenerationLoss(
-        predictedNoise=predictedNoise,
-        targetNoise=targetNoise,
         predictedMotion=predictedMotion,
         targetMotion=targetMotion,
         diffusionWeight=0.0,
@@ -71,16 +67,31 @@ def test_combinedLoss_reports_xyz_component() -> None:
     assert torch.isclose(totalLoss.detach(), expected, atol=1e-6)
 
 
-def test_combinedLoss_reports_weighted_contributions() -> None:
+def test_combinedLoss_uses_x0_for_diffusion_term() -> None:
+    targetMotion = _randomMotion(batchSize=1, frameCount=4)
+    predictedMotion = targetMotion.clone()
+    predictedMotion[:, :, 0, 0] = predictedMotion[:, :, 0, 0] + 0.25
+
+    totalLoss, components = combinedGenerationLoss(
+        predictedMotion=predictedMotion,
+        targetMotion=targetMotion,
+        diffusionWeight=1.0,
+        xyzWeight=0.0,
+        velocityWeight=0.0,
+        accelerationWeight=0.0,
+    )
+
+    expected = ((predictedMotion - targetMotion) ** 2).mean()
+    assert torch.isclose(components["loss_diffusion"], expected, atol=1e-6)
+    assert torch.isclose(totalLoss.detach(), expected, atol=1e-6)
+
+
+def test_combinedLoss_matches_weighted_component_sum() -> None:
     targetMotion = _randomMotion(batchSize=1, frameCount=5)
     predictedMotion = targetMotion.clone()
     predictedMotion[:, :, 0, 0] = predictedMotion[:, :, 0, 0] + 0.1
-    targetNoise = torch.zeros_like(targetMotion)
-    predictedNoise = torch.ones_like(targetMotion) * 0.2
 
     totalLoss, components = combinedGenerationLoss(
-        predictedNoise=predictedNoise,
-        targetNoise=targetNoise,
         predictedMotion=predictedMotion,
         targetMotion=targetMotion,
         diffusionWeight=0.7,
@@ -89,13 +100,13 @@ def test_combinedLoss_reports_weighted_contributions() -> None:
         accelerationWeight=0.4,
     )
 
-    contribSum = (
-        components["contrib_diffusion"]
-        + components["contrib_xyz"]
-        + components["contrib_vel_xyz"]
-        + components["contrib_acceleration"]
+    expected = (
+        0.7 * components["loss_diffusion"]
+        + 1.3 * components["loss_xyz"]
+        + components["loss_vel_xyz"]
+        + components["loss_acceleration"]
     )
-    assert torch.isclose(totalLoss.detach(), contribSum, atol=1e-6)
+    assert torch.isclose(totalLoss.detach(), expected, atol=1e-6)
 
 
 def test_velocityXyzLoss_is_zero_for_identical_motion() -> None:
@@ -126,12 +137,8 @@ def test_combinedLoss_can_disable_vel_xyz_and_acc() -> None:
     targetMotion = _randomMotion(batchSize=1, frameCount=5)
     predictedMotion = targetMotion.clone()
     predictedMotion[:, 2:, :, :] = predictedMotion[:, 2:, :, :] + 0.3
-    targetNoise = torch.zeros_like(targetMotion)
-    predictedNoise = torch.zeros_like(targetMotion)
 
     _, components = combinedGenerationLoss(
-        predictedNoise=predictedNoise,
-        targetNoise=targetNoise,
         predictedMotion=predictedMotion,
         targetMotion=targetMotion,
         diffusionWeight=0.0,
@@ -140,9 +147,9 @@ def test_combinedLoss_can_disable_vel_xyz_and_acc() -> None:
         accelerationWeight=0.0,
     )
 
-    assert torch.isclose(components["contrib_vel_xyz"], torch.tensor(0.0))
+    assert torch.isclose(components["loss_vel_xyz"], torch.tensor(0.0))
     assert torch.isclose(
-        components["contrib_acceleration"],
+        components["loss_acceleration"],
         torch.tensor(0.0),
     )
 

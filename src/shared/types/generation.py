@@ -6,12 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
-PREDICTION_TARGET_EPSILON = "epsilon"
 PREDICTION_TARGET_X0 = "x0"
-PREDICTION_TARGET_CHOICES = (
-    PREDICTION_TARGET_EPSILON,
-    PREDICTION_TARGET_X0,
-)
 
 
 @dataclass(frozen=True)
@@ -67,10 +62,9 @@ class GenerationTrainingHyperparameters:
         Optional cap for samples per epoch.
     fixedTrainChunk : bool
         When True, reuse the same training chunk each epoch.
-    overfitSamples : Optional[int]
-        Optional fixed subset size for overfit debugging mode.
-    numWorkers : Optional[int]
-        Optional dataloader worker override. Use 0 to avoid worker spawn.
+    overfitSamples : Optional[str]
+        Optional overfit selector. Accepts either a fixed subset size
+        ("16") or a 1-based inclusive range ("3:6").
     clearMpsCache : bool
         When False, skip explicit calls to torch.mps.empty_cache().
     
@@ -88,11 +82,9 @@ class GenerationTrainingHyperparameters:
     velXyzWeight : float
         Velocity matching weight in joint XYZ space.
     diffusionWeight : float
-        Weight for diffusion noise prediction loss.
+        Weight for the main x0 diffusion loss.
     accelerationWeight : float
         Weight for acceleration regularization loss.
-    predictionTarget : str
-        Diffusion parameterization target ("epsilon" or "x0").
     """
 
     batchSize: int
@@ -107,8 +99,7 @@ class GenerationTrainingHyperparameters:
     gradientAccumulation: int = 1  # Accumulate gradients over N batches
     maxSamplesPerEpoch: Optional[int] = None
     fixedTrainChunk: bool = False
-    overfitSamples: Optional[int] = None
-    numWorkers: Optional[int] = None
+    overfitSamples: Optional[str] = None
     clearMpsCache: bool = True
     
     # Learning Rate
@@ -118,7 +109,6 @@ class GenerationTrainingHyperparameters:
     velXyzWeight: float = 0.01
     diffusionWeight: float = 1.0
     accelerationWeight: float = 0.0
-    predictionTarget: str = PREDICTION_TARGET_EPSILON
 
 
 @dataclass(frozen=True)
@@ -187,8 +177,6 @@ class GenerationModelSettings:
         Optional network profile name to load.
     maxPromptLength : int
         Maximum tokenizer prompt length used during generation.
-    predictionTarget : str
-        Diffusion parameterization target used by the model.
     """
 
     modelName: str
@@ -196,7 +184,6 @@ class GenerationModelSettings:
     networkConfigPath: Optional[Path] = None
     profile: Optional[str] = None
     maxPromptLength: int = 64
-    predictionTarget: str = PREDICTION_TARGET_EPSILON
 
 
 @dataclass(frozen=True)

@@ -69,8 +69,6 @@ class GenerationNetworkConfig:
         Number of diffusion timesteps.
     numSpatialLayers : int
         Number of spatial GCN blocks near bone split.
-    numHierarchyLayers : int
-        Number of directed hierarchy blocks near bone split.
     numSpatioTemporalLayers : int
         Number of local spatio-temporal blocks near bone split.
     """
@@ -81,7 +79,6 @@ class GenerationNetworkConfig:
     numBones: int = 22
     diffusionSteps: int = 1000
     numSpatialLayers: int = 1
-    numHierarchyLayers: int = 1
     numSpatioTemporalLayers: int = 1
 
 

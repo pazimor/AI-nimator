@@ -1,15 +1,12 @@
 paths:
   dataset-root: "/Users/pazimor/dataset_preprocessed"
-  # Optional: train only on selected preprocessed dataset folders.
-  # Ex: ["KIT", "CMU", "ACCAD"]
-  dataset-folders: ["ACCAD"]
-  clip-checkpoint: "output/clip/best_model-512-quat.pt"
-  checkpoint-dir: "output/generation"
+  dataset-folders: ["ACCAD", "BioMotionLab_NTroje", "BMLHandball", "BMLmovi", "CMU", "DFaust_67", "EKUT", "Eyes_Japan_Dataset", "HumanEva", "KIT", "MPI_HDM05", "MPI_Limits", "MPI_mosh", "SFU", "SSM_synced", "TotalCapture", "Transitions_mocap"]
+  clip-checkpoint: "../../output/clip/best_model-512-quat.pt"
+  checkpoint-dir: "../../output/generation"
+  
   # Network architecture is loaded from network.yaml
   network-config: "network.yaml"
-  # Use an ACCAD-specific split file to avoid reusing stale indices
-  # generated from another dataset scope.
-  validation-indices: "output/generation/validation_indices_accad.json"
+  validation-indices: "../../output/generation/validation_indices.json"
 
 # ============================================
 # Profile: Mac (32GB RAM, MPS GPU)
@@ -33,7 +30,6 @@ training:
   vel-xyz-weight: 1.0
   diffusion-weight: 1.0
   acceleration-weight: 0.02
-  prediction-target: epsilon
 
 # ============================================
 # Profile: Overfit 16
@@ -49,44 +45,17 @@ overfit:
   gradient-accumulation: 1
   max-samples-per-epoch: 10000
   
-  # overfit 
-  overfit-samples: 16
-  num-workers: 0
+  # overfit: fixed count ("16") or 1-based inclusive range ("3:6")
+  overfit-samples: "3:6"
   clear-mps-cache: false
 
   MM-memory-limit-gb: 20.0
   # Leave null by default; pass a checkpoint only when architecture matches.
-  resume-checkpoint: output/generation/best_model.pt
+  resume-checkpoint: output/generation/best_model.pt # null
   
-  learning-rate: 0.0000001
+  learning-rate: 0.00001
   xyz-weight: 1.0
   xyz-weight-schedule: timestep
   vel-xyz-weight: 1.0
   diffusion-weight: 1.0
   acceleration-weight: 0.0
-  prediction-target: x0
-
-# ============================================
-# Profile: DGX Spark (128GB RAM, GB10 GPU)
-# Use with: --profile spark
-# ============================================
-spark:
-  epochs: 200
-  device: cuda
-  max-length: 256
-  model-name: xlm-roberta-base
-  validation-split: 0.01
-  early-stopping-patience: 30
-  batch-size: 8 # replace with 32 after benchmarking
-  gradient-accumulation: 1
-  max-samples-per-epoch: 10000 # replace to null after benchmarking
-  MM-memory-limit-gb: 100.0
-  resume-checkpoint: output/generation/best_model.pt
-  
-  learning-rate: 0.001
-  xyz-weight: 10.0
-  xyz-weight-schedule: timestep
-  vel-xyz-weight: 1.0
-  diffusion-weight: 1.0
-  acceleration-weight: 0.02
-  prediction-target: epsilon

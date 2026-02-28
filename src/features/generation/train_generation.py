@@ -12,9 +12,7 @@ from typing import Iterable, Mapping, Optional, Tuple
 import torch
 from torch.utils.data import DataLoader
 
-from src.shared.types.generation import (
-    PREDICTION_TARGET_EPSILON,
-)
+from src.shared.types.generation import PREDICTION_TARGET_X0
 
 # Limit CPU threads to reduce memory usage
 os.environ.setdefault("OMP_NUM_THREADS", "2")
@@ -44,10 +42,6 @@ LOSS_COMPONENT_KEYS = (
     "loss_xyz",
     "loss_vel_xyz",
     "loss_acceleration",
-    "contrib_diffusion",
-    "contrib_xyz",
-    "contrib_vel_xyz",
-    "contrib_acceleration",
 )
 LOSS_COMPONENT_LABELS = {
     "loss_xyz": "xyz",
@@ -620,11 +614,7 @@ def saveCheckpoint(
             "denoiser_state_dict": model.denoiser.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "loss": loss,
-            "prediction_target": getattr(
-                model,
-                "predictionTarget",
-                PREDICTION_TARGET_EPSILON,
-            ),
+            "prediction_target": PREDICTION_TARGET_X0,
         },
         checkpointPath,
     )
@@ -660,32 +650,21 @@ def loadCheckpoint(
         map_location="cpu",
     )
     checkpointPredictionTarget = checkpoint.get("prediction_target")
-    modelPredictionTarget = getattr(model, "predictionTarget", None)
-    if modelPredictionTarget is not None:
-        if checkpointPredictionTarget is None:
-            if (
-                optimizer is not None
-                and modelPredictionTarget != PREDICTION_TARGET_EPSILON
-            ):
-                raise RuntimeError(
-                    "Checkpoint is missing prediction_target metadata. "
-                    "It predates configurable diffusion parameterization "
-                    f"and cannot safely resume in {modelPredictionTarget!r} "
-                    "mode."
-                )
-        else:
-            checkpointPredictionTarget = str(
-                checkpointPredictionTarget
-            ).strip().lower()
-            if optimizer is not None:
-                if checkpointPredictionTarget != modelPredictionTarget:
-                    raise RuntimeError(
-                        "Checkpoint prediction_target "
-                        f"{checkpointPredictionTarget!r} does not match "
-                        f"configured mode {modelPredictionTarget!r}."
-                    )
-            else:
-                model.predictionTarget = checkpointPredictionTarget
+    if checkpointPredictionTarget is None:
+        raise RuntimeError(
+            "Checkpoint is missing prediction_target metadata. "
+            "Older epsilon checkpoints are not supported by the "
+            "x0-only generation pipeline."
+        )
+    checkpointPredictionTarget = str(
+        checkpointPredictionTarget
+    ).strip().lower()
+    if checkpointPredictionTarget != PREDICTION_TARGET_X0:
+        raise RuntimeError(
+            "Checkpoint prediction_target "
+            f"{checkpointPredictionTarget!r} is not supported. "
+            "Only x0 checkpoints can be loaded."
+        )
 
     # Try to load full model state first, fallback to denoiser only
     if "model_state_dict" in checkpoint:

@@ -7,12 +7,6 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-
-from src.shared.constants.skeletons import (
-    SMPL22_BONE_ORDER,
-    SMPL22_HIERARCHY,
-    SMPL24_BONE_ORDER,
-)
 from src.shared.model.layers.attention import MultiHeadAttention
 from src.shared.model.layers.normalization import AdaLN, FiLM
 from src.shared.model.layers.positional import RoPE
@@ -157,85 +151,6 @@ class DenoiserBlock(nn.Module):
         h = self.transform(h)
 
         return h
-
-
-def _buildHierarchyAdjacency(numBones: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Build directed hierarchy adjacency matrices for parent/child aggregation.
-    """
-    if numBones == len(SMPL22_BONE_ORDER):
-        boneOrder = SMPL22_BONE_ORDER
-        hierarchy: dict[str, Optional[str]] = dict(SMPL22_HIERARCHY)
-    elif numBones == len(SMPL24_BONE_ORDER):
-        boneOrder = SMPL24_BONE_ORDER
-        hierarchy = dict(SMPL22_HIERARCHY)
-        hierarchy["leftHand"] = "leftWrist"
-        hierarchy["rightHand"] = "rightWrist"
-    else:
-        identity = torch.eye(numBones, dtype=torch.float32)
-        return identity, identity
-
-    index = {name: idx for idx, name in enumerate(boneOrder)}
-    parentAdj = torch.eye(numBones, dtype=torch.float32)
-    childAdj = torch.eye(numBones, dtype=torch.float32)
-
-    for child, parent in hierarchy.items():
-        if parent is None:
-            continue
-        childIdx = index.get(child)
-        parentIdx = index.get(parent)
-        if childIdx is None or parentIdx is None:
-            continue
-        parentAdj[childIdx, parentIdx] = 1.0
-        childAdj[parentIdx, childIdx] = 1.0
-
-    parentDegree = parentAdj.sum(dim=1, keepdim=True).clamp(min=1.0)
-    childDegree = childAdj.sum(dim=1, keepdim=True).clamp(min=1.0)
-    return parentAdj / parentDegree, childAdj / childDegree
-
-
-class BoneHierarchyBlock(nn.Module):
-    """
-    Directed hierarchy mixing block over bones for each frame.
-    """
-
-    def __init__(
-        self,
-        numBones: int,
-        embedDim: int,
-        dropout: float = 0.0,
-    ) -> None:
-        super().__init__()
-        parentAdj, childAdj = _buildHierarchyAdjacency(numBones)
-        self.register_buffer("parentAdjacency", parentAdj)
-        self.register_buffer("childAdjacency", childAdj)
-        self.selfLinear = nn.Linear(embedDim, embedDim)
-        self.parentLinear = nn.Linear(embedDim, embedDim)
-        self.childLinear = nn.Linear(embedDim, embedDim)
-        self.activation = nn.SiLU()
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(embedDim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Apply directed parent/child aggregation.
-        """
-        batch, frames, bones, embedDim = x.shape
-        h = x.reshape(batch * frames, bones, embedDim)
-        parentMix = torch.matmul(self.parentAdjacency, h)
-        childMix = torch.matmul(self.childAdjacency, h)
-        mixed = (
-            self.selfLinear(h)
-            + self.parentLinear(parentMix)
-            + self.childLinear(childMix)
-        )
-        mixed = self.activation(mixed)
-        mixed = self.dropout(mixed)
-        mixed = self.norm(mixed)
-        mixed = mixed.reshape(batch, frames, bones, embedDim)
-        return x + mixed
-
-
 class SpatioTemporalMixBlock(nn.Module):
     """
     Local spatio-temporal mixing over (frames, bones) right after split.
@@ -289,7 +204,6 @@ class MotionDenoiser(nn.Module):
         motionChannels: int = 6,
         dropout: float = 0.1,
         numSpatialLayers: int = 1,
-        numHierarchyLayers: int = 1,
         numSpatioTemporalLayers: int = 1,
         textEmbedDim: Optional[int] = None,
     ) -> None:
@@ -312,8 +226,6 @@ class MotionDenoiser(nn.Module):
             Dropout rate, by default 0.1.
         numSpatialLayers : int, optional
             Number of spatial GCN blocks, by default 1.
-        numHierarchyLayers : int, optional
-            Number of directed hierarchy blocks after bone split.
         numSpatioTemporalLayers : int, optional
             Number of local spatio-temporal mixing blocks.
         textEmbedDim : Optional[int], optional
@@ -349,17 +261,6 @@ class MotionDenoiser(nn.Module):
 
         # Conditioning dimension: timestep
         condDim = embedDim
-
-        self.hierarchyBlocks = nn.ModuleList(
-            [
-                BoneHierarchyBlock(
-                    numBones=numBones,
-                    embedDim=embedDim,
-                    dropout=dropout,
-                )
-                for _ in range(numHierarchyLayers)
-            ]
-        )
 
         # Spatial blocks (GCN over bones per frame)
         self.spatialBlocks = nn.ModuleList(
@@ -418,10 +319,8 @@ class MotionDenoiser(nn.Module):
         """
         batch, frames, bones, channels = noisyMotion.shape
 
-        # Bone-wise projection, hierarchy, spatial and spatio-temporal mixing.
+        # Bone-wise projection, then spatial and spatio-temporal mixing.
         boneH = self.boneProj(noisyMotion)
-        for block in self.hierarchyBlocks:
-            boneH = block(boneH)
         for block in self.spatialBlocks:
             boneH = block(boneH)
         for block in self.spatioTemporalBlocks:

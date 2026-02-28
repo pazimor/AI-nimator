@@ -24,9 +24,6 @@ LOGGER = logging.getLogger("shared.dataset_manager")
 BYTES_PER_GB = 1024 * 1024 * 1024
 AUTO_MEMORY_FRACTION = 0.6
 AUTO_MIN_SAMPLE_MULTIPLIER = 4
-DEFAULT_NUM_WORKERS_DIVISOR = 2
-DEFAULT_PREFETCH_FACTOR = 2
-MAX_NUM_WORKERS = 8
 MIN_SAMPLES = 1
 MODEL_MEMORY_MULTIPLIER = 3
 DEFAULT_VALIDATION_SEED = 42
@@ -230,7 +227,7 @@ class DatasetManager:
         validationIndicesPath: Optional[Path] = None,
         maxSamplesPerEpoch: Optional[int] = None,
         datasetFolders: Optional[List[str]] = None,
-        numWorkers: Optional[int] = None,
+        fixedSampleRange: Optional[Tuple[int, int]] = None,
     ) -> None:
         self.datasetRoot = datasetRoot
         self.batchSize = batchSize
@@ -240,7 +237,7 @@ class DatasetManager:
         self.validationIndicesPath = validationIndicesPath
         self.maxSamplesPerEpoch = maxSamplesPerEpoch
         self.datasetFolders = datasetFolders
-        self.numWorkers = numWorkers
+        self.fixedSampleRange = fixedSampleRange
 
         self.memoryConfig = memoryConfig or MemoryManagerConfig()
         self.memoryManager = MemoryManager(self.memoryConfig, device)
@@ -253,6 +250,8 @@ class DatasetManager:
         self._fixedValidationIndices: Optional[List[int]] = None
         self._fixedValidationIndexSet: Optional[set[int]] = None
         self._fixedValidationLoader: Optional[DataLoader] = None
+        self._fixedSampleIndices: Optional[List[int]] = None
+        self._fixedSampleChunkInfo: Optional[str] = None
 
     def _ensureDataset(self) -> PreprocessedMotionDataset:
         """
@@ -359,6 +358,26 @@ class DatasetManager:
         self._ensureDataset()
         return self._getRotatingDataloaders(epochIndex)
 
+    def getEpochSampleIndices(
+        self,
+        epochIndex: int,
+    ) -> Tuple[List[int], str]:
+        """
+        Return the raw dataset indices selected for an epoch.
+
+        Parameters
+        ----------
+        epochIndex : int
+            Zero-based epoch index.
+
+        Returns
+        -------
+        Tuple[List[int], str]
+            Selected dataset indices and a human-readable chunk label.
+        """
+        self._ensureDataset()
+        return self._resolveEpochIndices(epochIndex)
+
     def _getRotatingDataloaders(
         self,
         epochIndex: int,
@@ -367,24 +386,40 @@ class DatasetManager:
         dataset = self._dataset
         if dataset is None:
             raise RuntimeError("Dataset not initialized.")
-        activeIndices = self._activeIndices
-        if activeIndices is None:
-            activeIndices = list(range(len(dataset)))
-        totalSize = self._totalSize or len(activeIndices)
-        chunkSize = self._getMaxSamples()
         valIndexSet = self._getFixedValidationIndexSet()
 
         if epochIndex > 0:
             self.clearCache()
 
-        if chunkSize >= totalSize:
-            indices = activeIndices
-            chunkInfo = f"all {totalSize} samples"
-            return self._buildDataloaders(
-                indices,
+        indices, chunkInfo = self._resolveEpochIndices(epochIndex)
+        totalSize = self._totalSize or len(indices)
+        if self.fixedSampleRange is not None or len(indices) < totalSize:
+            LOGGER.info(
+                "MM: Loading chunk for epoch %d: %s",
+                epochIndex + 1,
                 chunkInfo,
-                valIndexSet,
             )
+        return self._buildDataloaders(indices, chunkInfo, valIndexSet)
+
+    def _resolveEpochIndices(
+        self,
+        epochIndex: int,
+    ) -> Tuple[List[int], str]:
+        """Resolve raw dataset indices for a given epoch."""
+        dataset = self._dataset
+        if dataset is None:
+            raise RuntimeError("Dataset not initialized.")
+        activeIndices = self._activeIndices
+        if activeIndices is None:
+            activeIndices = list(range(len(dataset)))
+        totalSize = self._totalSize or len(activeIndices)
+
+        if self.fixedSampleRange is not None:
+            return self._getFixedSampleSelection(activeIndices, totalSize)
+
+        chunkSize = self._getMaxSamples()
+        if chunkSize >= totalSize:
+            return activeIndices, f"all {totalSize} samples"
 
         startIndex, indices = _selectChunkIndices(
             totalSize=totalSize,
@@ -393,12 +428,41 @@ class DatasetManager:
         )
         mappedIndices = [activeIndices[idx] for idx in indices]
         chunkInfo = _formatChunkInfo(startIndex, chunkSize, totalSize)
-        LOGGER.info(
-            "MM: Loading chunk for epoch %d: %s",
-            epochIndex + 1,
-            chunkInfo,
+        return mappedIndices, chunkInfo
+
+    def _getFixedSampleSelection(
+        self,
+        activeIndices: List[int],
+        totalSize: int,
+    ) -> Tuple[List[int], str]:
+        """Return the cached fixed sample selection."""
+        if (
+            self._fixedSampleIndices is not None
+            and self._fixedSampleChunkInfo is not None
+        ):
+            return self._fixedSampleIndices, self._fixedSampleChunkInfo
+        if self.fixedSampleRange is None:
+            raise RuntimeError("Fixed sample range is not configured.")
+        startPos, endPos = self.fixedSampleRange
+        if startPos <= 0 or endPos <= 0:
+            raise ValueError(
+                "Fixed sample range must use positive 1-based positions."
+            )
+        if startPos > endPos:
+            raise ValueError(
+                "Fixed sample range start must be <= end."
+            )
+        if endPos > totalSize:
+            raise ValueError(
+                "Fixed sample range "
+                f"{startPos}:{endPos} exceeds active dataset size "
+                f"({totalSize} samples)."
+            )
+        self._fixedSampleIndices = activeIndices[startPos - 1:endPos]
+        self._fixedSampleChunkInfo = (
+            f"samples {startPos}-{endPos}/{totalSize}"
         )
-        return self._buildDataloaders(mappedIndices, chunkInfo, valIndexSet)
+        return self._fixedSampleIndices, self._fixedSampleChunkInfo
 
     def _buildDataloaders(
         self,
@@ -439,24 +503,14 @@ class DatasetManager:
         shuffle: bool = True,
     ) -> DataLoader:
         """Create a dataloader with custom collation."""
-        numWorkers = (
-            self.numWorkers
-            if self.numWorkers is not None
-            else _resolveNumWorkers()
-        )
-        numWorkers = max(int(numWorkers), 0)
         pinMemory = self.device is not None and self.device.type == "cuda"
-        persistentWorkers = numWorkers > 0
-        prefetchFactor = DEFAULT_PREFETCH_FACTOR if numWorkers > 0 else None
         return DataLoader(
             dataset,
             batch_size=self.batchSize,
             shuffle=shuffle,
             collate_fn=motionTextCollate,
-            num_workers=numWorkers,
+            num_workers=0,
             pin_memory=pinMemory,
-            persistent_workers=persistentWorkers,
-            prefetch_factor=prefetchFactor,
         )
 
     def checkMemory(self, batchIndex: int, force: bool = False) -> bool:
@@ -801,17 +855,3 @@ def _formatChunkInfo(startIndex: int, chunkSize: int, totalSize: int) -> str:
     """
     endIndex = min(startIndex + chunkSize, totalSize)
     return f"samples {startIndex + 1}-{endIndex}/{totalSize}"
-
-
-def _resolveNumWorkers() -> int:
-    """
-    Resolve default number of dataloader workers.
-
-    Returns
-    -------
-    int
-        Resolved worker count.
-    """
-    cpuCount = os.cpu_count() or 1
-    suggested = max(cpuCount // DEFAULT_NUM_WORKERS_DIVISOR, 1)
-    return min(suggested, MAX_NUM_WORKERS)

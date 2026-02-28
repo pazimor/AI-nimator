@@ -336,7 +336,6 @@ def resolveModelSettings(
         networkConfig,
         modelName,
         maxPromptLength,
-        predictionTarget,
     ) = loadInferenceSettings(
         configPath,
         profile,
@@ -350,7 +349,6 @@ def resolveModelSettings(
         networkConfigPath=resolvedNetwork,
         profile=profile,
         maxPromptLength=maxPromptLength,
-        predictionTarget=predictionTarget,
     )
 
 

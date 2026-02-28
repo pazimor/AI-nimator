@@ -21,10 +21,7 @@ from src.shared.model.layers.correction import (
     Smoothing,
     VelocityRegularization,
 )
-from src.shared.types.generation import (
-    PREDICTION_TARGET_CHOICES,
-    PREDICTION_TARGET_EPSILON,
-)
+from src.shared.types.generation import PREDICTION_TARGET_X0
 
 
 class MotionGenerator(nn.Module):
@@ -53,11 +50,9 @@ class MotionGenerator(nn.Module):
         diffusionWeight: float = 1.0,
         accelerationWeight: float = 0.0,
         numSpatialLayers: int = 1,
-        numHierarchyLayers: int = 1,
         numSpatioTemporalLayers: int = 1,
         maxPromptLength: int = 64,
         generationEmbedDim: Optional[int] = None,
-        predictionTarget: str = PREDICTION_TARGET_EPSILON,
     ) -> None:
         """
         Initialize MotionGenerator.
@@ -94,8 +89,6 @@ class MotionGenerator(nn.Module):
             Weight for acceleration loss, by default 0.0.
         numSpatialLayers : int, optional
             Number of spatial GCN blocks.
-        numHierarchyLayers : int, optional
-            Number of directed bone hierarchy blocks.
         numSpatioTemporalLayers : int, optional
             Number of local spatio-temporal mixing blocks.
         maxPromptLength : int, optional
@@ -103,24 +96,15 @@ class MotionGenerator(nn.Module):
         generationEmbedDim : Optional[int], optional
             Internal denoiser width. When omitted, defaults to ``embedDim``
             for backward compatibility.
-        predictionTarget : str, optional
-            Denoiser parameterization target ("epsilon" or "x0").
         """
         super().__init__()
-        resolvedPredictionTarget = str(predictionTarget).strip().lower()
-        if resolvedPredictionTarget not in PREDICTION_TARGET_CHOICES:
-            allowed = ", ".join(PREDICTION_TARGET_CHOICES)
-            raise ValueError(
-                "predictionTarget must be one of "
-                f"[{allowed}], got {predictionTarget!r}."
-            )
         self.embedDim = embedDim
         self.generationEmbedDim = (
             embedDim
             if generationEmbedDim is None
             else int(generationEmbedDim)
         )
-        self.predictionTarget = resolvedPredictionTarget
+        self.predictionTarget = PREDICTION_TARGET_X0
         self.numBones = numBones
         self.diffusionSteps = diffusionSteps
         self.xyzWeight = xyzWeight
@@ -148,7 +132,6 @@ class MotionGenerator(nn.Module):
             numLayers=numLayers,
             numBones=numBones,
             numSpatialLayers=numSpatialLayers,
-            numHierarchyLayers=numHierarchyLayers,
             numSpatioTemporalLayers=numSpatioTemporalLayers,
             textEmbedDim=embedDim,
         )
@@ -182,9 +165,9 @@ class MotionGenerator(nn.Module):
         timesteps : torch.Tensor
             Diffusion timesteps shaped (batch,).
         targetNoise : Optional[torch.Tensor], optional
-            Ground truth noise for loss computation.
+            Unused legacy argument kept for backward compatibility.
         targetMotion : Optional[torch.Tensor], optional
-            Ground truth clean motion for auxiliary losses.
+            Ground truth clean motion for x0-based losses.
         motionMask : Optional[torch.Tensor], optional
             Boolean mask indicating valid (non-padded) frames.
 
@@ -228,36 +211,28 @@ class MotionGenerator(nn.Module):
             "predicted_motion": predictedMotion,
         }
 
-        if targetNoise is not None:
-            if targetMotion is None:
-                from src.shared.model.generation.losses import diffusionLoss
+        if targetMotion is not None:
+            from src.shared.model.generation.losses import combinedGenerationLoss
 
-                loss = diffusionLoss(
-                    predictedNoise,
-                    targetNoise,
-                    motionMask=motionMask,
-                )
-                result["loss"] = loss
-            else:
-                from src.shared.model.generation.losses import combinedGenerationLoss
-
-                loss, components = combinedGenerationLoss(
-                    predictedNoise=predictedNoise,
-                    targetNoise=targetNoise,
-                    predictedMotion=predictedMotion,
-                    targetMotion=targetMotion,
-                    diffusionWeight=self.diffusionWeight,
-                    xyzWeight=self.xyzWeight,
-                    xyzWeightSchedule=self.xyzWeightSchedule,
-                    velocityXyzWeight=self.velXyzWeight,
-                    accelerationWeight=self.accelerationWeight,
-                    predictionTarget=self.predictionTarget,
-                    timesteps=timesteps,
-                    numTimesteps=self.ddim.num_timesteps,
-                    motionMask=motionMask,
-                )
-                result["loss"] = loss
-                result.update(components)
+            loss, components = combinedGenerationLoss(
+                predictedMotion=predictedMotion,
+                targetMotion=targetMotion,
+                diffusionWeight=self.diffusionWeight,
+                xyzWeight=self.xyzWeight,
+                xyzWeightSchedule=self.xyzWeightSchedule,
+                velocityXyzWeight=self.velXyzWeight,
+                accelerationWeight=self.accelerationWeight,
+                timesteps=timesteps,
+                numTimesteps=self.ddim.num_timesteps,
+                motionMask=motionMask,
+            )
+            result["loss"] = loss
+            result.update(components)
+        elif targetNoise is not None:
+            raise ValueError(
+                "targetNoise without targetMotion is not supported by "
+                "the fixed x0 prediction target."
+            )
 
         return result
 
@@ -317,7 +292,7 @@ class MotionGenerator(nn.Module):
         for i, t in enumerate(timestepSequence):
             tBatch = torch.full((1,), t, device=device, dtype=torch.long)
 
-            # Predict denoiser output, then resolve epsilon/x0 pair.
+            # Predict x0, then derive the epsilon view needed by DDIM.
             denoiserOutput = self.denoiser(
                 noisyMotion=x,
                 textEmbedding=textEmbeds,
@@ -413,22 +388,13 @@ class MotionGenerator(nn.Module):
         modelOutput: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Convert the denoiser output into both epsilon and x0 views.
+        Convert the denoiser x0 output into both epsilon and x0 views.
 
         Returns
         -------
         tuple[torch.Tensor, torch.Tensor]
             Predicted epsilon and predicted clean motion x0.
         """
-        if self.predictionTarget == PREDICTION_TARGET_EPSILON:
-            predictedNoise = modelOutput
-            predictedMotion = self.ddim.predict_start_from_noise(
-                noisyMotion,
-                timesteps,
-                predictedNoise,
-            )
-            return predictedNoise, predictedMotion
-
         predictedMotion = modelOutput
         predictedNoise = self.ddim.predict_noise_from_start(
             noisyMotion,

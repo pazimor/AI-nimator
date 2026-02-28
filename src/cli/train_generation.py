@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional
 
@@ -29,6 +30,30 @@ from src.shared.types import GenerationTrainingConfig, GenerationTrainingResult
 
 LOGGER = logging.getLogger("generation.train_cli")
 DEFAULT_CONFIG_PATH = Path("src/configs/train_generation.yaml")
+
+
+@dataclass(frozen=True)
+class OverfitSelection:
+    """Normalized overfit selector."""
+
+    raw: str
+    sampleCount: Optional[int] = None
+    rangeStart: Optional[int] = None
+    rangeEnd: Optional[int] = None
+
+    @property
+    def isRange(self) -> bool:
+        """Return True when the selector targets an explicit range."""
+        return self.rangeStart is not None and self.rangeEnd is not None
+
+    @property
+    def sampleTotal(self) -> int:
+        """Return the number of samples represented by the selector."""
+        if self.sampleCount is not None:
+            return self.sampleCount
+        if self.rangeStart is None or self.rangeEnd is None:
+            raise RuntimeError("Invalid overfit selector state.")
+        return self.rangeEnd - self.rangeStart + 1
 
 
 def buildArgumentParser() -> argparse.ArgumentParser:
@@ -67,11 +92,11 @@ def buildArgumentParser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--overfit-samples",
-        type=int,
+        type=str,
         default=None,
         help=(
-            "Enable overfit debug mode on a fixed subset size "
-            "(for example: 16)."
+            "Enable overfit debug mode on a fixed subset selector "
+            "(for example: 16 or 3:6, range is 1-based inclusive)."
         ),
     )
     parser.add_argument(
@@ -119,7 +144,7 @@ def _runTraining(
     config: GenerationTrainingConfig,
     profile: Optional[str] = None,
     datasetFolders: Optional[list[str]] = None,
-    overfitSamples: Optional[int] = None,
+    overfitSamples: Optional[str] = None,
     learningRateOverride: Optional[float] = None,
 ) -> GenerationTrainingResult:
     """
@@ -182,10 +207,8 @@ def _runTraining(
         diffusionWeight=config.training.diffusionWeight,
         accelerationWeight=config.training.accelerationWeight,
         numSpatialLayers=networkConfig.generation.numSpatialLayers,
-        numHierarchyLayers=networkConfig.generation.numHierarchyLayers,
         numSpatioTemporalLayers=networkConfig.generation.numSpatioTemporalLayers,
         maxPromptLength=config.training.maxPromptLength,
-        predictionTarget=config.training.predictionTarget,
     ).to(device)
     LOGGER.info(
         "Model initialized with CLIP from %s",
@@ -213,10 +236,6 @@ def _runTraining(
         config.training.velXyzWeight,
         config.training.accelerationWeight,
     )
-    LOGGER.info(
-        "Diffusion parameterization: prediction_target=%s",
-        config.training.predictionTarget,
-    )
     if config.training.accelerationWeight > 0.1:
         LOGGER.warning(
             "Acceleration weight %.4f is high for rotation-only 6D "
@@ -233,40 +252,46 @@ def _runTraining(
     if not config.training.clearMpsCache:
         LOGGER.info("MPS cache clearing disabled by config.")
 
-    requestedOverfitSamples = (
+    requestedOverfitSpec = (
         overfitSamples
         if overfitSamples is not None
         else config.training.overfitSamples
     )
-    if (
-        requestedOverfitSamples is not None
-        and requestedOverfitSamples <= 0
-    ):
-        raise ValueError(
-            "overfit-samples must be a positive integer when provided."
-        )
+    overfitSelection = _parseOverfitSelection(requestedOverfitSpec)
 
     useFixedTrainChunk = config.training.fixedTrainChunk
     selectedValidationSplit = config.training.validationSplit
     selectedMaxSamplesPerEpoch = config.training.maxSamplesPerEpoch
     selectedValidationIndicesPath = config.paths.validationIndices
     selectedResumeCheckpoint = config.training.resumeCheckpoint
-    selectedNumWorkers = config.training.numWorkers
-    if requestedOverfitSamples is not None:
+    selectedFixedSampleRange: Optional[tuple[int, int]] = None
+    if overfitSelection is not None:
         useFixedTrainChunk = True
         selectedValidationSplit = 0.0
-        selectedMaxSamplesPerEpoch = requestedOverfitSamples
         selectedValidationIndicesPath = None
-        if selectedNumWorkers is None:
-            selectedNumWorkers = 0
-        LOGGER.info(
-            "Overfit mode enabled: %d samples, fixed chunk, "
-            "validation disabled.",
-            requestedOverfitSamples,
-        )
-        if selectedNumWorkers == 0:
+        if overfitSelection.isRange:
+            selectedMaxSamplesPerEpoch = None
+            if (
+                overfitSelection.rangeStart is None
+                or overfitSelection.rangeEnd is None
+            ):
+                raise RuntimeError("Invalid overfit range selector.")
+            selectedFixedSampleRange = (
+                overfitSelection.rangeStart,
+                overfitSelection.rangeEnd,
+            )
             LOGGER.info(
-                "Overfit mode: using num_workers=0 to avoid worker startup latency."
+                "Overfit mode enabled: fixed range %s (%d samples), "
+                "validation disabled.",
+                overfitSelection.raw,
+                overfitSelection.sampleTotal,
+            )
+        else:
+            selectedMaxSamplesPerEpoch = overfitSelection.sampleCount
+            LOGGER.info(
+                "Overfit mode enabled: first %d samples, fixed chunk, "
+                "validation disabled.",
+                overfitSelection.sampleTotal,
             )
     if selectedValidationSplit <= 0.0:
         LOGGER.info(
@@ -289,13 +314,19 @@ def _runTraining(
         validationIndicesPath=selectedValidationIndicesPath,
         maxSamplesPerEpoch=selectedMaxSamplesPerEpoch,
         datasetFolders=selectedFolders,
-        numWorkers=selectedNumWorkers,
+        fixedSampleRange=selectedFixedSampleRange,
     )
     datasetManager.dataset.validateCompatibility(
         modelName=config.training.modelName,
         maxPromptLength=config.training.maxPromptLength,
     )
     LOGGER.info("Dataset indexed: %d total samples", datasetManager.totalSize)
+    if overfitSelection is not None:
+        _logSelectedOverfitPrompts(
+            datasetManager=datasetManager,
+            selection=overfitSelection,
+            tokenizer=model.clip.tokenizer,
+        )
 
     selectedLearningRate = (
         float(learningRateOverride)
@@ -485,6 +516,92 @@ def _parseFolderList(rawValue: str | None) -> list[str] | None:
     return normalized
 
 
+def _parseOverfitSelection(raw: Optional[str]) -> Optional[OverfitSelection]:
+    """Parse an overfit selector from CLI/config."""
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    if not value or value.lower() == "null":
+        return None
+    if ":" not in value:
+        count = _parsePositiveInt(value, label="overfit-samples")
+        return OverfitSelection(raw=value, sampleCount=count)
+
+    parts = value.split(":")
+    if len(parts) != 2:
+        raise ValueError(
+            "overfit-samples range must use the format start:end "
+            "(example: 3:6)."
+        )
+    start = _parsePositiveInt(
+        parts[0].strip(),
+        label="overfit-samples range start",
+    )
+    end = _parsePositiveInt(
+        parts[1].strip(),
+        label="overfit-samples range end",
+    )
+    if start > end:
+        raise ValueError(
+            "overfit-samples range start must be <= end "
+            f"(got {value!r})."
+        )
+    return OverfitSelection(
+        raw=value,
+        rangeStart=start,
+        rangeEnd=end,
+    )
+
+
+def _parsePositiveInt(value: str, label: str) -> int:
+    """Parse a strictly positive integer from text."""
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise ValueError(f"{label} must be an integer.") from error
+    if parsed <= 0:
+        raise ValueError(f"{label} must be strictly positive.")
+    return parsed
+
+
+def _logSelectedOverfitPrompts(
+    datasetManager: DatasetManager,
+    selection: OverfitSelection,
+    tokenizer: object,
+) -> None:
+    """Log the prompts selected for overfit mode."""
+    selectedIndices, chunkInfo = datasetManager.getEpochSampleIndices(0)
+    if not selectedIndices:
+        LOGGER.warning("Overfit selection is empty.")
+        return
+    LOGGER.info(
+        "Selected overfit prompts (%s): %s",
+        selection.raw,
+        chunkInfo,
+    )
+    dataset = datasetManager.dataset
+    for order, datasetIndex in enumerate(selectedIndices, start=1):
+        sample = dataset[datasetIndex]
+        inputIds = sample.get("input_ids")
+        if isinstance(inputIds, torch.Tensor):
+            tokenIds = inputIds.detach().cpu().tolist()
+        else:
+            tokenIds = list(inputIds) if inputIds is not None else []
+        promptText = tokenizer.decode(
+            tokenIds,
+            skip_special_tokens=True,
+        ).strip()
+        sourceFile = dataset.indexEntries[datasetIndex].sourceFile or "unknown"
+        LOGGER.info(
+            "Overfit prompt %d/%d [dataset=%d source=%s]: %s",
+            order,
+            len(selectedIndices),
+            datasetIndex,
+            sourceFile,
+            promptText or "<empty prompt>",
+        )
+
+
 def _setOptimizerLearningRate(
     optimizer: torch.optim.Optimizer,
     learningRate: float,
@@ -501,10 +618,6 @@ def _nanLossComponents() -> dict[str, float]:
         "loss_xyz": float("nan"),
         "loss_vel_xyz": float("nan"),
         "loss_acceleration": float("nan"),
-        "contrib_diffusion": float("nan"),
-        "contrib_xyz": float("nan"),
-        "contrib_vel_xyz": float("nan"),
-        "contrib_acceleration": float("nan"),
     }
 
 
@@ -527,41 +640,6 @@ def _formatComponents(components: Mapping[str, float]) -> str:
             components.get("loss_xyz", float("nan")),
             components.get("loss_vel_xyz", float("nan")),
             components.get("loss_acceleration", float("nan")),
-        )
-    )
-
-
-def _safePercent(numerator: float, denominator: float) -> float:
-    """Return a stable percentage value."""
-    if denominator <= 0.0 or numerator != numerator:
-        return float("nan")
-    return 100.0 * numerator / denominator
-
-
-def _formatImpact(components: Mapping[str, float]) -> str:
-    """Format weighted contribution ratios for each loss term."""
-    if _componentsDisabled(
-        components,
-        (
-            "contrib_diffusion",
-            "contrib_xyz",
-            "contrib_vel_xyz",
-            "contrib_acceleration",
-        ),
-    ):
-        return "disabled"
-    diff = components.get("contrib_diffusion", float("nan"))
-    xyz = components.get("contrib_xyz", float("nan"))
-    velXyz = components.get("contrib_vel_xyz", float("nan"))
-    acc = components.get("contrib_acceleration", float("nan"))
-    total = diff + xyz + velXyz + acc
-    return (
-        "diff= %.1f%%, xyz= %.1f%%, vel_xyz= %.1f%%, acc= %.1f%%"
-        % (
-            _safePercent(diff, total),
-            _safePercent(xyz, total),
-            _safePercent(velXyz, total),
-            _safePercent(acc, total),
         )
     )
 
@@ -595,12 +673,6 @@ def _logEpochSummary(
         learningRate,
         _formatComponents(trainComponents),
         _formatComponents(valComponents),
-    )
-    LOGGER.info(
-        "epoch: %s impact train: [ %s ], val: [ %s ]",
-        epoch,
-        _formatImpact(trainComponents),
-        _formatImpact(valComponents),
     )
 
 

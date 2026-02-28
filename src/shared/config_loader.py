@@ -30,10 +30,6 @@ from src.shared.types import (
     GenerationTrainingHyperparameters,
     GenerationTrainingPaths,
 )
-from src.shared.types.generation import (
-    PREDICTION_TARGET_CHOICES,
-    PREDICTION_TARGET_EPSILON,
-)
 from src.shared.types.network import (
     ClipNetworkConfig,
     GenerationNetworkConfig,
@@ -136,9 +132,6 @@ def _parseNetworkConfig(section: Dict[str, Any]) -> NetworkConfig:
             numSpatialLayers=int(
                 generationSection.get("num-spatial-layers", 1)
             ),
-            numHierarchyLayers=int(
-                generationSection.get("num-hierarchy-layers", 1)
-            ),
             numSpatioTemporalLayers=int(
                 generationSection.get("num-spatio-temporal-layers", 1)
             ),
@@ -189,6 +182,14 @@ def _optionalInt(section: Dict[str, Any], key: str) -> Optional[int]:
     if value is None or value == "null":
         return None
     return int(value)
+
+
+def _optionalString(section: Dict[str, Any], key: str) -> Optional[str]:
+    """Get optional string from section."""
+    value = section.get(key)
+    if value is None or value == "null":
+        return None
+    return str(value).strip()
 
 
 # ==============================================================================
@@ -374,18 +375,6 @@ def loadGenerationConfig(
         "acceleration-weight",
         GENERATION_DEFAULT_ACCELERATION_WEIGHT,
     )
-    predictionTarget = str(
-        trainingSection.get(
-            "prediction-target",
-            PREDICTION_TARGET_EPSILON,
-        )
-    ).strip().lower()
-    if predictionTarget not in PREDICTION_TARGET_CHOICES:
-        allowed = ", ".join(PREDICTION_TARGET_CHOICES)
-        raise ValueError(
-            "prediction-target must be one of "
-            f"[{allowed}], got {predictionTarget!r}."
-        )
     
     hyperparameters = GenerationTrainingHyperparameters(
         batchSize=_int(
@@ -430,13 +419,9 @@ def loadGenerationConfig(
             "fixed-train-chunk",
             False,
         ),
-        overfitSamples=_optionalInt(
+        overfitSamples=_optionalString(
             trainingSection,
             "overfit-samples",
-        ),
-        numWorkers=_optionalInt(
-            trainingSection,
-            "num-workers",
         ),
         clearMpsCache=_bool(
             trainingSection,
@@ -454,7 +439,6 @@ def loadGenerationConfig(
         velXyzWeight=velXyzWeight,
         diffusionWeight=diffusionWeight,
         accelerationWeight=accelerationWeight,
-        predictionTarget=predictionTarget,
     )
 
     return GenerationTrainingConfig(

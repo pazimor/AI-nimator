@@ -24,10 +24,6 @@ from src.shared.types import (
     GenerationModelSettings,
     GenerationOutputOptions,
 )
-from src.shared.types.generation import (
-    PREDICTION_TARGET_CHOICES,
-    PREDICTION_TARGET_EPSILON,
-)
 from src.shared.types.network import NetworkConfig
 
 AXIS_ANGLE_CHANNELS = 3
@@ -137,7 +133,7 @@ def resolveOptionalPath(
 def loadInferenceSettings(
     configPath: Path,
     profile: Optional[str],
-) -> tuple[Optional[Path], Optional[Path], str, int, str]:
+) -> tuple[Optional[Path], Optional[Path], str, int]:
     """
     Extract inference-related settings from a training config file.
 
@@ -150,9 +146,9 @@ def loadInferenceSettings(
 
     Returns
     -------
-    tuple[Optional[Path], Optional[Path], str, int, str]
+    tuple[Optional[Path], Optional[Path], str, int]
         Clip checkpoint path, network config path, model name, and
-        tokenizer max length, plus diffusion parameterization target.
+        tokenizer max length.
     """
     payload = loadYamlPayload(configPath)
     pathsSection = ensureDict(payload.get(YAML_PATHS_KEY, {}))
@@ -162,18 +158,6 @@ def loadInferenceSettings(
         trainingSection.get(YAML_MODEL_NAME_KEY, DEFAULT_MODEL_NAME)
     )
     maxPromptLength = int(trainingSection.get("max-length", 64))
-    predictionTarget = str(
-        trainingSection.get(
-            "prediction-target",
-            PREDICTION_TARGET_EPSILON,
-        )
-    ).strip().lower()
-    if predictionTarget not in PREDICTION_TARGET_CHOICES:
-        allowed = ", ".join(PREDICTION_TARGET_CHOICES)
-        raise ValueError(
-            "prediction-target must be one of "
-            f"[{allowed}], got {predictionTarget!r}."
-        )
     clipCheckpoint = resolveOptionalPath(
         configPath,
         optionalString(pathsSection.get(YAML_CLIP_CHECKPOINT_KEY)),
@@ -187,7 +171,6 @@ def loadInferenceSettings(
         networkConfig,
         modelName,
         maxPromptLength,
-        predictionTarget,
     )
 
 
@@ -289,7 +272,6 @@ def buildMotionGenerator(
     modelName: str,
     clipCheckpointPath: Optional[Path],
     maxPromptLength: int,
-    predictionTarget: str,
 ) -> MotionGenerator:
     """
     Instantiate a motion generator from network config.
@@ -304,8 +286,6 @@ def buildMotionGenerator(
         Path to CLIP checkpoint, if available.
     maxPromptLength : int
         Tokenizer max length used during inference tokenization.
-    predictionTarget : str
-        Diffusion parameterization used by the model.
 
     Returns
     -------
@@ -320,12 +300,10 @@ def buildMotionGenerator(
         numBones=networkConfig.generation.numBones,
         diffusionSteps=networkConfig.generation.diffusionSteps,
         numSpatialLayers=networkConfig.generation.numSpatialLayers,
-        numHierarchyLayers=networkConfig.generation.numHierarchyLayers,
         numSpatioTemporalLayers=networkConfig.generation.numSpatioTemporalLayers,
         modelName=modelName,
         clipCheckpoint=clipCheckpointPath,
         maxPromptLength=maxPromptLength,
-        predictionTarget=predictionTarget,
     )
 
 
@@ -582,7 +560,6 @@ def validateGenerationPaths(
         networkConfigPath=modelSettings.networkConfigPath,
         profile=modelSettings.profile,
         maxPromptLength=modelSettings.maxPromptLength,
-        predictionTarget=modelSettings.predictionTarget,
     )
 
 
@@ -648,7 +625,6 @@ def prepareGenerationState(
         modelName=modelSettings.modelName,
         clipCheckpointPath=modelSettings.clipCheckpoint,
         maxPromptLength=modelSettings.maxPromptLength,
-        predictionTarget=modelSettings.predictionTarget,
     )
     loadModelCheckpoint(inferenceConfig.checkpoint, model)
     model = model.to(device)
