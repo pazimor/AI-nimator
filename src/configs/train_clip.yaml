@@ -4,7 +4,8 @@ paths:
   # Ex: ["KIT", "CMU", "ACCAD"]
   # dataset-folders: ["ACCAD", "BioMotionLab_NTroje", "BMLHandball", "BMLmovi", "CMU", "DFaust_67", "EKUT", "Eyes_Japan_Dataset", "HumanEva", "KIT", "MPI_HDM05", "MPI_Limits", "MPI_mosh", "SFU", "SSM_synced", "TotalCapture", "Transitions_mocap"]
   dataset-folders: ["ACCAD"] # for quick preview
-  checkpoint-dir: output/clip
+  checkpoint-dir: ../../output/clip
+  validation-indices: ../../output/clip/validation_indices.json
   # Network architecture is loaded from network.yaml
   network-config: "src/configs/network.yaml"
 
@@ -12,36 +13,40 @@ paths:
 # Profile: Mac (32GB RAM, MPS GPU)
 # ============================================
 training:
-  epochs: 500
+  epochs: 5000
   device: mps
   max-length: 256
   model-name: xlm-roberta-base
-  validation-split: 0.1
+  validation-split: 0.05
   early-stopping-patience: 100
-  batch-size: 8
-  gradient-accumulation: 16
-  MM-memory-limit-gb: 25.0
+  batch-size: 32
+  gradient-accumulation: 1
+  MM-memory-limit-gb: 20.0
   weight-decay: 0.01
-  # resume-checkpoint: output/clip/best_model.pt
+  resume-checkpoint: ../../output/clip/best_model.pt
   
   # Learning Rate (constant)
   learning-rate: 0.00001
 
 # ============================================
-# Profile: DGX Spark (128GB RAM, GB10 GPU)
-# Use with: --profile spark
+# Profile: Overfit
 # ============================================
-spark:
-  epochs: 100
-  device: cuda
+overfit:
+  epochs: 1000
+  device: mps
   max-length: 256
   model-name: xlm-roberta-base
-  validation-split: 0.1
-  early-stopping-patience: 15
-  batch-size: 64
-  gradient-accumulation: 2
-  MM-memory-limit-gb: 0.0
-  weight-decay: 0.01
-  
+  validation-split: 0.0
+  early-stopping-patience: 100
+  batch-size: 4
+  gradient-accumulation: 1
+  MM-memory-limit-gb: 20.0
+  weight-decay: 0.0
+  max-samples-per-epoch: 10000
+  fixed-train-chunk: true
+  overfit-samples: "10:12"
+  disable-dropout: true
+  resume-checkpoint: null
+
   # Learning Rate (constant)
-  learning-rate: 0.0001
+  learning-rate: 0.00001

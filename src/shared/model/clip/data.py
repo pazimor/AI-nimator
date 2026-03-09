@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence
 
 import torch
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 
 from src.features.dataset_builder.dataset_reader import (
-    MotionPayload,
-    loadAnimationPayload,
+    DetailedMotionPayload,
+    loadAnimationPayloadWithExtras,
     loadPromptSegments,
 )
+from src.shared.model.components import (
+    buildComponentRegistry,
+    buildMotionFeatureTensors,
+)
+from src.shared.model.components.base import MotionComponent
 from src.shared.skeleton import SkeletonNormalizer
 from src.shared.types import (
     ClipDatasetRecord,
@@ -23,6 +28,22 @@ from src.shared.types import (
 )
 
 LOGGER = logging.getLogger("shared.clip.data")
+OPTIONAL_COMPONENTS = tuple(
+    component
+    for component in buildComponentRegistry()
+    if component.sampleKey != "motion"
+)
+OPTIONAL_COMPONENT_SAMPLE_KEYS = tuple(
+    component.sampleKey for component in OPTIONAL_COMPONENTS
+)
+EXTRAS_DEPENDENT_COMPONENT_KEYS = frozenset(
+    {
+        "root_translation",
+        "root_velocity",
+    }
+)
+
+
 def loadPromptFile(path: str | Path) -> List[ClipPromptSegment]:
     """
     Return prompt segments listed in a prompt.json file.
@@ -114,7 +135,7 @@ class MotionTextClipDataset(Dataset[MotionTextSample]):
         # LRU cache with size 1: keeps only the last loaded file
         # Since prompts from the same file are consecutive, this avoids reloading
         self._cachedPath: Optional[Path] = None
-        self._cachedMotion: Optional[Tuple] = None
+        self._cachedMotion: Optional[DetailedMotionPayload] = None
         self._cacheHits = 0
         self._cacheMisses = 0
         self.records: List[ClipDatasetRecord] = self._buildIndex()
@@ -142,12 +163,13 @@ class MotionTextClipDataset(Dataset[MotionTextSample]):
         Returns
         -------
         Dict[str, object]
-            Tokenized text fields and motion slice for contrastive training.
+            Tokenized text fields, the base rotation tensor, and any derived
+            motion features available for downstream consumers.
         """
         record = self.records[index]
         try:
-            motionSlice, meta = self._sliceMotion(record)
-        except Exception as e:
+            motionSlice, meta, featureTensors = self._sliceMotion(record)
+        except Exception:
             LOGGER.error(
                 "Failed to load sample %d from file: %s (frames %d-%d)",
                 index,
@@ -157,13 +179,15 @@ class MotionTextClipDataset(Dataset[MotionTextSample]):
             )
             raise
         encoded = self._tokenize(record.promptText)
-        return {
+        sample = {
             "input_ids": encoded["input_ids"],
             "attention_mask": encoded["attention_mask"],
             "motion": motionSlice,
             "time": torch.tensor([record.startFrame, record.endFrame]),
             "meta": meta,
         }
+        sample.update(featureTensors)
+        return sample
 
     def _buildIndex(self) -> List[ClipDatasetRecord]:
         """
@@ -253,10 +277,10 @@ class MotionTextClipDataset(Dataset[MotionTextSample]):
             targetDirectory / f"{promptStem}.json",
         ]
 
-    def _loadMotion(self, path: Path) -> MotionPayload:
+    def _loadMotion(self, path: Path) -> DetailedMotionPayload:
         """
-        Load motion from disk or LRU cache.
-        
+        Load motion, metadata, and extras from disk or LRU cache.
+
         Uses a single-entry LRU cache. Since prompts from the same animation
         file are indexed consecutively, this avoids reloading the same file
         multiple times within a batch or consecutive samples.
@@ -268,14 +292,18 @@ class MotionTextClipDataset(Dataset[MotionTextSample]):
 
         Returns
         -------
-        MotionPayload
-            Motion tensor and metadata.
+        DetailedMotionPayload
+            Motion tensor, metadata, and top-level extras.
         """
         # Check if this is the cached file
-        if self.cacheMotion and self._cachedPath == path and self._cachedMotion is not None:
+        if (
+            self.cacheMotion
+            and self._cachedPath == path
+            and self._cachedMotion is not None
+        ):
             self._cacheHits += 1
             return self._cachedMotion
-        
+
         # Cache miss - need to load from disk
         self._cacheMisses += 1
         LOGGER.debug(
@@ -284,22 +312,22 @@ class MotionTextClipDataset(Dataset[MotionTextSample]):
             self._cacheHits,
             self._cacheMisses,
         )
-        motion, meta = loadAnimationPayload(
+        motion, meta, extras = loadAnimationPayloadWithExtras(
             path,
             skeletonNormalizer=self.skeletonNormalizer,
         )
-        
+
         # Update LRU cache (replace previous entry)
         if self.cacheMotion:
             self._cachedPath = path
-            self._cachedMotion = (motion, meta)
-        
-        return motion, meta
-    
+            self._cachedMotion = (motion, meta, extras)
+
+        return motion, meta, extras
+
     def clearCache(self) -> None:
         """
         Clear the motion cache.
-        
+
         Call this between dataset rotations or when memory needs to be freed.
         """
         self._cachedPath = None
@@ -309,21 +337,23 @@ class MotionTextClipDataset(Dataset[MotionTextSample]):
             self._cacheHits,
             self._cacheMisses,
         )
-    
+
     def getCacheStats(self) -> Dict[str, int]:
         """Return cache hit/miss statistics."""
         return {
             "hits": self._cacheHits,
             "misses": self._cacheMisses,
-            "hitRate": self._cacheHits / max(1, self._cacheHits + self._cacheMisses),
+            "hitRate": (
+                self._cacheHits / max(1, self._cacheHits + self._cacheMisses)
+            ),
         }
 
     def _sliceMotion(
         self,
         record: ClipDatasetRecord,
-    ) -> MotionPayload:
+    ) -> tuple[torch.Tensor, Dict[str, object], Dict[str, torch.Tensor]]:
         """
-        Return the cropped motion slice and merged metadata.
+        Return the cropped motion slice, merged metadata, and derived features.
 
         Parameters
         ----------
@@ -332,13 +362,31 @@ class MotionTextClipDataset(Dataset[MotionTextSample]):
 
         Returns
         -------
-        MotionPayload
-            Cropped motion and merged metadata.
+        tuple[torch.Tensor, Dict[str, object], Dict[str, torch.Tensor]]
+            Cropped motion, merged metadata, and optional feature tensors.
         """
-        motion, meta = self._loadMotion(record.animationPath)
+        motion, meta, extras = self._loadMotion(record.animationPath)
         motionSlice = sliceMotion(motion, record.startFrame, record.endFrame)
+        slicedExtras = _sliceTemporalExtras(
+            extras=extras,
+            startFrame=record.startFrame,
+            endFrame=record.endFrame,
+        )
+        featureTensors = buildMotionFeatureTensors(
+            motion=motionSlice,
+            extras=slicedExtras,
+            enabledComponents=_availableOptionalComponents(slicedExtras),
+        )
+        if "trans" not in slicedExtras:
+            zeroTranslation = torch.zeros(
+                motionSlice.shape[0],
+                3,
+                dtype=motionSlice.dtype,
+            )
+            featureTensors["root_translation"] = zeroTranslation
+            featureTensors["root_velocity"] = torch.zeros_like(zeroTranslation)
         mergedMeta = meta | record.metadata
-        return motionSlice, mergedMeta
+        return motionSlice, mergedMeta, featureTensors
 
     def _tokenize(self, promptText: str) -> Dict[str, torch.Tensor]:
         """
@@ -384,53 +432,113 @@ def motionTextCollate(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
     lengths = [item["motion"].shape[0] for item in batch]
     maxTime = max(lengths)
     motionBatch = torch.stack(
-        [_padMotion(item["motion"], maxTime) for item in batch],
+        [_padTemporalTensor(item["motion"], maxTime) for item in batch],
     )
     motionMask = torch.stack(
         [_buildMotionMask(length, maxTime, motionBatch.device) for length in lengths],
     )
-    attentionMasks = torch.stack(
-        [item["attention_mask"] for item in batch],
-    )
-    return {
-        "input_ids": torch.stack([item["input_ids"] for item in batch]),
-        "attention_mask": attentionMasks,
+    payload = {
         "motion": motionBatch,
         "motion_mask": motionMask,
         "time": torch.stack([item["time"] for item in batch]),
         "meta": [item["meta"] for item in batch],
     }
+    if all("input_ids" in item for item in batch):
+        payload["input_ids"] = torch.stack([item["input_ids"] for item in batch])
+    if all("attention_mask" in item for item in batch):
+        payload["attention_mask"] = torch.stack(
+            [item["attention_mask"] for item in batch],
+        )
+    if all("sample_id" in item for item in batch):
+        payload["sample_id"] = torch.tensor(
+            [int(item["sample_id"]) for item in batch],
+            dtype=torch.long,
+        )
+    if all("text_id" in item for item in batch):
+        payload["text_id"] = torch.tensor(
+            [int(item["text_id"]) for item in batch],
+            dtype=torch.long,
+        )
+    if all("pooled_text" in item for item in batch):
+        payload["pooled_text"] = torch.stack(
+            [item["pooled_text"] for item in batch]
+        )
+    if all("generation_text_embedding" in item for item in batch):
+        payload["generation_text_embedding"] = torch.stack(
+            [item["generation_text_embedding"] for item in batch]
+        )
+    for sampleKey in OPTIONAL_COMPONENT_SAMPLE_KEYS:
+        tensors = [item.get(sampleKey) for item in batch]
+        if not any(isinstance(value, torch.Tensor) for value in tensors):
+            continue
+        if not all(isinstance(value, torch.Tensor) for value in tensors):
+            raise KeyError(
+                f"Inconsistent batch: missing tensor component {sampleKey!r}."
+            )
+        payload[sampleKey] = torch.stack(
+            [_padTemporalTensor(value, maxTime) for value in tensors]
+        )
+    return payload
 
 
-def _padMotion(motion: torch.Tensor, targetLength: int) -> torch.Tensor:
+def _sliceTemporalExtras(
+    extras: Dict[str, object],
+    startFrame: int,
+    endFrame: int,
+) -> Dict[str, object]:
+    """Slice top-level animation extras so they stay aligned with motion."""
+    sliced: Dict[str, object] = {}
+    rawTranslation = extras.get("trans")
+    if rawTranslation is None:
+        return sliced
+    translation = torch.as_tensor(rawTranslation, dtype=torch.float32)
+    if translation.dim() != 2 or translation.shape[1] != 3:
+        return sliced
+    sliced["trans"] = translation[startFrame:endFrame]
+    return sliced
+
+
+def _availableOptionalComponents(
+    extras: Dict[str, object],
+) -> tuple[MotionComponent, ...]:
+    """Return only the optional components supported by the current sample."""
+    if "trans" in extras:
+        return OPTIONAL_COMPONENTS
+    return tuple(
+        component
+        for component in OPTIONAL_COMPONENTS
+        if component.key not in EXTRAS_DEPENDENT_COMPONENT_KEYS
+    )
+
+
+def _padTemporalTensor(
+    tensor: torch.Tensor,
+    targetLength: int,
+) -> torch.Tensor:
     """
-    Pad a motion tensor to a target temporal length.
+    Pad a temporal tensor to a target temporal length.
 
     Parameters
     ----------
-    motion : torch.Tensor
-        Motion tensor shaped (frames, bones, channels).
+    tensor : torch.Tensor
+        Tensor shaped (frames, ...).
     targetLength : int
         Desired temporal length after padding.
 
     Returns
     -------
     torch.Tensor
-        Motion tensor padded with zeros at the end.
+        Tensor padded with zeros at the end.
     """
-    if motion.shape[0] == targetLength:
-        return motion
-    paddingShape = (
-        targetLength - motion.shape[0],
-        motion.shape[1],
-        motion.shape[2],
-    )
+    if tensor.shape[0] == targetLength:
+        return tensor
+    paddingShape = (targetLength - tensor.shape[0],) + tuple(tensor.shape[1:])
     padding = torch.zeros(
         paddingShape,
-        dtype=motion.dtype,
-        device=motion.device,
+        dtype=tensor.dtype,
+        device=tensor.device,
     )
-    return torch.cat([motion, padding], dim=0)
+    return torch.cat([tensor, padding], dim=0)
 
 
 def _buildMotionMask(

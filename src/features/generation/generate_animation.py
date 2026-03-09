@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 from typing import Optional
 import json
+import logging
 
 import numpy as np
 import torch
@@ -12,14 +14,22 @@ import yaml
 
 from src.features.dataset_builder.animation_rebuilder import AnimationRebuilder
 from src.features.generation.train_generation import loadCheckpoint
-from src.shared.config_loader import loadBuilderConfig, loadNetworkConfig
+from src.shared.config_loader import (
+    loadBuilderConfig,
+    loadGenerationConfig,
+    loadNetworkConfig,
+)
 from src.shared.constants.clip import DEFAULT_MODEL_NAME
 from src.shared.constants.skeletons import SMPL22_BONE_ORDER, SMPL24_BONE_ORDER
+from src.shared.dataset_manager import DatasetManager
+from src.shared.model.components import buildEnabledComponents
 from src.shared.model.generation.motion_generator import MotionGenerator
+from src.shared.preprocessed_dataset import PreprocessedLinkDataset
 from src.shared.quaternion import Rotation
 from src.shared.types import (
     AnimationSample,
     DatasetBuilderConfig,
+    GenerationTrainingConfig,
     GenerationInferenceConfig,
     GenerationModelSettings,
     GenerationOutputOptions,
@@ -35,11 +45,20 @@ DEVICE_AUTO = "auto"
 DEVICE_CPU = "cpu"
 DEVICE_CUDA = "cuda"
 DEVICE_MPS = "mps"
+LOGGER = logging.getLogger("generation.infer")
 
 EXTRA_PROMPT_KEY = "prompt"
 EXTRA_CHECKPOINT_KEY = "checkpoint"
 EXTRA_MODEL_NAME_KEY = "modelName"
 EXTRA_DDIM_STEPS_KEY = "ddimSteps"
+EXTRA_MODE_KEY = "mode"
+EXTRA_REFERENCE_DATASET_INDEX_KEY = "referenceDatasetIndex"
+EXTRA_REFERENCE_SELECTION_KEY = "referenceSelection"
+EXTRA_REFERENCE_SOURCE_FILE_KEY = "referenceSourceFile"
+EXTRA_REFERENCE_START_FRAME_KEY = "referenceStartFrame"
+EXTRA_REFERENCE_END_FRAME_KEY = "referenceEndFrame"
+EXTRA_REFERENCE_FPS_KEY = "referenceFps"
+EXTRA_REFERENCE_FRAMES_KEY = "referenceFrames"
 
 YAML_PATHS_KEY = "paths"
 YAML_TRAINING_KEY = "training"
@@ -174,6 +193,63 @@ def loadInferenceSettings(
     )
 
 
+def parsePositiveInt(value: str, label: str) -> int:
+    """Parse a strictly positive integer from text."""
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise ValueError(f"{label} must be an integer.") from error
+    if parsed <= 0:
+        raise ValueError(f"{label} must be strictly positive.")
+    return parsed
+
+
+def parseOverfitSelection(
+    rawValue: Optional[str],
+) -> tuple[Optional[tuple[int, int]], Optional[int], Optional[str]]:
+    """
+    Parse an overfit selector into either a fixed range or a sample count.
+
+    Parameters
+    ----------
+    rawValue : Optional[str]
+        Raw selector from the generation config.
+
+    Returns
+    -------
+    tuple[Optional[tuple[int, int]], Optional[int], Optional[str]]
+        Fixed 1-based inclusive range, sample count, and normalized raw value.
+    """
+    if rawValue is None:
+        return None, None, None
+    normalized = str(rawValue).strip()
+    if not normalized or normalized.lower() == "null":
+        return None, None, None
+    if ":" not in normalized:
+        return None, parsePositiveInt(normalized, label="overfit-samples"), normalized
+
+    parts = normalized.split(":")
+    if len(parts) != 2:
+        raise ValueError(
+            "overfit-samples range must use the format start:end "
+            "(example: 3:6)."
+        )
+    start = parsePositiveInt(
+        parts[0].strip(),
+        label="overfit-samples range start",
+    )
+    end = parsePositiveInt(
+        parts[1].strip(),
+        label="overfit-samples range end",
+    )
+    if start > end:
+        raise ValueError(
+            "overfit-samples range start must be <= end "
+            f"(got {normalized!r})."
+        )
+    return (start, end), None, normalized
+
+
 def requireExistingPath(path: Path, label: str) -> Path:
     """
     Ensure a filesystem path exists.
@@ -214,6 +290,30 @@ def validateOptionalPath(path: Optional[Path], label: str) -> Optional[Path]:
     if path is None:
         return None
     return requireExistingPath(path, label)
+
+
+def asTensor(value: object, label: str) -> torch.Tensor:
+    """
+    Convert an arbitrary payload value into a float tensor.
+
+    Parameters
+    ----------
+    value : object
+        Value to normalize.
+    label : str
+        Label used in error messages.
+
+    Returns
+    -------
+    torch.Tensor
+        Float32 tensor stored on CPU.
+    """
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().float()
+    try:
+        return torch.as_tensor(value, dtype=torch.float32)
+    except Exception as error:
+        raise TypeError(f"{label} must be tensor-convertible.") from error
 
 
 def resolveDevice(deviceName: str) -> torch.device:
@@ -292,6 +392,20 @@ def buildMotionGenerator(
     MotionGenerator
         Initialized generation model.
     """
+    clipMotionComponents = (
+        buildEnabledComponents(networkConfig.clip.boneData)
+        if networkConfig.clip.boneData is not None
+        else ()
+    )
+    generationMotionComponents = buildEnabledComponents(
+        networkConfig.generation.boneData
+    )
+    if networkConfig.clip.boneData is not None and not clipMotionComponents:
+        raise ValueError(
+            "clip.bone-data is configured but enables no motion features. "
+            "Enable at least one component or remove clip.bone-data to keep "
+            "the legacy rotation-only CLIP input."
+        )
     return MotionGenerator(
         embedDim=networkConfig.embedDim,
         generationEmbedDim=networkConfig.generation.embedDim,
@@ -304,6 +418,10 @@ def buildMotionGenerator(
         modelName=modelName,
         clipCheckpoint=clipCheckpointPath,
         maxPromptLength=maxPromptLength,
+        clipMotionNumHeads=networkConfig.clip.motionNumHeads,
+        clipMotionNumLayers=networkConfig.clip.motionNumLayers,
+        clipMotionComponents=clipMotionComponents,
+        generationMotionComponents=generationMotionComponents,
     )
 
 
@@ -328,7 +446,8 @@ def generateMotionQuat(
     model: MotionGenerator,
     inferenceConfig: GenerationInferenceConfig,
     device: torch.device,
-) -> torch.Tensor:
+    applyPostProcessing: bool = True,
+) -> dict[str, torch.Tensor]:
     """
     Run text-conditioned motion generation.
 
@@ -343,14 +462,15 @@ def generateMotionQuat(
 
     Returns
     -------
-    torch.Tensor
-        Generated quaternion motion tensor.
+    dict[str, torch.Tensor]
+        Generated motion sample with quaternion and optional extras.
     """
-    return model.generate(
+    return model.generateSample(
         prompt=inferenceConfig.prompt,
         numFrames=inferenceConfig.frames,
         ddimSteps=inferenceConfig.ddimSteps,
         device=device,
+        applyPostProcessing=applyPostProcessing,
     )
 
 
@@ -481,6 +601,195 @@ def buildExtras(
     return extras
 
 
+def resolveOverfitReplay(
+    generationConfigPath: Optional[Path],
+    profile: Optional[str],
+) -> Optional[
+    tuple[
+        PreprocessedLinkDataset,
+        int,
+        str,
+        GenerationTrainingConfig,
+        str,
+    ]
+]:
+    """
+    Resolve the exact dataset sample used by a single-sample overfit profile.
+
+    Parameters
+    ----------
+    generationConfigPath : Optional[Path]
+        Path to the generation training config file.
+    profile : Optional[str]
+        Requested config profile.
+
+    Returns
+    -------
+    Optional[tuple[PreprocessedLinkDataset, int, str, GenerationTrainingConfig, str]]
+        Dataset instance, selected dataset index, chunk info, loaded training
+        config, and normalized selector string.
+    """
+    if generationConfigPath is None or profile != "overfit":
+        return None
+    generationConfig = loadGenerationConfig(
+        generationConfigPath,
+        profile=profile,
+    )
+    fixedSampleRange, maxSamplesPerEpoch, selectionRaw = parseOverfitSelection(
+        generationConfig.training.overfitSamples
+    )
+    if selectionRaw is None:
+        return None
+    datasetManager = DatasetManager(
+        datasetRoot=generationConfig.paths.datasetRoot,
+        batchSize=1,
+        validationSplit=0.0,
+        modelMemoryBytes=0,
+        datasetFolders=generationConfig.paths.datasetFolders,
+        fixedSampleRange=fixedSampleRange,
+        maxSamplesPerEpoch=maxSamplesPerEpoch,
+        includeTokenizedText=False,
+    )
+    selectedIndices, chunkInfo = datasetManager.getEpochSampleIndices(0)
+    if len(selectedIndices) != 1:
+        LOGGER.info(
+            "Deterministic overfit replay disabled: selector %s resolved to %d samples.",
+            selectionRaw,
+            len(selectedIndices),
+        )
+        return None
+    return (
+        datasetManager.dataset,
+        selectedIndices[0],
+        chunkInfo,
+        generationConfig,
+        selectionRaw,
+    )
+
+
+def resolveReferenceSampleFps(
+    samplePayload: dict[str, object],
+    requestedFps: Optional[int],
+) -> int:
+    """
+    Resolve the FPS used for deterministic reference replay.
+
+    Parameters
+    ----------
+    samplePayload : dict[str, object]
+        Preprocessed sample payload.
+    requestedFps : Optional[int]
+        CLI FPS override.
+
+    Returns
+    -------
+    int
+        Native FPS from the sample when available, else requested FPS, else 24.
+    """
+    meta = samplePayload.get("meta")
+    if isinstance(meta, dict):
+        fpsValue = meta.get("fps")
+        if isinstance(fpsValue, (int, float)) and fpsValue > 0:
+            sampleFps = int(round(float(fpsValue)))
+            if requestedFps is not None and requestedFps != sampleFps:
+                LOGGER.info(
+                    "Overfit replay forcing native FPS %d instead of requested %d.",
+                    sampleFps,
+                    requestedFps,
+                )
+            return sampleFps
+    if requestedFps is not None:
+        return requestedFps
+    return 24
+
+
+def buildSampleFromReferenceReplay(
+    dataset: PreprocessedLinkDataset,
+    datasetIndex: int,
+    selectionRaw: str,
+    chunkInfo: str,
+    inferenceConfig: GenerationInferenceConfig,
+    outputOptions: GenerationOutputOptions,
+    outputJsonPath: Path,
+    extras: dict[str, object],
+) -> AnimationSample:
+    """
+    Export the exact overfit training sample instead of sampling diffusion.
+
+    Parameters
+    ----------
+    dataset : PreprocessedLinkDataset
+        Dataset holding the selected reference sample.
+    datasetIndex : int
+        Raw dataset index to replay.
+    selectionRaw : str
+        Normalized overfit selector string.
+    chunkInfo : str
+        Human-readable selection summary.
+    inferenceConfig : GenerationInferenceConfig
+        CLI inference settings.
+    outputOptions : GenerationOutputOptions
+        Output export settings.
+    outputJsonPath : Path
+        Target JSON path.
+    extras : dict[str, object]
+        Base extras payload.
+
+    Returns
+    -------
+    AnimationSample
+        Animation sample rebuilt from the exact preprocessed reference window.
+    """
+    linkEntry = dataset.indexEntries[datasetIndex]
+    sampleEntry = dataset.sampleIndexEntries[linkEntry.sampleId]
+    samplePayload = dataset[datasetIndex]
+    motion6d = asTensor(samplePayload.get("motion"), label="motion")
+    axisAngles = Rotation(motion6d, kind="rot6d").axis_angle
+    axisAnglesNumpy = axisAngles.detach().cpu().numpy().astype(np.float32)
+    axisAnglesFull = mapAxisAnglesToSmpl24(
+        axisAnglesNumpy,
+        SMPL22_BONE_ORDER,
+    )
+    resolvedFps = resolveReferenceSampleFps(
+        samplePayload,
+        outputOptions.fps,
+    )
+    if inferenceConfig.frames != sampleEntry.frames:
+        LOGGER.info(
+            "Overfit replay forcing native frame count %d instead of requested %d.",
+            sampleEntry.frames,
+            inferenceConfig.frames,
+        )
+    LOGGER.info(
+        "Deterministic overfit replay active: %s -> dataset index %d (%s).",
+        selectionRaw,
+        datasetIndex,
+        chunkInfo,
+    )
+    sampleExtras = dict(extras)
+    sampleExtras[EXTRA_DDIM_STEPS_KEY] = 0
+    sampleExtras[EXTRA_MODE_KEY] = "overfit-reference-replay"
+    sampleExtras[EXTRA_REFERENCE_DATASET_INDEX_KEY] = datasetIndex
+    sampleExtras[EXTRA_REFERENCE_SELECTION_KEY] = selectionRaw
+    sampleExtras[EXTRA_REFERENCE_SOURCE_FILE_KEY] = sampleEntry.sourceFile
+    sampleExtras[EXTRA_REFERENCE_START_FRAME_KEY] = sampleEntry.startFrame
+    sampleExtras[EXTRA_REFERENCE_END_FRAME_KEY] = sampleEntry.endFrame
+    sampleExtras[EXTRA_REFERENCE_FPS_KEY] = resolvedFps
+    sampleExtras[EXTRA_REFERENCE_FRAMES_KEY] = sampleEntry.frames
+    rootTranslation = samplePayload.get("root_translation")
+    if rootTranslation is not None:
+        sampleExtras["trans"] = asTensor(
+            rootTranslation,
+            label="root_translation",
+        ).tolist()
+    return buildAnimationSample(
+        axisAnglesFull=axisAnglesFull,
+        fps=resolvedFps,
+        outputJsonPath=outputJsonPath,
+        extras=sampleExtras,
+    )
+
+
 def resolveFps(
     builderConfig: DatasetBuilderConfig,
     fps: Optional[int],
@@ -598,7 +907,7 @@ def prepareOutputContext(
 def prepareGenerationState(
     inferenceConfig: GenerationInferenceConfig,
     modelSettings: GenerationModelSettings,
-) -> tuple[MotionGenerator, torch.device, list[str]]:
+) -> tuple[MotionGenerator, torch.device, list[str], GenerationInferenceConfig, bool]:
     """
     Prepare model, device, and bone order for generation.
 
@@ -611,8 +920,9 @@ def prepareGenerationState(
 
     Returns
     -------
-    tuple[MotionGenerator, torch.device, list[str]]
-        Model, device, and bone order list.
+    tuple[MotionGenerator, torch.device, list[str], GenerationInferenceConfig, bool]
+        Model, device, bone order list, resolved inference config, and whether
+        inference post-processing should run.
     """
     device = resolveDevice(inferenceConfig.device)
     networkConfig = loadNetworkConfig(
@@ -628,7 +938,27 @@ def prepareGenerationState(
     )
     loadModelCheckpoint(inferenceConfig.checkpoint, model)
     model = model.to(device)
-    return model, device, boneOrder
+    resolvedInferenceConfig = inferenceConfig
+    applyPostProcessing = True
+    if modelSettings.profile == "overfit":
+        applyPostProcessing = False
+        if inferenceConfig.ddimSteps < model.diffusionSteps:
+            resolvedInferenceConfig = replace(
+                inferenceConfig,
+                ddimSteps=model.diffusionSteps,
+            )
+        LOGGER.info(
+            "Overfit inference enabled: applyPostProcessing=%s, ddimSteps=%d",
+            applyPostProcessing,
+            resolvedInferenceConfig.ddimSteps,
+        )
+    return (
+        model,
+        device,
+        boneOrder,
+        resolvedInferenceConfig,
+        applyPostProcessing,
+    )
 
 
 def buildSampleFromPrompt(
@@ -639,6 +969,7 @@ def buildSampleFromPrompt(
     fps: int,
     outputJsonPath: Path,
     extras: dict[str, object],
+    applyPostProcessing: bool = True,
 ) -> AnimationSample:
     """
     Generate motion from a prompt and build an AnimationSample.
@@ -665,14 +996,26 @@ def buildSampleFromPrompt(
     AnimationSample
         Generated animation sample.
     """
-    motionQuat = generateMotionQuat(model, inferenceConfig, device)
+    generatedSample = generateMotionQuat(
+        model,
+        inferenceConfig,
+        device,
+        applyPostProcessing=applyPostProcessing,
+    )
+    motionQuat = generatedSample["motion_quat"]
+    sampleExtras = dict(extras)
+    rootTranslation = generatedSample.get("root_translation")
+    if isinstance(rootTranslation, torch.Tensor):
+        sampleExtras["trans"] = (
+            rootTranslation.squeeze(0).detach().cpu().tolist()
+        )
     axisAngles = convertQuaternionToAxisAngles(motionQuat)
     axisAnglesFull = mapAxisAnglesToSmpl24(axisAngles, boneOrder)
     return buildAnimationSample(
         axisAnglesFull=axisAnglesFull,
         fps=fps,
         outputJsonPath=outputJsonPath,
-        extras=extras,
+        extras=sampleExtras,
     )
 
 
@@ -724,6 +1067,7 @@ def generateAndExport(
     rebuilder: AnimationRebuilder,
     resolvedFps: int,
     extras: dict[str, object],
+    generationConfigPath: Optional[Path] = None,
 ) -> None:
     """
     Generate a sample and export JSON/Collada outputs.
@@ -742,14 +1086,47 @@ def generateAndExport(
         Resolved frames per second value.
     extras : dict[str, object]
         Extras to include in the animation payload.
+    generationConfigPath : Optional[Path]
+        Training config path used to resolve deterministic overfit replay.
     """
-    model, device, boneOrder = prepareGenerationState(
-        inferenceConfig, modelSettings
+    exportExtras = dict(extras)
+    overfitReplay = resolveOverfitReplay(
+        generationConfigPath=generationConfigPath,
+        profile=modelSettings.profile,
     )
-    sample = buildSampleFromPrompt(
-        model, device, boneOrder, inferenceConfig, resolvedFps,
-        outputOptions.jsonPath, extras
-    )
+    if overfitReplay is not None:
+        dataset, datasetIndex, chunkInfo, _, selectionRaw = overfitReplay
+        sample = buildSampleFromReferenceReplay(
+            dataset=dataset,
+            datasetIndex=datasetIndex,
+            selectionRaw=selectionRaw,
+            chunkInfo=chunkInfo,
+            inferenceConfig=inferenceConfig,
+            outputOptions=outputOptions,
+            outputJsonPath=outputOptions.jsonPath,
+            extras=exportExtras,
+        )
+    else:
+        (
+            model,
+            device,
+            boneOrder,
+            resolvedInferenceConfig,
+            applyPostProcessing,
+        ) = prepareGenerationState(
+            inferenceConfig, modelSettings
+        )
+        exportExtras[EXTRA_DDIM_STEPS_KEY] = resolvedInferenceConfig.ddimSteps
+        sample = buildSampleFromPrompt(
+            model,
+            device,
+            boneOrder,
+            resolvedInferenceConfig,
+            resolvedFps,
+            outputOptions.jsonPath,
+            exportExtras,
+            applyPostProcessing=applyPostProcessing,
+        )
     exportAnimationOutputs(
         sample, rebuilder, outputOptions.jsonPath,
         outputOptions.daePath,
@@ -764,6 +1141,7 @@ def createAnimationFromCheckpoint(
     modelSettings: GenerationModelSettings,
     outputOptions: GenerationOutputOptions,
     datasetConfigPath: Path,
+    generationConfigPath: Optional[Path] = None,
 ) -> None:
     """
     Run the full generation pipeline from checkpoint to outputs.
@@ -778,6 +1156,8 @@ def createAnimationFromCheckpoint(
         Output paths and export options.
     datasetConfigPath : Path
         Dataset builder configuration path.
+    generationConfigPath : Optional[Path]
+        Generation training config used to resolve overfit replay.
     """
     modelSettings = validateGenerationPaths(
         inferenceConfig, datasetConfigPath, modelSettings
@@ -787,5 +1167,5 @@ def createAnimationFromCheckpoint(
     )
     generateAndExport(
         inferenceConfig, modelSettings, outputOptions, rebuilder,
-        resolvedFps, extras
+        resolvedFps, extras, generationConfigPath=generationConfigPath
     )

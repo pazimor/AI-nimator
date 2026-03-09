@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 
 from src.features.dataset_preprocessor.preprocess_dataset import (
@@ -40,6 +41,15 @@ def buildArgumentParser() -> argparse.ArgumentParser:
             "(example: KIT,CMU,ACCAD)."
         ),
     )
+    parser.add_argument(
+        "--network-config",
+        type=Path,
+        default=None,
+        help=(
+            "Optional override for the shared network.yaml file used "
+            "to decide which motion features are preprocessed."
+        ),
+    )
     return parser
 
 
@@ -55,6 +65,14 @@ def main() -> None:
     parser = buildArgumentParser()
     arguments = parser.parse_args()
     config = loadPreprocessConfig(arguments.config)
+    if arguments.network_config is not None:
+        config = replace(
+            config,
+            paths=replace(
+                config.paths,
+                networkConfigPath=arguments.network_config.expanduser(),
+            ),
+        )
     preprocessor = DatasetPreprocessor(config)
     includeFolders = _parseFolderList(arguments.include_folders)
     preprocessor.run(includeFolders=includeFolders)

@@ -1,75 +1,135 @@
-"""Preprocess converted datasets into shardable tensor files."""
+"""Preprocess converted datasets into the V2 shardable tensor format."""
 
 from __future__ import annotations
 
 import gc
 import json
+import logging
 import math
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
-from transformers import XLMRobertaTokenizerFast
+from transformers import XLMRobertaModel, XLMRobertaTokenizerFast
 
 from src.features.dataset_builder.dataset_reader import (
-    loadAnimationPayload,
+    loadAnimationPayloadWithExtras,
     loadPromptSegments,
 )
 from src.features.dataset_builder.progress import TqdmProgressReporter
+from src.shared.config_loader import loadNetworkConfig
 from src.shared.constants.preprocessed import (
-    PREPROCESSED_INDEX_FILENAME,
+    PREPROCESSED_GENERATION_TEXT_CACHE_DIRNAME,
+    PREPROCESSED_LINK_INDEX_FILENAME,
     PREPROCESSED_MANIFEST_FILENAME,
     PREPROCESSED_MANIFEST_VERSION,
     PREPROCESSED_MIN_FRAME_COUNT,
     PREPROCESSED_PROMPT_FILENAME,
-    PREPROCESSED_SHARDS_DIRNAME,
+    PREPROCESSED_SAMPLE_INDEX_FILENAME,
+    PREPROCESSED_SAMPLE_SHARDS_DIRNAME,
+    PREPROCESSED_TEXT_INDEX_FILENAME,
+    PREPROCESSED_TEXT_SHARDS_DIRNAME,
 )
+from src.shared.model.components import (
+    buildEnabledComponents,
+    buildMotionFeatureTensors,
+)
+from src.shared.model.components.base import MotionComponent
 from src.shared.types import (
     PreprocessDatasetConfig,
-    PreprocessedDatasetManifest,
+    PreprocessedDatasetManifestV2,
     PreprocessedDatasetShardInfo,
-    PreprocessedSampleIndex,
+    PreprocessedLinkIndexV2,
+    PreprocessedSampleIndexV2,
+    PreprocessedTextIndexV2,
 )
 
 PROMPT_FILENAME = PREPROCESSED_PROMPT_FILENAME
 MANIFEST_FILENAME = PREPROCESSED_MANIFEST_FILENAME
-INDEX_FILENAME = PREPROCESSED_INDEX_FILENAME
-SHARDS_DIRNAME = PREPROCESSED_SHARDS_DIRNAME
+SAMPLE_INDEX_FILENAME = PREPROCESSED_SAMPLE_INDEX_FILENAME
+TEXT_INDEX_FILENAME = PREPROCESSED_TEXT_INDEX_FILENAME
+LINK_INDEX_FILENAME = PREPROCESSED_LINK_INDEX_FILENAME
+SAMPLE_SHARDS_DIRNAME = PREPROCESSED_SAMPLE_SHARDS_DIRNAME
+TEXT_SHARDS_DIRNAME = PREPROCESSED_TEXT_SHARDS_DIRNAME
+GENERATION_CACHE_DIRNAME = PREPROCESSED_GENERATION_TEXT_CACHE_DIRNAME
 MANIFEST_VERSION = PREPROCESSED_MANIFEST_VERSION
 MIN_FRAME_COUNT = PREPROCESSED_MIN_FRAME_COUNT
+LOGGER = logging.getLogger("dataset.preprocess")
+
+
+@dataclass
+class _PendingTextRecord:
+    """Mutable unique-text registry entry used before the text shards exist."""
+
+    textId: int
+    rawText: str
+    usageCount: int = 0
+    inputIds: Optional[torch.Tensor] = None
+    attentionMask: Optional[torch.Tensor] = None
+    pooledText: Optional[torch.Tensor] = None
+
+
+@dataclass
+class _PendingLinkRecord:
+    """Mutable link entry finalized once text bytes are known."""
+
+    sampleId: int
+    textId: int
+    datasetFolder: str
+    sourceFile: str
+    frames: int
 
 
 class DatasetPreprocessor:
-    """Convert a converted dataset into a shardable tensor dataset."""
+    """Convert a converted dataset into a V2 preprocessed dataset."""
 
     def __init__(self, config: PreprocessDatasetConfig) -> None:
-        """
-        Initialize the preprocessor.
-
-        Parameters
-        ----------
-        config : PreprocessDatasetConfig
-            Parsed preprocessing configuration.
-        """
         self.config = config
         self.tokenizer = XLMRobertaTokenizerFast.from_pretrained(
             config.processing.modelName,
         )
-        self._writer = ShardWriter(
-            outputRoot=config.paths.outputRoot,
-            shardSize=config.processing.shardSize,
+        self.textEncoder = XLMRobertaModel.from_pretrained(
+            config.processing.modelName,
+            low_cpu_mem_usage=True,
         )
+        self.textEncoder.eval()
+        for parameter in self.textEncoder.parameters():
+            parameter.requires_grad = False
+
+        self.networkConfig = loadNetworkConfig(
+            configPath=config.paths.networkConfigPath,
+        )
+        self.enabledComponents = _mergeEnabledComponents(
+            buildEnabledComponents(self.networkConfig.generation.boneData),
+            (
+                buildEnabledComponents(self.networkConfig.clip.boneData)
+                if self.networkConfig.clip.boneData is not None
+                else ()
+            ),
+        )
+        self.enabledComponentKeys = [
+            component.key for component in self.enabledComponents
+        ]
+        if "rotation6d" not in self.enabledComponentKeys:
+            raise ValueError(
+                "The V2 preprocessing pipeline still requires `rotation6d` "
+                "because `motion` remains the base training tensor."
+            )
+        LOGGER.info(
+            "Preprocess enabled motion components: %s",
+            ", ".join(self.enabledComponentKeys),
+        )
+        self._writer = DatasetV2Writer(
+            outputRoot=config.paths.outputRoot,
+            sampleShardSize=config.processing.sampleShardSize,
+            textShardSize=config.processing.textShardSize,
+        )
+        self._textIdByValue: dict[str, int] = {}
+        self._textRecords: list[_PendingTextRecord] = []
 
     def run(self, includeFolders: Optional[List[str]] = None) -> None:
-        """
-        Execute preprocessing and write shards + manifest.
-
-        Returns
-        -------
-        None
-            Results are written to disk.
-        """
+        """Execute preprocessing and write shards + indices + manifest."""
         folders = includeFolders or self.config.paths.includeFolders
         promptFiles = self._listPromptFiles(
             self.config.paths.inputRoot,
@@ -83,33 +143,32 @@ class DatasetPreprocessor:
             self._processPromptFile(promptPath)
             reporter.advance(promptPath.as_posix())
         reporter.close()
-        self._writer.finalize(self._buildManifest())
+
+        pooledTextDim = self._materializeUniqueTexts()
+        self._writer.finalize(
+            modelName=self.config.processing.modelName,
+            maxPromptLength=self.config.processing.maxPromptLength,
+            splitFrames=self.config.processing.splitFrames,
+            downsampleTargetFrames=self.config.processing.downsampleTargetFrames,
+            maxSegmentFrames=self.config.processing.maxSegmentFrames,
+            enabledComponents=self.enabledComponentKeys,
+            pooledTextDim=pooledTextDim,
+        )
 
     def _listPromptFiles(
         self,
         root: Path,
         includeFolders: Optional[List[str]] = None,
     ) -> List[Path]:
-        """
-        Return sorted prompt.json files under a root.
-
-        Parameters
-        ----------
-        root : Path
-            Dataset root directory.
-
-        includeFolders : Optional[List[str]]
-            Optional list of top-level folders to include.
-
-        Returns
-        -------
-        List[Path]
-            Sorted list of prompt.json files.
-        """
+        """Return sorted prompt.json files under a root."""
         promptFiles = sorted(root.rglob(PROMPT_FILENAME))
         if not includeFolders:
             return promptFiles
-        allowed = {folder.strip().lower() for folder in includeFolders if folder.strip()}
+        allowed = {
+            folder.strip().lower()
+            for folder in includeFolders
+            if folder.strip()
+        }
         if not allowed:
             return promptFiles
         filtered: List[Path] = []
@@ -120,14 +179,7 @@ class DatasetPreprocessor:
         return filtered
 
     def _processPromptFile(self, promptPath: Path) -> None:
-        """
-        Load a prompt file, its animation, and write preprocessed samples.
-
-        Parameters
-        ----------
-        promptPath : Path
-            Path to the prompt.json file.
-        """
+        """Load one prompt file, its animation, and register its links."""
         promptMeta, segments = loadPromptSegments(promptPath)
         datasetFolder = _extractTopLevelFolder(
             promptPath,
@@ -137,7 +189,9 @@ class DatasetPreprocessor:
             promptPath,
             self.config.paths.inputRoot,
         )
-        motion, motionMeta = loadAnimationPayload(animationPath)
+        motion, motionMeta, motionExtras = loadAnimationPayloadWithExtras(
+            animationPath,
+        )
         try:
             for segment in segments:
                 self._processSegment(
@@ -148,6 +202,7 @@ class DatasetPreprocessor:
                     promptMeta=promptMeta,
                     motion=motion,
                     motionMeta=motionMeta,
+                    motionExtras=motionExtras,
                     sourceFile=segment.sourceFile,
                 )
         finally:
@@ -163,30 +218,11 @@ class DatasetPreprocessor:
         promptMeta: Dict[str, object],
         motion: torch.Tensor,
         motionMeta: Dict[str, object],
+        motionExtras: Dict[str, object],
         sourceFile: str,
     ) -> None:
-        """
-        Split, filter, and serialize one prompt segment.
-
-        Parameters
-        ----------
-        segmentText : str
-            Prompt text to tokenize.
-        segmentStart : int
-            Start frame for the segment.
-        segmentEnd : int
-            End frame for the segment.
-        datasetFolder : str
-            Top-level dataset folder (e.g. KIT, CMU).
-        promptMeta : Dict[str, object]
-            Prompt-level metadata.
-        motion : torch.Tensor
-            Full motion tensor for the animation.
-        motionMeta : Dict[str, object]
-            Metadata attached to the motion payload.
-        sourceFile : str
-            Source identifier for traceability.
-        """
+        """Split, filter, and serialize one prompt segment."""
+        textId = self._registerText(segmentText)
         windows = _buildWindows(
             segmentStart,
             segmentEnd,
@@ -194,306 +230,384 @@ class DatasetPreprocessor:
         )
         for windowStart, windowEnd in windows:
             motionSlice = motion[windowStart:windowEnd]
-            motionSlice = _downsampleMotion(
+            motionSlice, downsampleIndices = _downsampleMotion(
                 motionSlice,
                 self.config.processing.downsampleTargetFrames,
+            )
+            slicedExtras = _sliceTemporalExtras(
+                extras=motionExtras,
+                start=windowStart,
+                end=windowEnd,
+                downsampleIndices=downsampleIndices,
             )
             if not _isFramesValid(
                 motionSlice.shape[0],
                 self.config.processing.maxSegmentFrames,
             ):
                 continue
-            sample = self._buildSample(
-                text=segmentText,
-                motionSlice=motionSlice,
-                windowStart=windowStart,
-                windowEnd=windowEnd,
-                mergedMeta=motionMeta | promptMeta,
+            featureTensors = buildMotionFeatureTensors(
+                motion=motionSlice,
+                extras=slicedExtras,
+                enabledComponents=self.enabledComponents,
             )
+            sample = {
+                "motion": motionSlice,
+                "time": torch.tensor(
+                    [windowStart, windowEnd],
+                    dtype=torch.long,
+                ),
+                "meta": motionMeta | promptMeta,
+            }
+            sample.update(featureTensors)
             sampleBytes = _estimateSampleBytes(sample)
-            self._writer.addSample(
+            sampleId = self._writer.addSample(
                 sample=sample,
                 frames=motionSlice.shape[0],
                 sampleBytes=sampleBytes,
                 datasetFolder=datasetFolder,
                 sourceFile=sourceFile,
+                startFrame=windowStart,
+                endFrame=windowEnd,
+            )
+            self._writer.addLink(
+                sampleId=sampleId,
+                textId=textId,
+                datasetFolder=datasetFolder,
+                sourceFile=sourceFile,
+                frames=motionSlice.shape[0],
             )
 
-    def _buildSample(
+    def _registerText(self, rawText: str) -> int:
+        """Deduplicate and register one text string."""
+        normalized = rawText.strip()
+        existingId = self._textIdByValue.get(normalized)
+        if existingId is not None:
+            self._textRecords[existingId].usageCount += 1
+            return existingId
+        textId = len(self._textRecords)
+        self._textIdByValue[normalized] = textId
+        self._textRecords.append(
+            _PendingTextRecord(
+                textId=textId,
+                rawText=normalized,
+                usageCount=1,
+            )
+        )
+        return textId
+
+    def _materializeUniqueTexts(self) -> int:
+        """Tokenize + encode every unique text, then write text shards."""
+        if not self._textRecords:
+            pooledTextDim = int(self.textEncoder.config.hidden_size)
+            self._writer.writeTexts(self._textRecords)
+            return pooledTextDim
+
+        pooledTextDim = int(self.textEncoder.config.hidden_size)
+        batchSize = self.config.processing.textBatchSize
+        for start in range(0, len(self._textRecords), batchSize):
+            chunk = self._textRecords[start:start + batchSize]
+            texts = [record.rawText for record in chunk]
+            encoded = self.tokenizer(
+                texts,
+                padding="max_length",
+                truncation=True,
+                max_length=self.config.processing.maxPromptLength,
+                return_tensors="pt",
+            )
+            with torch.no_grad():
+                outputs = self.textEncoder(
+                    input_ids=encoded["input_ids"],
+                    attention_mask=encoded["attention_mask"],
+                )
+            pooled = _maskedMean(
+                outputs.last_hidden_state,
+                encoded["attention_mask"],
+            )
+            pooledTextDim = int(pooled.shape[-1])
+            for index, record in enumerate(chunk):
+                record.inputIds = encoded["input_ids"][index].detach().cpu()
+                record.attentionMask = (
+                    encoded["attention_mask"][index].detach().cpu()
+                )
+                record.pooledText = pooled[index].detach().cpu()
+            del outputs, pooled, encoded
+            gc.collect()
+
+        self._writer.writeTexts(self._textRecords)
+        return pooledTextDim
+
+
+class DatasetV2Writer:
+    """Write preprocessed samples, texts, links, and the V2 manifest."""
+
+    def __init__(
         self,
-        text: str,
-        motionSlice: torch.Tensor,
-        windowStart: int,
-        windowEnd: int,
-        mergedMeta: Dict[str, object],
-    ) -> Dict[str, object]:
-        """
-        Build a single preprocessed sample dictionary.
-
-        Parameters
-        ----------
-        text : str
-            Raw prompt text.
-        motionSlice : torch.Tensor
-            Motion tensor for the window.
-        windowStart : int
-            Start frame for the window.
-        windowEnd : int
-            End frame for the window.
-        mergedMeta : Dict[str, object]
-            Combined metadata to store with the sample.
-
-        Returns
-        -------
-        Dict[str, object]
-            Sample dictionary with tensors.
-        """
-        encoded = _tokenizeText(
-            self.tokenizer,
-            text,
-            self.config.processing.maxPromptLength,
-        )
-        return {
-            "input_ids": encoded["input_ids"],
-            "attention_mask": encoded["attention_mask"],
-            "motion": motionSlice,
-            "time": torch.tensor([windowStart, windowEnd]),
-            "meta": mergedMeta,
-        }
-
-    def _buildManifest(self) -> PreprocessedDatasetManifest:
-        """
-        Build the manifest metadata after preprocessing.
-
-        Returns
-        -------
-        PreprocessedDatasetManifest
-            Manifest populated with dataset statistics.
-        """
-        return self._writer.buildManifest(
-            modelName=self.config.processing.modelName,
-            maxPromptLength=self.config.processing.maxPromptLength,
-            splitFrames=self.config.processing.splitFrames,
-            downsampleTargetFrames=(
-                self.config.processing.downsampleTargetFrames
-            ),
-            maxSegmentFrames=self.config.processing.maxSegmentFrames,
-        )
-
-
-class ShardWriter:
-    """Write preprocessed samples into shard files with an index."""
-
-    def __init__(self, outputRoot: Path, shardSize: int) -> None:
-        """
-        Initialize the shard writer.
-
-        Parameters
-        ----------
-        outputRoot : Path
-            Root directory for output shards.
-        shardSize : int
-            Maximum samples per shard file.
-        """
+        outputRoot: Path,
+        sampleShardSize: int,
+        textShardSize: int,
+    ) -> None:
         self.outputRoot = outputRoot
-        self.shardSize = shardSize
-        self.shardsDir = outputRoot / SHARDS_DIRNAME
-        self.shardsDir.mkdir(parents=True, exist_ok=True)
-        self._currentSamples: List[Dict[str, object]] = []
-        self._indexEntries: List[PreprocessedSampleIndex] = []
-        self._shardInfos: List[PreprocessedDatasetShardInfo] = []
+        self.sampleShardSize = sampleShardSize
+        self.textShardSize = textShardSize
+        self.sampleShardsDir = outputRoot / SAMPLE_SHARDS_DIRNAME
+        self.textShardsDir = outputRoot / TEXT_SHARDS_DIRNAME
+        self.sampleShardsDir.mkdir(parents=True, exist_ok=True)
+        self.textShardsDir.mkdir(parents=True, exist_ok=True)
+        (outputRoot / GENERATION_CACHE_DIRNAME).mkdir(parents=True, exist_ok=True)
+
+        self._currentSamples: list[dict[str, object]] = []
+        self._currentTexts: list[dict[str, object]] = []
+        self._sampleIndexEntries: list[PreprocessedSampleIndexV2] = []
+        self._textIndexEntries: list[PreprocessedTextIndexV2] = []
+        self._pendingLinks: list[_PendingLinkRecord] = []
+        self._linkEntries: list[PreprocessedLinkIndexV2] = []
+        self._sampleShards: list[PreprocessedDatasetShardInfo] = []
+        self._textShards: list[PreprocessedDatasetShardInfo] = []
+
+        self._sampleBytesById: list[int] = []
+        self._textBytesById: list[int] = []
         self._sampleBytesSum = 0
-        self._sampleCount = 0
+        self._pairBytesSum = 0
         self._framesSum = 0
         self._maxSampleBytes = 0
         self._maxFrames = 0
 
     def addSample(
         self,
-        sample: Dict[str, object],
+        sample: dict[str, object],
         frames: int,
         sampleBytes: int,
         datasetFolder: str,
         sourceFile: str,
-    ) -> None:
-        """
-        Queue a sample for shard writing.
-
-        Parameters
-        ----------
-        sample : Dict[str, object]
-            Preprocessed sample dictionary.
-        frames : int
-            Frame count for the sample.
-        sampleBytes : int
-            Estimated sample size in bytes.
-        datasetFolder : str
-            Top-level dataset folder (e.g. KIT, CMU).
-        sourceFile : str
-            Source identifier for traceability.
-        """
-        shardIndex = len(self._shardInfos)
+        startFrame: int,
+        endFrame: int,
+    ) -> int:
+        """Queue one motion sample for shard writing."""
+        sampleId = len(self._sampleIndexEntries)
+        shardIndex = len(self._sampleShards)
         shardOffset = len(self._currentSamples)
         self._currentSamples.append(sample)
-        self._indexEntries.append(
-            PreprocessedSampleIndex(
+        self._sampleIndexEntries.append(
+            PreprocessedSampleIndexV2(
+                sampleId=sampleId,
                 shardIndex=shardIndex,
                 shardOffset=shardOffset,
                 frames=frames,
                 sampleBytes=sampleBytes,
                 datasetFolder=datasetFolder,
                 sourceFile=sourceFile,
-            ),
+                startFrame=startFrame,
+                endFrame=endFrame,
+            )
         )
-        self._updateStats(frames, sampleBytes)
-        if len(self._currentSamples) >= self.shardSize:
-            self._flushShard()
+        self._sampleBytesById.append(sampleBytes)
+        self._sampleBytesSum += sampleBytes
+        self._framesSum += frames
+        self._maxSampleBytes = max(self._maxSampleBytes, sampleBytes)
+        self._maxFrames = max(self._maxFrames, frames)
+        if len(self._currentSamples) >= self.sampleShardSize:
+            self._flushSampleShard()
+        return sampleId
 
-    def finalize(self, manifest: PreprocessedDatasetManifest) -> None:
-        """
-        Write pending samples, index, and manifest to disk.
+    def addLink(
+        self,
+        sampleId: int,
+        textId: int,
+        datasetFolder: str,
+        sourceFile: str,
+        frames: int,
+    ) -> None:
+        """Register one training link between a sample and a text."""
+        self._pendingLinks.append(
+            _PendingLinkRecord(
+                sampleId=sampleId,
+                textId=textId,
+                datasetFolder=datasetFolder,
+                sourceFile=sourceFile,
+                frames=frames,
+            )
+        )
 
-        Parameters
-        ----------
-        manifest : PreprocessedDatasetManifest
-            Dataset manifest to serialize.
-        """
-        if self._currentSamples:
-            self._flushShard()
-        self._writeIndex()
-        self._writeManifest(manifest)
+    def writeTexts(
+        self,
+        records: Sequence[_PendingTextRecord],
+    ) -> None:
+        """Write every unique text payload and finalize link byte estimates."""
+        for record in records:
+            if (
+                record.inputIds is None
+                or record.attentionMask is None
+                or record.pooledText is None
+            ):
+                raise ValueError(
+                    f"Text record {record.textId} is missing encoded tensors."
+                )
+            payload = {
+                "text_id": record.textId,
+                "raw_text": record.rawText,
+                "input_ids": record.inputIds,
+                "attention_mask": record.attentionMask,
+                "pooled_text": record.pooledText,
+            }
+            textBytes = _estimateSampleBytes(payload)
+            self._textBytesById.append(textBytes)
+            shardIndex = len(self._textShards)
+            shardOffset = len(self._currentTexts)
+            self._currentTexts.append(payload)
+            self._textIndexEntries.append(
+                PreprocessedTextIndexV2(
+                    textId=record.textId,
+                    shardIndex=shardIndex,
+                    shardOffset=shardOffset,
+                    usageCount=record.usageCount,
+                )
+            )
+            if len(self._currentTexts) >= self.textShardSize:
+                self._flushTextShard()
 
-    def buildManifest(
+        if self._currentTexts:
+            self._flushTextShard()
+
+        self._linkEntries = []
+        self._pairBytesSum = 0
+        for index, link in enumerate(self._pendingLinks):
+            pairBytes = (
+                self._sampleBytesById[link.sampleId]
+                + self._textBytesById[link.textId]
+            )
+            self._pairBytesSum += pairBytes
+            self._linkEntries.append(
+                PreprocessedLinkIndexV2(
+                    linkId=index,
+                    sampleId=link.sampleId,
+                    textId=link.textId,
+                    datasetFolder=link.datasetFolder,
+                    sourceFile=link.sourceFile,
+                    frames=link.frames,
+                    pairBytes=pairBytes,
+                )
+            )
+
+    def finalize(
         self,
         modelName: str,
         maxPromptLength: int,
         splitFrames: Optional[int],
         downsampleTargetFrames: Optional[int],
         maxSegmentFrames: Optional[int],
-    ) -> PreprocessedDatasetManifest:
-        """
-        Create a manifest dataclass with computed stats.
-
-        Returns
-        -------
-        PreprocessedDatasetManifest
-            Manifest with dataset-level statistics.
-        """
-        averageSampleBytes = _safeAverage(
-            self._sampleBytesSum,
-            self._sampleCount,
+        enabledComponents: list[str],
+        pooledTextDim: int,
+    ) -> None:
+        """Flush shards, write indices, and serialize the V2 manifest."""
+        if self._currentSamples:
+            self._flushSampleShard()
+        if self._pendingLinks and not self._linkEntries:
+            raise RuntimeError(
+                "Links were registered before text shards were materialized."
+            )
+        self._writeJson(
+            self.outputRoot / SAMPLE_INDEX_FILENAME,
+            [asdict(entry) for entry in self._sampleIndexEntries],
         )
-        averageFrames = _safeAverage(self._framesSum, self._sampleCount)
-        return PreprocessedDatasetManifest(
+        self._writeJson(
+            self.outputRoot / TEXT_INDEX_FILENAME,
+            [asdict(entry) for entry in self._textIndexEntries],
+        )
+        self._writeJson(
+            self.outputRoot / LINK_INDEX_FILENAME,
+            [asdict(entry) for entry in self._linkEntries],
+        )
+        manifest = PreprocessedDatasetManifestV2(
             version=MANIFEST_VERSION,
             modelName=modelName,
             maxPromptLength=maxPromptLength,
             splitFrames=splitFrames,
             downsampleTargetFrames=downsampleTargetFrames,
             maxSegmentFrames=maxSegmentFrames,
-            shardSize=self.shardSize,
-            totalSamples=self._sampleCount,
-            averageSampleBytes=averageSampleBytes,
+            sampleShardSize=self.sampleShardSize,
+            textShardSize=self.textShardSize,
+            totalSamples=len(self._sampleIndexEntries),
+            totalTexts=len(self._textIndexEntries),
+            totalLinks=len(self._linkEntries),
+            averageSampleBytes=_safeAverage(
+                self._sampleBytesSum,
+                len(self._sampleIndexEntries),
+            ),
             maxSampleBytes=self._maxSampleBytes,
-            averageFrames=averageFrames,
+            averagePairBytes=_safeAverage(
+                self._pairBytesSum,
+                len(self._linkEntries),
+            ),
+            averageFrames=_safeAverage(
+                self._framesSum,
+                len(self._sampleIndexEntries),
+            ),
             maxFrames=self._maxFrames,
-            shards=self._shardInfos,
-            indexPath=INDEX_FILENAME,
+            sampleShards=self._sampleShards,
+            textShards=self._textShards,
+            sampleIndexPath=SAMPLE_INDEX_FILENAME,
+            textIndexPath=TEXT_INDEX_FILENAME,
+            linkIndexPath=LINK_INDEX_FILENAME,
+            enabledComponents=list(enabledComponents),
+            pooledTextDim=pooledTextDim,
         )
+        payload = asdict(manifest)
+        payload["sampleShards"] = [asdict(entry) for entry in manifest.sampleShards]
+        payload["textShards"] = [asdict(entry) for entry in manifest.textShards]
+        self._writeJson(self.outputRoot / MANIFEST_FILENAME, payload)
 
-    def _updateStats(self, frames: int, sampleBytes: int) -> None:
-        """
-        Update rolling dataset statistics.
-
-        Parameters
-        ----------
-        frames : int
-            Frame count for the sample.
-        sampleBytes : int
-            Estimated sample size.
-        """
-        self._sampleCount += 1
-        self._framesSum += frames
-        self._sampleBytesSum += sampleBytes
-        self._maxFrames = max(self._maxFrames, frames)
-        self._maxSampleBytes = max(self._maxSampleBytes, sampleBytes)
-
-    def _flushShard(self) -> None:
-        """
-        Write the current shard to disk and reset the buffer.
-        """
-        shardPath = self._shardPath(len(self._shardInfos))
+    def _flushSampleShard(self) -> None:
+        """Write the buffered motion samples to disk."""
+        shardPath = self._sampleShardPath(len(self._sampleShards))
         torch.save(self._currentSamples, shardPath)
-        self._shardInfos.append(
+        self._sampleShards.append(
             PreprocessedDatasetShardInfo(
                 path=str(shardPath.relative_to(self.outputRoot)),
                 sampleCount=len(self._currentSamples),
-            ),
+            )
         )
         self._currentSamples = []
         gc.collect()
 
-    def _writeIndex(self) -> None:
-        """Serialize the sample index to disk."""
-        indexPayload = [asdict(entry) for entry in self._indexEntries]
-        self._writeJson(self.outputRoot / INDEX_FILENAME, indexPayload)
+    def _flushTextShard(self) -> None:
+        """Write the buffered unique texts to disk."""
+        shardPath = self._textShardPath(len(self._textShards))
+        torch.save(self._currentTexts, shardPath)
+        self._textShards.append(
+            PreprocessedDatasetShardInfo(
+                path=str(shardPath.relative_to(self.outputRoot)),
+                sampleCount=len(self._currentTexts),
+            )
+        )
+        self._currentTexts = []
+        gc.collect()
 
-    def _writeManifest(self, manifest: PreprocessedDatasetManifest) -> None:
-        """
-        Serialize the manifest to disk.
+    def _sampleShardPath(self, shardIndex: int) -> Path:
+        filename = f"sample_shard_{shardIndex:05d}.pt"
+        return self.sampleShardsDir / filename
 
-        Parameters
-        ----------
-        manifest : PreprocessedDatasetManifest
-            Manifest dataclass to serialize.
-        """
-        payload = asdict(manifest)
-        payload["shards"] = [asdict(entry) for entry in manifest.shards]
-        self._writeJson(self.outputRoot / MANIFEST_FILENAME, payload)
+    def _textShardPath(self, shardIndex: int) -> Path:
+        filename = f"text_shard_{shardIndex:05d}.pt"
+        return self.textShardsDir / filename
 
     def _writeJson(self, path: Path, payload: object) -> None:
-        """
-        Write JSON payload to disk with ASCII encoding.
-
-        Parameters
-        ----------
-        path : Path
-            Destination JSON path.
-        payload : object
-            Serializable payload.
-        """
         serialized = json.dumps(payload, ensure_ascii=True, indent=2)
         path.write_text(serialized, encoding="utf-8")
 
-    def _shardPath(self, shardIndex: int) -> Path:
-        """
-        Return the shard file path for a given shard index.
 
-        Parameters
-        ----------
-        shardIndex : int
-            Shard index in the dataset.
-        """
-        filename = f"shard_{shardIndex:05d}.pt"
-        return self.shardsDir / filename
+def _mergeEnabledComponents(
+    primary: Sequence[MotionComponent],
+    secondary: Sequence[MotionComponent],
+) -> tuple[MotionComponent, ...]:
+    """Merge component sequences while preserving first-seen order."""
+    merged: dict[str, MotionComponent] = {}
+    for component in (*primary, *secondary):
+        merged.setdefault(component.key, component)
+    return tuple(merged.values())
 
 
 def _resolveAnimationPath(promptPath: Path, datasetRoot: Path) -> Path:
-    """
-    Resolve animation path next to the prompt file.
-
-    Parameters
-    ----------
-    promptPath : Path
-        Path to the prompt.json file.
-    datasetRoot : Path
-        Root directory for prompts and animations.
-
-    Returns
-    -------
-    Path
-        Resolved animation file path.
-    """
+    """Resolve animation path next to the prompt file."""
     try:
         relativeDirectory = promptPath.parent.relative_to(datasetRoot)
     except ValueError:
@@ -525,23 +639,7 @@ def _buildWindows(
     endFrame: int,
     splitFrames: Optional[int],
 ) -> List[Tuple[int, int]]:
-    """
-    Build window ranges for a segment.
-
-    Parameters
-    ----------
-    startFrame : int
-        Segment start frame.
-    endFrame : int
-        Segment end frame.
-    splitFrames : Optional[int]
-        Window size for splitting.
-
-    Returns
-    -------
-    List[Tuple[int, int]]
-        Window ranges for the segment.
-    """
+    """Build window ranges for a segment."""
     if not _isFrameCountValid(splitFrames):
         return [(startFrame, endFrame)]
     windowStarts = list(range(startFrame, endFrame, splitFrames))
@@ -553,56 +651,64 @@ def _buildWindows(
 
 
 def _isFrameCountValid(value: Optional[int]) -> bool:
-    """
-    Return True when a frame count is valid.
-
-    Parameters
-    ----------
-    value : Optional[int]
-        Frame count to validate.
-    """
+    """Return True when a frame count is valid."""
     return value is not None and value >= MIN_FRAME_COUNT
 
 
 def _downsampleMotion(
     motion: torch.Tensor,
     targetFrames: Optional[int],
-) -> torch.Tensor:
-    """
-    Downsample a motion tensor to the target frame count.
-
-    Parameters
-    ----------
-    motion : torch.Tensor
-        Motion tensor shaped (frames, bones, channels).
-    targetFrames : Optional[int]
-        Target frame count.
-
-    Returns
-    -------
-    torch.Tensor
-        Downsampled motion tensor.
-    """
-    if not _isFrameCountValid(targetFrames):
-        return motion
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Downsample a motion tensor to the target frame count."""
     currentFrames = motion.shape[0]
-    if currentFrames <= targetFrames:
-        return motion
-    stride = math.ceil(currentFrames / targetFrames)
-    return motion[::max(stride, MIN_FRAME_COUNT)]
+    indices = _buildDownsampleIndices(currentFrames, targetFrames)
+    if indices.numel() == currentFrames:
+        return motion, indices
+    return motion.index_select(0, indices), indices
+
+
+def _buildDownsampleIndices(
+    frameCount: int,
+    targetFrames: Optional[int],
+) -> torch.Tensor:
+    """Return the temporal indices kept after downsampling."""
+    if frameCount <= 0:
+        return torch.zeros(0, dtype=torch.long)
+    if not _isFrameCountValid(targetFrames):
+        return torch.arange(frameCount, dtype=torch.long)
+    if frameCount <= targetFrames:
+        return torch.arange(frameCount, dtype=torch.long)
+    stride = math.ceil(frameCount / targetFrames)
+    return torch.arange(0, frameCount, max(stride, MIN_FRAME_COUNT))
+
+
+def _sliceTemporalExtras(
+    extras: Dict[str, object],
+    start: int,
+    end: int,
+    downsampleIndices: torch.Tensor,
+) -> Dict[str, object]:
+    """Slice and downsample temporal extras to match a motion window."""
+    sliced: Dict[str, object] = {}
+    rawTranslation = extras.get("trans")
+    if rawTranslation is None:
+        return sliced
+    translation = torch.as_tensor(rawTranslation, dtype=torch.float32)
+    if translation.dim() != 2 or translation.shape[1] != 3:
+        LOGGER.warning(
+            "Ignoring root translation with unexpected shape %s.",
+            tuple(translation.shape),
+        )
+        return sliced
+    translation = translation[start:end]
+    if translation.shape[0] != downsampleIndices.numel():
+        translation = translation.index_select(0, downsampleIndices)
+    sliced["trans"] = translation
+    return sliced
 
 
 def _isFramesValid(frames: int, maxFrames: Optional[int]) -> bool:
-    """
-    Check whether frame count passes the filter.
-
-    Parameters
-    ----------
-    frames : int
-        Frame count to validate.
-    maxFrames : Optional[int]
-        Maximum allowed frame count.
-    """
+    """Check whether frame count passes the filter."""
     if frames < MIN_FRAME_COUNT:
         return False
     if maxFrames is None:
@@ -610,79 +716,33 @@ def _isFramesValid(frames: int, maxFrames: Optional[int]) -> bool:
     return frames <= maxFrames
 
 
-def _tokenizeText(
-    tokenizer: XLMRobertaTokenizerFast,
-    text: str,
-    maxPromptLength: int,
-) -> Dict[str, torch.Tensor]:
-    """
-    Tokenize text.
-
-    Parameters
-    ----------
-    tokenizer : XLMRobertaTokenizerFast
-        Tokenizer instance.
-    text : str
-        Prompt text.
-    maxPromptLength : int
-        Token length for truncation and padding.
-    """
-    encoded = tokenizer(
-        text,
-        padding="max_length",
-        truncation=True,
-        max_length=maxPromptLength,
-        return_tensors="pt",
-    )
-    return {
-        "input_ids": encoded["input_ids"].squeeze(0),
-        "attention_mask": encoded["attention_mask"].squeeze(0),
-    }
+def _maskedMean(
+    sequenceOutput: torch.Tensor,
+    attentionMask: torch.Tensor,
+) -> torch.Tensor:
+    """Compute a masked mean pooling over the sequence dimension."""
+    expandedMask = attentionMask.unsqueeze(-1).expand_as(sequenceOutput).float()
+    safeDenominator = expandedMask.sum(dim=1).clamp(min=1e-6)
+    maskedSum = (sequenceOutput * expandedMask).sum(dim=1)
+    return maskedSum / safeDenominator
 
 
 def _estimateSampleBytes(sample: Dict[str, object]) -> int:
-    """
-    Estimate the memory footprint of a sample.
-
-    Parameters
-    ----------
-    sample : Dict[str, object]
-        Sample dictionary with tensors.
-    """
-    inputIds = sample["input_ids"]
-    attentionMask = sample["attention_mask"]
-    motion = sample["motion"]
-    totalBytes = (
-        _tensorBytes(inputIds)
-        + _tensorBytes(attentionMask)
-        + _tensorBytes(motion)
-    )
+    """Estimate the memory footprint of a sample-like payload."""
+    totalBytes = 0
+    for value in sample.values():
+        if isinstance(value, torch.Tensor):
+            totalBytes += _tensorBytes(value)
     return int(totalBytes)
 
 
 def _tensorBytes(tensor: torch.Tensor) -> int:
-    """
-    Return bytes consumed by a tensor.
-
-    Parameters
-    ----------
-    tensor : torch.Tensor
-        Tensor to inspect.
-    """
+    """Return bytes consumed by a tensor."""
     return int(tensor.numel() * tensor.element_size())
 
 
-def _safeAverage(total: int, count: int) -> float:
-    """
-    Return a safe average.
-
-    Parameters
-    ----------
-    total : int
-        Total sum.
-    count : int
-        Count of entries.
-    """
+def _safeAverage(total: int | float, count: int) -> float:
+    """Return a safe average."""
     if count <= 0:
         return 0.0
     return float(total) / float(count)

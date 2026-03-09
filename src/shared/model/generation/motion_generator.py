@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 import torch
 import torch.nn as nn
 
 from src.shared.model.clip.core import ClipModel
+from src.shared.model.components import buildMotionFeatureTensors
+from src.shared.model.components.base import MotionComponent
 from src.shared.model.generation.ddim import DDIM
 from src.shared.model.generation.denoiser import MotionDenoiser
 from src.shared.model.generation.losses import (
@@ -32,6 +34,7 @@ class MotionGenerator(nn.Module):
     and post-processing correction layers.
     """
     MOTION_ROTATION_CHANNELS = 6
+    ROOT_TRANSLATION_CHANNELS = 3
 
     def __init__(
         self,
@@ -49,10 +52,15 @@ class MotionGenerator(nn.Module):
         velXyzWeight: float = DEFAULT_VELOCITY_XYZ_WEIGHT,
         diffusionWeight: float = 1.0,
         accelerationWeight: float = 0.0,
+        clipGuidanceWeight: float = 0.0,
         numSpatialLayers: int = 1,
         numSpatioTemporalLayers: int = 1,
         maxPromptLength: int = 64,
         generationEmbedDim: Optional[int] = None,
+        clipMotionNumHeads: int = 4,
+        clipMotionNumLayers: int = 2,
+        clipMotionComponents: Optional[tuple[MotionComponent, ...]] = None,
+        generationMotionComponents: Optional[tuple[MotionComponent, ...]] = None,
     ) -> None:
         """
         Initialize MotionGenerator.
@@ -87,6 +95,8 @@ class MotionGenerator(nn.Module):
             Weight for diffusion loss, by default 1.0.
         accelerationWeight : float, optional
             Weight for acceleration loss, by default 0.0.
+        clipGuidanceWeight : float, optional
+            Weight for the auxiliary CLIP text-motion guidance loss.
         numSpatialLayers : int, optional
             Number of spatial GCN blocks.
         numSpatioTemporalLayers : int, optional
@@ -96,6 +106,17 @@ class MotionGenerator(nn.Module):
         generationEmbedDim : Optional[int], optional
             Internal denoiser width. When omitted, defaults to ``embedDim``
             for backward compatibility.
+        clipMotionNumHeads : int, optional
+            Number of attention heads in the frozen CLIP motion encoder.
+        clipMotionNumLayers : int, optional
+            Number of transformer layers in the frozen CLIP motion encoder.
+        clipMotionComponents : Optional[tuple[MotionComponent, ...]], optional
+            Optional CLIP motion feature layout. When omitted, CLIP uses the
+            legacy rotation-only motion tensor.
+        generationMotionComponents : Optional[tuple[MotionComponent, ...]], optional
+            Motion features supervised during generation training. The denoiser
+            still predicts the base 6D rotation tensor, while auxiliary heads
+            and losses can supervise extra motion signals such as root motion.
         """
         super().__init__()
         self.embedDim = embedDim
@@ -112,13 +133,24 @@ class MotionGenerator(nn.Module):
         self.velXyzWeight = velXyzWeight
         self.diffusionWeight = diffusionWeight
         self.accelerationWeight = accelerationWeight
+        self.clipGuidanceWeight = clipGuidanceWeight
         self.maxPromptLength = max(1, int(maxPromptLength))
+        self.generationMotionComponents = tuple(generationMotionComponents or ())
+        self._generationComponentsBySampleKey = {
+            component.sampleKey: component
+            for component in self.generationMotionComponents
+            if component.key != "rotation6d"
+        }
 
         # CLIP text encoder (frozen)
         self.clip = ClipModel(
             modelName=modelName,
             embedDim=embedDim,
             freezeTextEncoder=True,
+            motionNumHeads=clipMotionNumHeads,
+            motionNumLayers=clipMotionNumLayers,
+            motionComponents=clipMotionComponents,
+            numBones=numBones,
         )
         if clipCheckpoint is not None:
             self._loadClipCheckpoint(clipCheckpoint)
@@ -135,6 +167,20 @@ class MotionGenerator(nn.Module):
             numSpatioTemporalLayers=numSpatioTemporalLayers,
             textEmbedDim=embedDim,
         )
+        self.rootTranslationHead: Optional[nn.Module]
+        if self._requiresRootTranslationHead():
+            flatMotionDim = self.numBones * self.MOTION_ROTATION_CHANNELS
+            self.rootTranslationHead = nn.Sequential(
+                nn.LayerNorm(flatMotionDim),
+                nn.Linear(flatMotionDim, self.generationEmbedDim),
+                nn.SiLU(),
+                nn.Linear(
+                    self.generationEmbedDim,
+                    self.ROOT_TRANSLATION_CHANNELS,
+                ),
+            )
+        else:
+            self.rootTranslationHead = None
 
         # Post-processing (inference only)
         self.renorm = Renormalization()
@@ -143,26 +189,29 @@ class MotionGenerator(nn.Module):
 
     def forward(
         self,
-        textInputIds: torch.Tensor,
-        textAttentionMask: torch.Tensor,
-        noisyMotion: torch.Tensor,
-        timesteps: torch.Tensor,
+        textInputIds: Optional[torch.Tensor] = None,
+        textAttentionMask: Optional[torch.Tensor] = None,
+        noisyMotion: Optional[torch.Tensor] = None,
+        timesteps: Optional[torch.Tensor] = None,
         targetNoise: Optional[torch.Tensor] = None,
         targetMotion: Optional[torch.Tensor] = None,
         motionMask: Optional[torch.Tensor] = None,
+        clipMotionContext: Optional[Mapping[str, object]] = None,
+        textEmbedding: Optional[torch.Tensor] = None,
+        componentTargets: Optional[Mapping[str, torch.Tensor]] = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass for training.
 
         Parameters
         ----------
-        textInputIds : torch.Tensor
+        textInputIds : Optional[torch.Tensor]
             Tokenized text input IDs.
-        textAttentionMask : torch.Tensor
+        textAttentionMask : Optional[torch.Tensor]
             Text attention mask.
-        noisyMotion : torch.Tensor
+        noisyMotion : Optional[torch.Tensor]
             Noisy motion shaped (batch, frames, bones, 6).
-        timesteps : torch.Tensor
+        timesteps : Optional[torch.Tensor]
             Diffusion timesteps shaped (batch,).
         targetNoise : Optional[torch.Tensor], optional
             Unused legacy argument kept for backward compatibility.
@@ -170,18 +219,38 @@ class MotionGenerator(nn.Module):
             Ground truth clean motion for x0-based losses.
         motionMask : Optional[torch.Tensor], optional
             Boolean mask indicating valid (non-padded) frames.
+        clipMotionContext : Optional[Mapping[str, object]], optional
+            Auxiliary tensors used to rebuild the CLIP motion input for
+            guidance when some CLIP components are not directly predicted.
+        textEmbedding : Optional[torch.Tensor], optional
+            Precomputed CLIP text embedding used during training.
+        componentTargets : Optional[Mapping[str, torch.Tensor]], optional
+            Auxiliary generation targets keyed by sample tensor name
+            (for example ``root_translation`` or ``joint_xyz``).
 
         Returns
         -------
         dict[str, torch.Tensor]
             Dictionary with predicted noise and optional loss.
         """
-        # Get frozen text embedding from CLIP
-        with torch.no_grad():
-            textEmbeds, _ = self.clip.encodeText(
-                inputIds=textInputIds,
-                attentionMask=textAttentionMask,
-            )
+        if noisyMotion is None or timesteps is None:
+            raise ValueError("noisyMotion and timesteps are required.")
+        if textEmbedding is not None:
+            if textInputIds is not None or textAttentionMask is not None:
+                raise ValueError(
+                    "Provide either textEmbedding or tokenized inputs, not both."
+                )
+            textEmbeds = textEmbedding
+        else:
+            if textInputIds is None or textAttentionMask is None:
+                raise ValueError(
+                    "textEmbedding or tokenized text inputs are required."
+                )
+            with torch.no_grad():
+                textEmbeds, _ = self.clip.encodeText(
+                    inputIds=textInputIds,
+                    attentionMask=textAttentionMask,
+                )
 
         # Predict denoiser output
         if noisyMotion.shape[-1] != self.MOTION_ROTATION_CHANNELS:
@@ -205,11 +274,14 @@ class MotionGenerator(nn.Module):
             timesteps=timesteps,
             modelOutput=denoiserOutput,
         )
+        predictedRootTranslation = self._predictRootTranslation(predictedMotion)
 
         result = {
             "predicted_noise": predictedNoise,
             "predicted_motion": predictedMotion,
         }
+        if predictedRootTranslation is not None:
+            result["predicted_root_translation"] = predictedRootTranslation
 
         if targetMotion is not None:
             from src.shared.model.generation.losses import combinedGenerationLoss
@@ -226,6 +298,29 @@ class MotionGenerator(nn.Module):
                 numTimesteps=self.ddim.num_timesteps,
                 motionMask=motionMask,
             )
+            componentLoss, componentLosses = self._generationComponentLoss(
+                predictedMotion=predictedMotion,
+                predictedRootTranslation=predictedRootTranslation,
+                componentTargets=componentTargets,
+                motionMask=motionMask,
+            )
+            if componentLoss is not None:
+                loss = loss + componentLoss
+                result.update(componentLosses)
+            if self.clipGuidanceWeight > 0.0:
+                clipMotionInput = self.clip.buildMotionInputFromMotion(
+                    motion=predictedMotion,
+                    context=clipMotionContext,
+                )
+                clipMotionEmbeds = self.clip.encodeMotion(
+                    clipMotionInput,
+                    motionMask=motionMask,
+                )
+                clipGuidanceLoss = 1.0 - (
+                    torch.sum(textEmbeds * clipMotionEmbeds, dim=-1).mean()
+                )
+                loss = loss + (self.clipGuidanceWeight * clipGuidanceLoss)
+                result["loss_clip_guidance"] = clipGuidanceLoss.detach()
             result["loss"] = loss
             result.update(components)
         elif targetNoise is not None:
@@ -236,6 +331,80 @@ class MotionGenerator(nn.Module):
 
         return result
 
+    def train(self, mode: bool = True) -> MotionGenerator:
+        """
+        Keep the frozen CLIP tower in eval mode while toggling the generator.
+        """
+        super().train(mode)
+        self.clip.eval()
+        return self
+
+    @torch.no_grad()
+    def generateSample(
+        self,
+        prompt: str,
+        numFrames: int,
+        ddimSteps: int = 50,
+        device: Optional[torch.device] = None,
+        applyPostProcessing: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Generate a motion sample and any exported auxiliary features.
+        """
+        if device is None:
+            device = next(self.parameters()).device
+
+        self.eval()
+
+        encoded = self.clip.tokenizer(
+            prompt,
+            padding="max_length",
+            truncation=True,
+            max_length=self.maxPromptLength,
+            return_tensors="pt",
+        )
+        inputIds = encoded["input_ids"].to(device)
+        attentionMask = encoded["attention_mask"].to(device)
+
+        textEmbeds, _ = self.clip.encodeText(inputIds, attentionMask)
+
+        x = torch.randn(1, numFrames, self.numBones, 6, device=device)
+        resolvedSteps = max(1, min(int(ddimSteps), self.diffusionSteps))
+        stepRatio = max(1, self.diffusionSteps // resolvedSteps)
+        timestepSequence = list(range(0, self.diffusionSteps, stepRatio))[::-1]
+
+        for i, t in enumerate(timestepSequence):
+            tBatch = torch.full((1,), t, device=device, dtype=torch.long)
+            denoiserOutput = self.denoiser(
+                noisyMotion=x,
+                textEmbedding=textEmbeds,
+                timesteps=tBatch,
+            )
+            predictedNoise, _ = self._resolveModelPredictions(
+                noisyMotion=x,
+                timesteps=tBatch,
+                modelOutput=denoiserOutput,
+            )
+            x = self._ddimStep(x, predictedNoise, t, timestepSequence, i)
+
+        rawMotion6d = x
+        predictedRootTranslation = self._predictRootTranslation(rawMotion6d)
+        motion6d = rawMotion6d
+        if applyPostProcessing:
+            batch, frames, bones, channels = motion6d.shape
+            motionFlat = motion6d.view(batch, frames, bones * channels)
+            smoothed = self.smoothing(motionFlat)
+            motion6d = smoothed.view(batch, frames, bones, channels)
+
+        motionQuat = self._sixdToQuaternion(motion6d)
+        if applyPostProcessing:
+            motionQuat = self.velocityReg(motionQuat)
+        sample = {"motion_quat": motionQuat}
+
+        if predictedRootTranslation is not None:
+            sample["root_translation"] = predictedRootTranslation
+        return sample
+
     @torch.no_grad()
     def generate(
         self,
@@ -243,6 +412,7 @@ class MotionGenerator(nn.Module):
         numFrames: int,
         ddimSteps: int = 50,
         device: Optional[torch.device] = None,
+        applyPostProcessing: bool = True,
     ) -> torch.Tensor:
         """
         Generate motion from text prompt using DDIM sampling.
@@ -263,66 +433,13 @@ class MotionGenerator(nn.Module):
         torch.Tensor
             Generated motion shaped (1, frames, bones, 4) as quaternions.
         """
-        if device is None:
-            device = next(self.parameters()).device
-
-        self.eval()
-
-        # Tokenize prompt
-        encoded = self.clip.tokenizer(
-            prompt,
-            padding="max_length",
-            truncation=True,
-            max_length=self.maxPromptLength,
-            return_tensors="pt",
-        )
-        inputIds = encoded["input_ids"].to(device)
-        attentionMask = encoded["attention_mask"].to(device)
-
-        # Get text embedding
-        textEmbeds, _ = self.clip.encodeText(inputIds, attentionMask)
-
-        # Initialize random noise
-        x = torch.randn(1, numFrames, self.numBones, 6, device=device)
-
-        # DDIM sampling with fewer steps
-        stepRatio = self.diffusionSteps // ddimSteps
-        timestepSequence = list(range(0, self.diffusionSteps, stepRatio))[::-1]
-
-        for i, t in enumerate(timestepSequence):
-            tBatch = torch.full((1,), t, device=device, dtype=torch.long)
-
-            # Predict x0, then derive the epsilon view needed by DDIM.
-            denoiserOutput = self.denoiser(
-                noisyMotion=x,
-                textEmbedding=textEmbeds,
-                timesteps=tBatch,
-            )
-            predictedNoise, _ = self._resolveModelPredictions(
-                noisyMotion=x,
-                timesteps=tBatch,
-                modelOutput=denoiserOutput,
-            )
-
-            # DDIM step
-            x = self._ddimStep(x, predictedNoise, t, timestepSequence, i)
-
-        # Post-process: apply corrections
-        motion6d = x
-
-        # Reshape for smoothing: (batch, frames, bones * 6)
-        batch, frames, bones, channels = motion6d.shape
-        motionFlat = motion6d.view(batch, frames, bones * channels)
-        smoothed = self.smoothing(motionFlat)
-        motion6d = smoothed.view(batch, frames, bones, channels)
-
-        # Convert 6D to quaternions
-        motionQuat = self._sixdToQuaternion(motion6d)
-
-        # Apply velocity regularization
-        motionQuat = self.velocityReg(motionQuat)
-
-        return motionQuat
+        return self.generateSample(
+            prompt=prompt,
+            numFrames=numFrames,
+            ddimSteps=ddimSteps,
+            device=device,
+            applyPostProcessing=applyPostProcessing,
+        )["motion_quat"]
 
     def _ddimStep(
         self,
@@ -402,6 +519,116 @@ class MotionGenerator(nn.Module):
             predictedMotion,
         )
         return predictedNoise, predictedMotion
+
+    def trainableParameters(self) -> tuple[nn.Parameter, ...]:
+        """Return every parameter optimized during generation training."""
+        parameters = list(self.denoiser.parameters())
+        if self.rootTranslationHead is not None:
+            parameters.extend(self.rootTranslationHead.parameters())
+        return tuple(parameters)
+
+    def _requiresRootTranslationHead(self) -> bool:
+        """Return True when generation supervision needs explicit root motion."""
+        requiredKeys = {"root_translation", "root_velocity"}
+        return any(
+            component.key in requiredKeys
+            for component in self.generationMotionComponents
+        )
+
+    def _predictRootTranslation(
+        self,
+        motion: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Predict root translation from the generated 6D motion sequence."""
+        if self.rootTranslationHead is None:
+            return None
+        flatMotion = motion.reshape(motion.shape[0], motion.shape[1], -1)
+        return self.rootTranslationHead(flatMotion)
+
+    def _generationComponentLoss(
+        self,
+        predictedMotion: torch.Tensor,
+        predictedRootTranslation: Optional[torch.Tensor],
+        componentTargets: Optional[Mapping[str, torch.Tensor]],
+        motionMask: Optional[torch.Tensor],
+    ) -> tuple[Optional[torch.Tensor], dict[str, torch.Tensor]]:
+        """Compute auxiliary losses for enabled generation components."""
+        if not componentTargets or not self._generationComponentsBySampleKey:
+            return None, {}
+
+        predictedTargets = self._buildPredictedComponentTargets(
+            predictedMotion=predictedMotion,
+            predictedRootTranslation=predictedRootTranslation,
+        )
+        totalLoss = torch.tensor(0.0, device=predictedMotion.device)
+        lossCount = 0
+        losses: dict[str, torch.Tensor] = {}
+
+        for sampleKey, target in componentTargets.items():
+            component = self._generationComponentsBySampleKey.get(sampleKey)
+            if component is None:
+                continue
+            predicted = predictedTargets.get(sampleKey)
+            if predicted is None:
+                continue
+            componentLoss = component.loss(
+                predicted=predicted,
+                target=target,
+                motionMask=motionMask,
+            )
+            weightedLoss = self._componentLossWeight(component.key) * componentLoss
+            totalLoss = totalLoss + weightedLoss
+            losses[f"loss_{component.key}"] = componentLoss.detach()
+            lossCount += 1
+
+        if lossCount == 0:
+            return None, {}
+        totalLoss = totalLoss / float(lossCount)
+        losses["loss_components"] = totalLoss.detach()
+        return totalLoss, losses
+
+    def _buildPredictedComponentTargets(
+        self,
+        predictedMotion: torch.Tensor,
+        predictedRootTranslation: Optional[torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Build auxiliary targets from the predicted clean motion."""
+        if not self.generationMotionComponents:
+            return {}
+
+        stacked: dict[str, list[torch.Tensor]] = {}
+        for batchIndex in range(predictedMotion.shape[0]):
+            extras: dict[str, object] = {}
+            if predictedRootTranslation is not None:
+                extras["trans"] = predictedRootTranslation[batchIndex]
+            sampleFeatures = buildMotionFeatureTensors(
+                motion=predictedMotion[batchIndex],
+                extras=extras,
+                enabledComponents=self.generationMotionComponents,
+            )
+            for sampleKey, value in sampleFeatures.items():
+                stacked.setdefault(sampleKey, []).append(value)
+        return {
+            sampleKey: torch.stack(values, dim=0)
+            for sampleKey, values in stacked.items()
+        }
+
+    def _componentLossWeight(self, componentKey: str) -> float:
+        """Resolve the default weight for one auxiliary motion component."""
+        if componentKey in {"root_translation", "joint_xyz", "pelvis_height"}:
+            return max(1.0, float(self.xyzWeight))
+        if componentKey in {
+            "root_velocity",
+            "joint_velocity",
+            "end_effector_velocity",
+            "root_yaw_velocity",
+        }:
+            return max(1.0, float(self.velXyzWeight))
+        if componentKey == "root_yaw":
+            return max(0.5, float(self.xyzWeight))
+        if componentKey in {"foot_contact", "hand_contact"}:
+            return 1.0
+        return 1.0
 
     def _sixdToQuaternion(self, sixd: torch.Tensor) -> torch.Tensor:
         """
@@ -501,9 +728,19 @@ class MotionGenerator(nn.Module):
             Path to the CLIP checkpoint file.
         """
         checkpoint = torch.load(checkpointPath, weights_only=False, map_location="cpu")
-        self.clip.load_state_dict(checkpoint["model_state_dict"])
+        try:
+            self.clip.load_state_dict(checkpoint["model_state_dict"])
+        except RuntimeError as error:
+            raise RuntimeError(
+                "Failed to load the CLIP checkpoint. The checkpoint motion "
+                "encoder likely does not match the current CLIP architecture "
+                "(clip.motion-num-heads / clip.motion-num-layers) or "
+                "clip.bone-data layout. Re-train CLIP or point generation "
+                f"to a matching checkpoint. Original error: {error}"
+            ) from error
 
     def _freezeClip(self) -> None:
         """Freeze all CLIP parameters."""
         for param in self.clip.parameters():
             param.requires_grad = False
+        self.clip.eval()

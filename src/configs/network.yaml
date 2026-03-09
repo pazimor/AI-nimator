@@ -13,20 +13,92 @@
 # ============================================
 default:
   # CLIP embedding dimension (must match the CLIP checkpoint output size)
-  embed-dim: 512
-
+  embed-dim: 768
+  
   # CLIP Motion Encoder Architecture
   clip:
     motion-num-heads: 4
-    motion-num-layers: 2
-
-  # Generation Denoiser Architecture
+    motion-num-layers: 4
+    # The preprocessed dataset can still store extra motion features
+    # for retrieval and generation.
+    bone-data:
+      rotation6d: true
+      foot-contact: true
+      hand-contact: true
+      root-translation: true
+      root-velocity: true
+      root-yaw: true
+      root-yaw-velocity: true
+      joint-xyz: true
+      joint-velocity: true
+      end-effector-velocity: false
+      pelvis-height: false
+  
   generation:
-    # Internal denoiser width (can be larger than the CLIP embed-dim)
     embed-dim: 768
-    num-heads: 1
-    num-layers: 1
+    num-heads: 4
+    num-layers: 4
     num-bones: 22
     diffusion-steps: 500
-    num-spatial-layers: 2
-    num-spatio-temporal-layers: 2
+    num-spatial-layers: 4
+    num-spatio-temporal-layers: 4
+
+    bone-data:
+      rotation6d: true
+      foot-contact: false
+      hand-contact: false
+      root-translation: true
+      root-velocity: false
+      root-yaw: false
+      root-yaw-velocity: false
+      joint-xyz: true
+      joint-velocity: false
+      end-effector-velocity: false
+      pelvis-height: false
+
+# ============================================
+# Profile: Overfit
+# Narrower auxiliary supervision to make one-motion memorization stable.
+# Keep the CLIP motion layout identical to the checkpoint, but reduce the
+# generation-side targets to the signals that matter most for locomotion.
+# ============================================
+overfit:
+  embed-dim: 768
+
+  clip:
+    motion-num-heads: 4
+    motion-num-layers: 4
+    bone-data:
+      rotation6d: true
+      foot-contact: true
+      hand-contact: true
+      root-translation: true
+      root-velocity: true
+      root-yaw: true
+      root-yaw-velocity: true
+      joint-xyz: true
+      joint-velocity: true
+      end-effector-velocity: false
+      pelvis-height: false
+
+  generation:
+    embed-dim: 768
+    num-heads: 4
+    num-layers: 4
+    num-bones: 22
+    diffusion-steps: 500
+    num-spatial-layers: 4
+    num-spatio-temporal-layers: 4
+
+    bone-data:
+      rotation6d: true
+      foot-contact: false
+      hand-contact: false
+      root-translation: true
+      root-velocity: false
+      root-yaw: false
+      root-yaw-velocity: false
+      joint-xyz: true
+      joint-velocity: false
+      end-effector-velocity: false
+      pelvis-height: false

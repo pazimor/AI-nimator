@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Iterable, Mapping, Optional, Tuple
 
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from src.shared.types.generation import PREDICTION_TARGET_X0
@@ -42,10 +43,18 @@ LOSS_COMPONENT_KEYS = (
     "loss_xyz",
     "loss_vel_xyz",
     "loss_acceleration",
+    "loss_clip_guidance",
+    "loss_root_translation",
+    "loss_root_velocity",
+    "loss_components",
 )
 LOSS_COMPONENT_LABELS = {
     "loss_xyz": "xyz",
     "loss_vel_xyz": "vel_xyz",
+    "loss_clip_guidance": "clip",
+    "loss_root_translation": "rtrans",
+    "loss_root_velocity": "rvel",
+    "loss_components": "aux",
 }
 
 
@@ -78,10 +87,10 @@ def _extractLossComponents(
         Dictionary with detached component values.
     """
     components: LossComponents = {}
-    for key in LOSS_COMPONENT_KEYS:
-        value = outputs.get(key)
-        if value is not None:
-            components[key] = float(value.detach().item())
+    for key, value in outputs.items():
+        if key == "loss" or not key.startswith("loss_"):
+            continue
+        components[key] = float(value.detach().item())
     return components
 
 
@@ -180,8 +189,8 @@ def buildOptimizer(
     torch.optim.Optimizer
         AdamW optimizer for denoiser parameters.
     """
-    # Only train denoiser parameters (CLIP is frozen)
-    trainableParams = list(model.denoiser.parameters())
+    # Train the denoiser and any auxiliary generation heads (CLIP is frozen).
+    trainableParams = list(model.trainableParameters())
     return torch.optim.AdamW(trainableParams, lr=learningRate)
 
 
@@ -197,6 +206,7 @@ def trainOneEpoch(
     chunkInfo: Optional[str] = None,
     memoryLimitGB: float = 0.0,
     clearMpsCache: bool = True,
+    deterministicCorruption: bool = False,
 ) -> tuple[float, LossComponents]:
     """
     Run a single training epoch.
@@ -263,6 +273,7 @@ def trainOneEpoch(
                 ddim,
                 device,
                 gradientAccumulation,
+                deterministicCorruption=deterministicCorruption,
             )
             pbar.updateLoss(lossValue)
             _updateLossComponents(componentSums, lossComponents)
@@ -280,7 +291,7 @@ def trainOneEpoch(
             # Step optimizer after accumulation
             if accumSteps >= gradientAccumulation:
                 torch.nn.utils.clip_grad_norm_(
-                    model.denoiser.parameters(),
+                    model.trainableParameters(),
                     max_norm=1.0,
                 )
                 optimizer.step()
@@ -307,6 +318,7 @@ def _runBatch(
     optimizer: torch.optim.Optimizer,
     ddim: DDIM,
     device: torch.device,
+    deterministicCorruption: bool = False,
 ) -> tuple[float, LossComponents]:
     """
     Run forward/backward pass for a single batch.
@@ -334,45 +346,48 @@ def _runBatch(
     )  # More memory-efficient than zero_grad()
 
     # Move data to device
-    inputIds = batch["input_ids"].to(device)
-    attentionMask = batch["attention_mask"].to(device)
+    textEmbedding = batch["generation_text_embedding"].to(device)
     motion = batch["motion"].to(device)
     motionMask = batch.get("motion_mask")
     if motionMask is not None:
         motionMask = motionMask.to(device)
+    clipMotionContext = model.clip.extractMotionContext(batch)
+    componentTargets = _extractComponentTargets(batch, model, device)
     batchSize = motion.shape[0]
     _ensureRotationOnlyInput(motion)
+
+    timesteps, noise, noisyMotion = _prepareDiffusionInputs(
+        batch=batch,
+        motion=motion,
+        ddim=ddim,
+        device=device,
+        deterministicCorruption=deterministicCorruption,
+    )
 
     # Delete batch reference early
     del batch
 
-    # Sample random timesteps
-    timesteps = torch.randint(
-        0, ddim.num_timesteps,
-        (batchSize,),
-        device=device,
-        dtype=torch.long,
-    )
-
-    # Sample noise
-    noise = torch.randn_like(motion)
-
-    # Add noise to motion
-    noisyMotion = ddim.q_sample(motion, timesteps, noise)
-
     # Predict noise
     outputs = model(
-        textInputIds=inputIds,
-        textAttentionMask=attentionMask,
+        textEmbedding=textEmbedding,
         noisyMotion=noisyMotion,
         timesteps=timesteps,
         targetNoise=noise,
         targetMotion=motion,
         motionMask=motionMask,
+        clipMotionContext=clipMotionContext,
+        componentTargets=componentTargets,
     )
     
     # Delete inputs early
-    del inputIds, attentionMask, noisyMotion, motion, motionMask
+    del (
+        textEmbedding,
+        noisyMotion,
+        motion,
+        motionMask,
+        clipMotionContext,
+        componentTargets,
+    )
 
     loss = outputs["loss"]
     lossComponents = _extractLossComponents(outputs)
@@ -383,7 +398,7 @@ def _runBatch(
     loss.backward()
     
     # Clip gradients to prevent memory spikes
-    torch.nn.utils.clip_grad_norm_(model.denoiser.parameters(), max_norm=1.0)
+    torch.nn.utils.clip_grad_norm_(model.trainableParameters(), max_norm=1.0)
     
     optimizer.step()
 
@@ -401,6 +416,7 @@ def _runBatchAccumulate(
     ddim: DDIM,
     device: torch.device,
     gradientAccumulation: int = 1,
+    deterministicCorruption: bool = False,
 ) -> tuple[float, LossComponents]:
     """
     Run forward/backward pass for gradient accumulation (no optimizer step).
@@ -424,43 +440,46 @@ def _runBatchAccumulate(
         Batch loss value and component breakdown.
     """
     # Move data to device
-    inputIds = batch["input_ids"].to(device)
-    attentionMask = batch["attention_mask"].to(device)
+    textEmbedding = batch["generation_text_embedding"].to(device)
     motion = batch["motion"].to(device)
     motionMask = batch.get("motion_mask")
     if motionMask is not None:
         motionMask = motionMask.to(device)
+    clipMotionContext = model.clip.extractMotionContext(batch)
+    componentTargets = _extractComponentTargets(batch, model, device)
     batchSize = motion.shape[0]
     _ensureRotationOnlyInput(motion)
 
-    del batch
-
-    # Sample random timesteps
-    timesteps = torch.randint(
-        0, ddim.num_timesteps,
-        (batchSize,),
+    timesteps, noise, noisyMotion = _prepareDiffusionInputs(
+        batch=batch,
+        motion=motion,
+        ddim=ddim,
         device=device,
-        dtype=torch.long,
+        deterministicCorruption=deterministicCorruption,
     )
 
-    # Sample noise
-    noise = torch.randn_like(motion)
-
-    # Add noise to motion
-    noisyMotion = ddim.q_sample(motion, timesteps, noise)
+    del batch
 
     # Predict noise
     outputs = model(
-        textInputIds=inputIds,
-        textAttentionMask=attentionMask,
+        textEmbedding=textEmbedding,
         noisyMotion=noisyMotion,
         timesteps=timesteps,
         targetNoise=noise,
         targetMotion=motion,
         motionMask=motionMask,
+        clipMotionContext=clipMotionContext,
+        componentTargets=componentTargets,
     )
     
-    del inputIds, attentionMask, noisyMotion, motion, motionMask
+    del (
+        textEmbedding,
+        noisyMotion,
+        motion,
+        motionMask,
+        clipMotionContext,
+        componentTargets,
+    )
 
     loss = outputs["loss"]
     lossComponents = _extractLossComponents(outputs)
@@ -481,6 +500,7 @@ def evaluateValidation(
     model: MotionGenerator,
     ddim: DDIM,
     device: torch.device,
+    deterministicCorruption: bool = False,
 ) -> tuple[float, LossComponents]:
     """
     Compute average loss on validation set.
@@ -508,32 +528,33 @@ def evaluateValidation(
 
     with torch.no_grad():
         for batch in dataloader:
-            inputIds = batch["input_ids"].to(device)
-            attentionMask = batch["attention_mask"].to(device)
+            textEmbedding = batch["generation_text_embedding"].to(device)
             motion = batch["motion"].to(device)
             motionMask = batch.get("motion_mask")
             if motionMask is not None:
                 motionMask = motionMask.to(device)
+            clipMotionContext = model.clip.extractMotionContext(batch)
+            componentTargets = _extractComponentTargets(batch, model, device)
             batchSize = motion.shape[0]
             _ensureRotationOnlyInput(motion)
 
-            timesteps = torch.randint(
-                0, ddim.num_timesteps,
-                (batchSize,),
+            timesteps, noise, noisyMotion = _prepareDiffusionInputs(
+                batch=batch,
+                motion=motion,
+                ddim=ddim,
                 device=device,
-                dtype=torch.long,
+                deterministicCorruption=deterministicCorruption,
             )
-            noise = torch.randn_like(motion)
-            noisyMotion = ddim.q_sample(motion, timesteps, noise)
 
             outputs = model(
-                textInputIds=inputIds,
-                textAttentionMask=attentionMask,
+                textEmbedding=textEmbedding,
                 noisyMotion=noisyMotion,
                 timesteps=timesteps,
                 targetNoise=noise,
                 targetMotion=motion,
                 motionMask=motionMask,
+                clipMotionContext=clipMotionContext,
+                componentTargets=componentTargets,
             )
 
             totalLoss += float(outputs["loss"].item())
@@ -545,14 +566,15 @@ def evaluateValidation(
 
             # Free memory in validation loop
             del (
-                inputIds,
-                attentionMask,
+                textEmbedding,
                 motion,
                 noisyMotion,
                 noise,
                 timesteps,
                 outputs,
                 motionMask,
+                clipMotionContext,
+                componentTargets,
             )
 
     gc.collect()
@@ -571,6 +593,114 @@ def _ensureRotationOnlyInput(motion: torch.Tensor) -> None:
             "Expected motion input with 6 channels (rotation-only), "
             f"got {motion.shape[-1]}."
         )
+
+
+def _extractComponentTargets(
+    batch: BatchDict,
+    model: MotionGenerator,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Collect auxiliary generation targets available in the batch."""
+    targets: dict[str, torch.Tensor] = {}
+    for component in model.generationMotionComponents:
+        if component.key == "rotation6d":
+            continue
+        value = batch.get(component.sampleKey)
+        if isinstance(value, torch.Tensor):
+            targets[component.sampleKey] = value.to(device)
+    return targets
+
+
+def disableDropoutModules(module: nn.Module) -> int:
+    """Set every dropout probability in ``module`` to zero."""
+    updated = 0
+    for child in module.modules():
+        if isinstance(child, nn.Dropout):
+            child.p = 0.0
+            updated += 1
+    return updated
+
+
+def _prepareDiffusionInputs(
+    batch: BatchDict,
+    motion: torch.Tensor,
+    ddim: DDIM,
+    device: torch.device,
+    deterministicCorruption: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build timesteps/noise pairs for one batch."""
+    batchSize = motion.shape[0]
+    if not deterministicCorruption:
+        timesteps = torch.randint(
+            0,
+            ddim.num_timesteps,
+            (batchSize,),
+            device=device,
+            dtype=torch.long,
+        )
+        noise = torch.randn_like(motion)
+        return timesteps, noise, ddim.q_sample(motion, timesteps, noise)
+
+    sampleIds = _resolveDeterministicSampleIds(batch, batchSize)
+    timesteps = _deterministicTimesteps(
+        sampleIds=sampleIds,
+        numTimesteps=ddim.num_timesteps,
+        device=device,
+    )
+    noise = _deterministicNoise(
+        sampleIds=sampleIds,
+        motionShape=motion.shape,
+        dtype=motion.dtype,
+        device=device,
+    )
+    return timesteps, noise, ddim.q_sample(motion, timesteps, noise)
+
+
+def _resolveDeterministicSampleIds(
+    batch: BatchDict,
+    batchSize: int,
+) -> list[int]:
+    """Return stable per-sample ids used to seed deterministic corruption."""
+    sampleIds = batch.get("sample_id")
+    if isinstance(sampleIds, torch.Tensor) and sampleIds.numel() == batchSize:
+        return [int(value) for value in sampleIds.detach().cpu().view(-1)]
+    return list(range(batchSize))
+
+
+def _deterministicTimesteps(
+    sampleIds: list[int],
+    numTimesteps: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Map sample ids to stable diffusion timesteps."""
+    values = [
+        ((int(sampleId) * 1103515245 + 12345) & 0x7FFFFFFF) % numTimesteps
+        for sampleId in sampleIds
+    ]
+    return torch.tensor(values, device=device, dtype=torch.long)
+
+
+def _deterministicNoise(
+    sampleIds: list[int],
+    motionShape: torch.Size,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build stable Gaussian noise per sample on CPU and move it to device."""
+    sampleShape = tuple(motionShape[1:])
+    noiseSamples: list[torch.Tensor] = []
+    for sampleId in sampleIds:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(17_171 + int(sampleId))
+        sampleNoise = torch.randn(
+            sampleShape,
+            generator=generator,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        noiseSamples.append(sampleNoise)
+    noise = torch.stack(noiseSamples, dim=0)
+    return noise.to(device=device, dtype=dtype)
 
 
 def saveCheckpoint(
@@ -673,6 +803,12 @@ def loadCheckpoint(
         model.denoiser.load_state_dict(checkpoint["denoiser_state_dict"])
 
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        try:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        except ValueError as error:
+            raise RuntimeError(
+                "Optimizer state is incompatible with the current generation "
+                "parameter set."
+            ) from error
 
     return checkpoint.get("epoch", 0), checkpoint.get("loss", float("inf"))

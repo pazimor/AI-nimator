@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from src.shared.model.components.ops import rot6dToJointXYZ
 from src.shared.model.generation.losses import (
-    _rot6dToJointXYZ,
     combinedGenerationLoss,
     velocityXyzLoss,
     xyzLoss,
@@ -156,7 +156,7 @@ def test_combinedLoss_can_disable_vel_xyz_and_acc() -> None:
 
 def test_root_joint_stays_in_place_without_translation() -> None:
     motion = _randomMotion(batchSize=1, frameCount=5)
-    jointXyz = _rot6dToJointXYZ(motion)
+    jointXyz = rot6dToJointXYZ(motion)
     rootTrajectory = jointXyz[:, :, 0, :]
     drift = (rootTrajectory - rootTrajectory[:, :1, :]).abs().max()
     assert float(drift.item()) < 1e-5

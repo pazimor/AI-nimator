@@ -13,6 +13,11 @@ from src.shared.skeleton import SkeletonNormalizer
 from src.shared.types import PromptSegment
 
 MotionPayload = Tuple[torch.Tensor, Dict[str, object]]
+DetailedMotionPayload = Tuple[
+    torch.Tensor,
+    Dict[str, object],
+    Dict[str, object],
+]
 
 
 def loadPromptSegments(
@@ -59,6 +64,32 @@ def loadAnimationPayload(
     MotionPayload
         Motion tensor shaped (frames, bones, 6) and associated metadata.
     """
+    motion, metadata, _ = loadAnimationPayloadWithExtras(
+        path,
+        skeletonNormalizer=skeletonNormalizer,
+    )
+    return motion, metadata
+
+
+def loadAnimationPayloadWithExtras(
+    path: str | Path,
+    skeletonNormalizer: SkeletonNormalizer | None = None,
+) -> DetailedMotionPayload:
+    """
+    Return motion, metadata, and top-level extras from an animation payload.
+
+    Parameters
+    ----------
+    path : str | Path
+        Filesystem path to the animation.js or animation.json file.
+    skeletonNormalizer : SkeletonNormalizer | None, optional
+        Normalizer applied to incoming bones before tensorization.
+
+    Returns
+    -------
+    DetailedMotionPayload
+        Motion tensor, metadata, and raw top-level extras.
+    """
     payload = _readJsonLike(path)
     bones = payload.get("bones", [])
     if skeletonNormalizer is not None:
@@ -66,7 +97,8 @@ def loadAnimationPayload(
     metadata = _extractAnimationMeta(payload)
     frameCount = _inferFrameCount(metadata, bones)
     motion = _bonesToTensor(bones, frameCount)
-    return motion, metadata
+    extras = _extractAnimationExtras(payload)
+    return motion, metadata, extras
 
 
 def _segmentFromDict(rawSegment: Dict[str, object]) -> PromptSegment:
@@ -98,6 +130,13 @@ def _sanitizeJsonText(rawText: str) -> str:
 def _extractAnimationMeta(payload: Dict[str, object]) -> Dict[str, object]:
     meta = payload.get("meta", {}) or {}
     return dict(meta)
+
+
+def _extractAnimationExtras(payload: Dict[str, object]) -> Dict[str, object]:
+    extras = payload.get("extras", {}) or {}
+    if isinstance(extras, dict):
+        return dict(extras)
+    return {}
 
 
 def _inferFrameCount(

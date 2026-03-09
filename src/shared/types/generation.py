@@ -67,6 +67,11 @@ class GenerationTrainingHyperparameters:
         ("16") or a 1-based inclusive range ("3:6").
     clearMpsCache : bool
         When False, skip explicit calls to torch.mps.empty_cache().
+    deterministicCorruption : bool
+        When True, reuse a stable timestep/noise pair per sample to make
+        overfit runs deterministic across epochs.
+    disableDropout : bool
+        When True, force dropout modules to probability 0 during training.
     
     Learning Rate
     -------------
@@ -85,6 +90,8 @@ class GenerationTrainingHyperparameters:
         Weight for the main x0 diffusion loss.
     accelerationWeight : float
         Weight for acceleration regularization loss.
+    clipGuidanceWeight : float
+        Weight for the auxiliary CLIP text-motion alignment guidance loss.
     """
 
     batchSize: int
@@ -101,6 +108,8 @@ class GenerationTrainingHyperparameters:
     fixedTrainChunk: bool = False
     overfitSamples: Optional[str] = None
     clearMpsCache: bool = True
+    deterministicCorruption: bool = False
+    disableDropout: bool = False
     
     # Learning Rate
     learningRate: float = 0.001
@@ -109,6 +118,7 @@ class GenerationTrainingHyperparameters:
     velXyzWeight: float = 0.01
     diffusionWeight: float = 1.0
     accelerationWeight: float = 0.0
+    clipGuidanceWeight: float = 0.0
 
 
 @dataclass(frozen=True)

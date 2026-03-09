@@ -164,6 +164,8 @@ class ClipTrainingHyperparameters:
         Number of epochs without improvement before stopping.
     checkpointDir : Optional[Path]
         Directory to save model checkpoints.
+    validationIndicesPath : Optional[Path]
+        Path to the persisted validation indices used for a stable split.
     resumeCheckpoint : Optional[Path]
         Path to a checkpoint file to resume training from.
     gradientAccumulation : int
@@ -172,6 +174,15 @@ class ClipTrainingHyperparameters:
         Maximum memory usage in GB before triggering cleanup (0 to disable).
     weightDecay : float
         Weight decay for regularization.
+    maxSamplesPerEpoch : Optional[int]
+        Optional cap for samples per epoch.
+    fixedTrainChunk : bool
+        When True, reuse the same training chunk each epoch.
+    overfitSamples : Optional[str]
+        Optional overfit selector. Accepts either a fixed subset size
+        ("16") or a 1-based inclusive range ("3:6").
+    disableDropout : bool
+        When True, force dropout modules in the motion encoder to probability 0.
     
     Learning Rate
     -------------
@@ -187,10 +198,15 @@ class ClipTrainingHyperparameters:
     validationSplit: float = 0.1
     earlyStoppingPatience: int = 3
     checkpointDir: Optional[Path] = None
+    validationIndicesPath: Optional[Path] = None
     resumeCheckpoint: Optional[Path] = None
     gradientAccumulation: int = 1
     MM_memoryLimitGB: float = 0.0
     weightDecay: float = 0.0
+    maxSamplesPerEpoch: Optional[int] = None
+    fixedTrainChunk: bool = False
+    overfitSamples: Optional[str] = None
+    disableDropout: bool = False
     
     # Learning Rate
     learningRate: float = 0.001

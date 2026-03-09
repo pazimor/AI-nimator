@@ -17,6 +17,7 @@ from src.shared.constants.clip import (
     DEFAULT_VALIDATION_SPLIT,
 )
 from src.shared.types import (
+    BoneDataConfig,
     ClipTrainingConfig,
     ClipTrainingHyperparameters,
     ClipTrainingPaths,
@@ -50,7 +51,10 @@ GENERATION_DEFAULT_XYZ_SCHEDULE = "none"
 GENERATION_DEFAULT_VEL_XYZ_WEIGHT = 0.01
 GENERATION_DEFAULT_DIFFUSION_WEIGHT = 1.0
 GENERATION_DEFAULT_ACCELERATION_WEIGHT = 0.0
-PREPROCESS_DEFAULT_SHARD_SIZE = 256
+GENERATION_DEFAULT_CLIP_GUIDANCE_WEIGHT = 0.0
+PREPROCESS_DEFAULT_SAMPLE_SHARD_SIZE = 256
+PREPROCESS_DEFAULT_TEXT_SHARD_SIZE = 2048
+PREPROCESS_DEFAULT_TEXT_BATCH_SIZE = 64
 
 LOGGER = logging.getLogger("shared.config.network")
 
@@ -106,6 +110,8 @@ def _parseNetworkConfig(section: Dict[str, Any]) -> NetworkConfig:
     """Parse network configuration from YAML section."""
     clipSection = section.get("clip", {})
     generationSection = section.get("generation", {})
+    clipBoneDataSection = clipSection.get("bone-data")
+    boneDataSection = generationSection.get("bone-data", {})
     clipEmbedDim = int(section.get("embed-dim", 128))
     generationEmbedDim = int(
         generationSection.get("embed-dim", clipEmbedDim)
@@ -122,6 +128,11 @@ def _parseNetworkConfig(section: Dict[str, Any]) -> NetworkConfig:
         clip=ClipNetworkConfig(
             motionNumHeads=int(clipSection.get("motion-num-heads", 4)),
             motionNumLayers=int(clipSection.get("motion-num-layers", 2)),
+            boneData=(
+                _parseBoneDataConfig(clipBoneDataSection)
+                if isinstance(clipBoneDataSection, dict)
+                else None
+            ),
         ),
         generation=GenerationNetworkConfig(
             embedDim=generationEmbedDim,
@@ -135,8 +146,31 @@ def _parseNetworkConfig(section: Dict[str, Any]) -> NetworkConfig:
             numSpatioTemporalLayers=int(
                 generationSection.get("num-spatio-temporal-layers", 1)
             ),
+            boneData=_parseBoneDataConfig(boneDataSection),
         ),
     )
+
+
+def _parseBoneDataConfig(section: Dict[str, Any]) -> BoneDataConfig:
+    """Parse optional motion feature toggles from network.yaml."""
+    return BoneDataConfig(
+        rotation6d=_bool(section, "rotation6d", True),
+        footContact=_bool(section, "foot-contact", False),
+        handContact=_bool(section, "hand-contact", False),
+        rootTranslation=_bool(section, "root-translation", False),
+        rootVelocity=_bool(section, "root-velocity", False),
+        rootYaw=_bool(section, "root-yaw", False),
+        rootYawVelocity=_bool(section, "root-yaw-velocity", False),
+        jointXyz=_bool(section, "joint-xyz", False),
+        jointVelocity=_bool(section, "joint-velocity", False),
+        endEffectorVelocity=_bool(
+            section,
+            "end-effector-velocity",
+            False,
+        ),
+        pelvisHeight=_bool(section, "pelvis-height", False),
+    )
+
 
 
 def _defaultNetworkConfig() -> NetworkConfig:
@@ -238,6 +272,17 @@ def loadTrainingConfig(
         resolved,
         pathsSection.get("network-config"),
     )
+    checkpointDir = _optionalPath(
+        resolved,
+        pathsSection.get("checkpoint-dir"),
+    )
+    validationIndicesPath = _optionalResolvedPath(
+        resolved,
+        pathsSection.get("validation-indices"),
+    )
+    if validationIndicesPath is None and checkpointDir is not None:
+        validationIndicesPath = checkpointDir / "validation_indices.json"
+
     hyperparameters = ClipTrainingHyperparameters(
         batchSize=_int(trainingSection, "batch-size", DEFAULT_BATCH_SIZE),
         maxPromptLength=_int(
@@ -260,10 +305,8 @@ def loadTrainingConfig(
             "early-stopping-patience",
             DEFAULT_EARLY_STOPPING_PATIENCE,
         ),
-        checkpointDir=_optionalPath(
-            resolved,
-            pathsSection.get("checkpoint-dir"),
-        ),
+        checkpointDir=checkpointDir,
+        validationIndicesPath=validationIndicesPath,
         resumeCheckpoint=_optionalExistingPath(
             resolved,
             trainingSection.get("resume-checkpoint"),
@@ -273,6 +316,24 @@ def loadTrainingConfig(
         gradientAccumulation=_int(trainingSection, "gradient-accumulation", 1),
         MM_memoryLimitGB=_float(trainingSection, "MM-memory-limit-gb", 0.0),
         weightDecay=_float(trainingSection, "weight-decay", 0.0),
+        maxSamplesPerEpoch=_optionalInt(
+            trainingSection,
+            "max-samples-per-epoch",
+        ),
+        fixedTrainChunk=_bool(
+            trainingSection,
+            "fixed-train-chunk",
+            False,
+        ),
+        overfitSamples=_optionalString(
+            trainingSection,
+            "overfit-samples",
+        ),
+        disableDropout=_bool(
+            trainingSection,
+            "disable-dropout",
+            False,
+        ),
         # Learning Rate
         learningRate=_float(
             trainingSection,
@@ -375,6 +436,11 @@ def loadGenerationConfig(
         "acceleration-weight",
         GENERATION_DEFAULT_ACCELERATION_WEIGHT,
     )
+    clipGuidanceWeight = _float(
+        trainingSection,
+        "clip-guidance-weight",
+        GENERATION_DEFAULT_CLIP_GUIDANCE_WEIGHT,
+    )
     
     hyperparameters = GenerationTrainingHyperparameters(
         batchSize=_int(
@@ -428,6 +494,16 @@ def loadGenerationConfig(
             "clear-mps-cache",
             True,
         ),
+        deterministicCorruption=_bool(
+            trainingSection,
+            "deterministic-corruption",
+            False,
+        ),
+        disableDropout=_bool(
+            trainingSection,
+            "disable-dropout",
+            False,
+        ),
         # Learning Rate
         learningRate=_float(
             trainingSection,
@@ -439,6 +515,7 @@ def loadGenerationConfig(
         velXyzWeight=velXyzWeight,
         diffusionWeight=diffusionWeight,
         accelerationWeight=accelerationWeight,
+        clipGuidanceWeight=clipGuidanceWeight,
     )
 
     return GenerationTrainingConfig(
@@ -591,6 +668,12 @@ def loadPreprocessConfig(configPath: Path) -> PreprocessDatasetConfig:
     outputRoot = _resolvePath(configPath, _require(pathsSection, "output-root"))
     outputRoot.mkdir(parents=True, exist_ok=True)
     includeFolders = _optionalStringList(pathsSection.get("include-folders"))
+    networkConfigPath = _optionalExistingPath(
+        configPath,
+        pathsSection.get("network-config"),
+        strict=False,
+        label="network-config",
+    )
 
     processing = PreprocessDatasetProcessing(
         modelName=str(
@@ -601,10 +684,24 @@ def loadPreprocessConfig(configPath: Path) -> PreprocessDatasetConfig:
             "max-length",
             DEFAULT_PROMPT_MAX_LENGTH,
         ),
-        shardSize=_int(
+        sampleShardSize=_int(
             processingSection,
-            "shard-size",
-            PREPROCESS_DEFAULT_SHARD_SIZE,
+            "sample-shard-size",
+            _int(
+                processingSection,
+                "shard-size",
+                PREPROCESS_DEFAULT_SAMPLE_SHARD_SIZE,
+            ),
+        ),
+        textShardSize=_int(
+            processingSection,
+            "text-shard-size",
+            PREPROCESS_DEFAULT_TEXT_SHARD_SIZE,
+        ),
+        textBatchSize=_int(
+            processingSection,
+            "text-batch-size",
+            PREPROCESS_DEFAULT_TEXT_BATCH_SIZE,
         ),
         splitFrames=_optionalInt(processingSection, "split-frames"),
         downsampleTargetFrames=_optionalInt(
@@ -622,6 +719,7 @@ def loadPreprocessConfig(configPath: Path) -> PreprocessDatasetConfig:
             inputRoot=inputRoot,
             outputRoot=outputRoot,
             includeFolders=includeFolders,
+            networkConfigPath=networkConfigPath,
         ),
         processing=processing,
     )
@@ -642,6 +740,12 @@ def _validatePreprocessSettings(
         raise ValueError(
             "Only one of split-frames or downsample-target-frames may be set."
         )
+    if processing.sampleShardSize <= 0:
+        raise ValueError("sample-shard-size must be strictly positive.")
+    if processing.textShardSize <= 0:
+        raise ValueError("text-shard-size must be strictly positive.")
+    if processing.textBatchSize <= 0:
+        raise ValueError("text-batch-size must be strictly positive.")
 
 
 def _resolvePath(configPath: Path, rawValue: str) -> Path:

@@ -167,11 +167,14 @@ class PreprocessDatasetPaths:
         Destination directory for the preprocessed dataset.
     includeFolders : Optional[List[str]]
         Optional top-level folders to include (e.g., KIT, CMU).
+    networkConfigPath : Optional[Path]
+        Optional path to the shared network.yaml feature toggles.
     """
 
     inputRoot: Path
     outputRoot: Path
     includeFolders: Optional[List[str]] = None
+    networkConfigPath: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -185,8 +188,12 @@ class PreprocessDatasetProcessing:
         Hugging Face tokenizer identifier used for preprocessing.
     maxPromptLength : int
         Token length used for preprocessing.
-    shardSize : int
-        Number of samples stored per shard.
+    sampleShardSize : int
+        Number of motion samples stored per shard.
+    textShardSize : int
+        Number of unique text entries stored per shard.
+    textBatchSize : int
+        Number of unique texts encoded per batch while building pooled cache.
     splitFrames : Optional[int]
         Split segments into windows of this size (None to disable).
     downsampleTargetFrames : Optional[int]
@@ -197,10 +204,17 @@ class PreprocessDatasetProcessing:
 
     modelName: str
     maxPromptLength: int
-    shardSize: int
+    sampleShardSize: int
+    textShardSize: int = 2048
+    textBatchSize: int = 64
     splitFrames: Optional[int] = None
     downsampleTargetFrames: Optional[int] = None
     maxSegmentFrames: Optional[int] = None
+
+    @property
+    def shardSize(self) -> int:
+        """Legacy alias for the motion shard size."""
+        return self.sampleShardSize
 
 
 @dataclass(frozen=True)
@@ -238,70 +252,46 @@ class PreprocessedDatasetShardInfo:
 
 
 @dataclass(frozen=True)
-class PreprocessedSampleIndex:
-    """
-    Index entry pointing to a preprocessed sample.
+class PreprocessedSampleIndexV2:
+    """Index entry pointing to a preprocessed motion sample."""
 
-    Attributes
-    ----------
-    shardIndex : int
-        Index of the shard containing the sample.
-    shardOffset : int
-        Offset of the sample within the shard.
-    frames : int
-        Frame count for the sample motion tensor.
-    sampleBytes : int
-        Approximate serialized size of the sample.
-    datasetFolder : str
-        Top-level dataset folder (for selective training).
-    sourceFile : str
-        Source identifier for traceability.
-    """
-
+    sampleId: int
     shardIndex: int
     shardOffset: int
     frames: int
     sampleBytes: int
     datasetFolder: str
     sourceFile: str
+    startFrame: int
+    endFrame: int
 
 
 @dataclass(frozen=True)
-class PreprocessedDatasetManifest:
-    """
-    Dataset-level metadata for preprocessed datasets.
+class PreprocessedTextIndexV2:
+    """Index entry pointing to a unique text payload."""
 
-    Attributes
-    ----------
-    version : int
-        Manifest schema version.
-    modelName : str
-        Tokenizer identifier used during preprocessing.
-    maxPromptLength : int
-        Token length used during preprocessing.
-    splitFrames : Optional[int]
-        Segment split size applied during preprocessing.
-    downsampleTargetFrames : Optional[int]
-        Downsample target applied during preprocessing.
-    maxSegmentFrames : Optional[int]
-        Frame-length filter applied during preprocessing.
-    shardSize : int
-        Number of samples stored per shard.
-    totalSamples : int
-        Total samples in the dataset.
-    averageSampleBytes : float
-        Mean estimated sample size in bytes.
-    maxSampleBytes : int
-        Maximum estimated sample size in bytes.
-    averageFrames : float
-        Mean frame count across samples.
-    maxFrames : int
-        Maximum frame count across samples.
-    shards : List[PreprocessedDatasetShardInfo]
-        Shard metadata list.
-    indexPath : str
-        Relative path to the sample index file.
-    """
+    textId: int
+    shardIndex: int
+    shardOffset: int
+    usageCount: int
+
+
+@dataclass(frozen=True)
+class PreprocessedLinkIndexV2:
+    """Index entry linking one text and one motion sample."""
+
+    linkId: int
+    sampleId: int
+    textId: int
+    datasetFolder: str
+    sourceFile: str
+    frames: int
+    pairBytes: int
+
+
+@dataclass(frozen=True)
+class PreprocessedDatasetManifestV2:
+    """Dataset-level metadata for the V2 preprocessed dataset format."""
 
     version: int
     modelName: str
@@ -309,14 +299,42 @@ class PreprocessedDatasetManifest:
     splitFrames: Optional[int]
     downsampleTargetFrames: Optional[int]
     maxSegmentFrames: Optional[int]
-    shardSize: int
+    sampleShardSize: int
+    textShardSize: int
     totalSamples: int
+    totalTexts: int
+    totalLinks: int
     averageSampleBytes: float
     maxSampleBytes: int
+    averagePairBytes: float
     averageFrames: float
     maxFrames: int
+    sampleShards: List[PreprocessedDatasetShardInfo]
+    textShards: List[PreprocessedDatasetShardInfo]
+    sampleIndexPath: str
+    textIndexPath: str
+    linkIndexPath: str
+    enabledComponents: List[str] = field(default_factory=list)
+    pooledTextDim: int = 0
+
+
+@dataclass(frozen=True)
+class GenerationTextCacheManifest:
+    """Manifest describing a checkpoint-specific cached text embedding set."""
+
+    version: int
+    clipFingerprint: str
+    embedDim: int
+    totalTexts: int
+    shardSize: int
     shards: List[PreprocessedDatasetShardInfo]
-    indexPath: str
+
+
+# Backward-compatible aliases used by existing imports.
+PreprocessedTextIndex = PreprocessedTextIndexV2
+PreprocessedLinkIndex = PreprocessedLinkIndexV2
+PreprocessedSampleIndex = PreprocessedSampleIndexV2
+PreprocessedDatasetManifest = PreprocessedDatasetManifestV2
 
 @dataclass(frozen=True)
 class PromptRecord:

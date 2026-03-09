@@ -58,3 +58,4 @@ poetry run python -m src.cli.json_to_collada -i path/to/animation.json -o out.da
 ## Notes
 
 - `network.yaml` controls shared dimensions across CLIP and generation. Keep `embed-dim` aligned.
+- `clip.bone-data` controls the motion features consumed by the CLIP motion encoder. If you change it, re-run CLIP training before generation training.

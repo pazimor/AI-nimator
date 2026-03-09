@@ -1,6 +1,7 @@
 paths:
   input-root: "/Users/pazimor/dataset"
   output-root: "/Users/pazimor/dataset_preprocessed"
+  network-config: "network.yaml"
   # Optional: list only the dataset folders to preprocess
   include-folders: ["ACCAD", "BioMotionLab_NTroje", "BMLHandball", "BMLmovi", "CMU", "DFaust_67", "EKUT", "Eyes_Japan_Dataset", "HumanEva", "KIT", "MPI_HDM05", "MPI_Limits", "MPI_mosh", "SFU", "SSM_synced", "TotalCapture", "Transitions_mocap"]
   
@@ -8,7 +9,9 @@ paths:
 processing:
   model-name: xlm-roberta-base
   max-length: 256
-  shard-size: 256
+  sample-shard-size: 256
+  text-shard-size: 2048
+  text-batch-size: 64
   
   # Choose one: split-frames OR downsample-target-frames
   split-frames: 512

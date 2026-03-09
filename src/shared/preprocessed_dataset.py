@@ -1,8 +1,11 @@
-"""Dataset loader for preprocessed shard-based datasets."""
+"""Dataset loader for the V2 preprocessed link-based dataset format."""
 
 from __future__ import annotations
 
+from collections import OrderedDict
+import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -10,112 +13,160 @@ import torch
 from torch.utils.data import Dataset
 
 from src.shared.constants.preprocessed import (
-    PREPROCESSED_INDEX_FILENAME,
+    PREPROCESSED_GENERATION_TEXT_CACHE_DIRNAME,
+    PREPROCESSED_GENERATION_TEXT_CACHE_MANIFEST_FILENAME,
+    PREPROCESSED_GENERATION_TEXT_CACHE_VERSION,
+    PREPROCESSED_LINK_INDEX_FILENAME,
     PREPROCESSED_MANIFEST_FILENAME,
     PREPROCESSED_MANIFEST_VERSION,
+    PREPROCESSED_SAMPLE_INDEX_FILENAME,
+    PREPROCESSED_TEXT_INDEX_FILENAME,
 )
 from src.shared.types import (
-    PreprocessedDatasetManifest,
+    GenerationTextCacheManifest,
+    PreprocessedDatasetManifestV2,
     PreprocessedDatasetShardInfo,
-    PreprocessedSampleIndex,
+    PreprocessedLinkIndexV2,
+    PreprocessedSampleIndexV2,
+    PreprocessedTextIndexV2,
 )
 
+LOGGER = logging.getLogger("shared.preprocessed_dataset")
 
-class PreprocessedMotionDataset(Dataset[Dict[str, object]]):
-    """Dataset loading preprocessed shard files on demand."""
 
-    def __init__(self, datasetRoot: Path) -> None:
-        """
-        Initialize the dataset.
+def computeClipCheckpointFingerprint(checkpointPath: Path) -> str:
+    """Return a stable SHA-256 fingerprint for a CLIP checkpoint file."""
+    digest = hashlib.sha256()
+    with checkpointPath.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
-        Parameters
-        ----------
-        datasetRoot : Path
-            Root directory of the preprocessed dataset.
-        """
+
+def resolveGenerationTextCacheDir(
+    datasetRoot: Path,
+    clipFingerprint: str,
+) -> Path:
+    """Return the directory holding cached generation embeddings."""
+    return datasetRoot / PREPROCESSED_GENERATION_TEXT_CACHE_DIRNAME / clipFingerprint
+
+
+class PreprocessedLinkDataset(Dataset[Dict[str, object]]):
+    """Dataset loading preprocessed V2 link records on demand."""
+
+    def __init__(
+        self,
+        datasetRoot: Path,
+        generationCacheCheckpoint: Optional[Path] = None,
+        includeTokenizedText: bool = True,
+        sampleShardCacheSize: int = 4,
+        textShardCacheSize: int = 8,
+        generationShardCacheSize: int = 4,
+    ) -> None:
         self.datasetRoot = datasetRoot
+        self.includeTokenizedText = includeTokenizedText
+        self.sampleShardCacheSize = max(1, int(sampleShardCacheSize))
+        self.textShardCacheSize = max(1, int(textShardCacheSize))
+        self.generationShardCacheSize = max(1, int(generationShardCacheSize))
         self.manifest = _loadManifest(datasetRoot)
-        self.indexEntries = _loadIndex(datasetRoot, self.manifest.indexPath)
-        self._cachedShardIndex: Optional[int] = None
-        self._cachedSamples: Optional[List[Dict[str, object]]] = None
+        self.sampleIndexEntries = _loadSampleIndex(
+            datasetRoot,
+            self.manifest.sampleIndexPath,
+        )
+        self.textIndexEntries = _loadTextIndex(
+            datasetRoot,
+            self.manifest.textIndexPath,
+        )
+        self.linkEntries = _loadLinkIndex(
+            datasetRoot,
+            self.manifest.linkIndexPath,
+        )
+        self.indexEntries = self.linkEntries
+        self._maxPairBytes = max(
+            (entry.pairBytes for entry in self.linkEntries),
+            default=0,
+        )
+
+        self._sampleShardCache: OrderedDict[int, List[Dict[str, object]]] = (
+            OrderedDict()
+        )
+        self._textShardCache: OrderedDict[int, List[Dict[str, object]]] = (
+            OrderedDict()
+        )
+        self._generationShardCache: OrderedDict[int, List[Dict[str, object]]] = (
+            OrderedDict()
+        )
+
+        self.generationCacheCheckpoint = (
+            generationCacheCheckpoint.expanduser()
+            if generationCacheCheckpoint is not None
+            else None
+        )
+        self.generationClipFingerprint: Optional[str] = None
+        self.generationCacheDir: Optional[Path] = None
+        self.generationCacheManifest: Optional[GenerationTextCacheManifest] = None
+        if self.generationCacheCheckpoint is not None:
+            self._loadGenerationCache(self.generationCacheCheckpoint)
 
     def __len__(self) -> int:
-        """
-        Return the number of samples in the dataset.
-
-        Returns
-        -------
-        int
-            Dataset length.
-        """
-        return len(self.indexEntries)
+        return len(self.linkEntries)
 
     def __getitem__(self, index: int) -> Dict[str, object]:
-        """
-        Load a sample by global index.
+        linkEntry = self.linkEntries[index]
+        sampleEntry = self.sampleIndexEntries[linkEntry.sampleId]
+        textEntry = self.textIndexEntries[linkEntry.textId]
+        samplePayload = self._loadSampleShard(sampleEntry.shardIndex)[
+            sampleEntry.shardOffset
+        ]
+        textPayload = self._loadTextShard(textEntry.shardIndex)[
+            textEntry.shardOffset
+        ]
+        payload: Dict[str, object] = {
+            "sample_id": int(linkEntry.sampleId),
+            "text_id": int(linkEntry.textId),
+            "pooled_text": textPayload["pooled_text"],
+            "motion": samplePayload["motion"],
+            "time": samplePayload["time"],
+            "meta": samplePayload["meta"],
+        }
+        if self.includeTokenizedText:
+            payload["input_ids"] = textPayload["input_ids"]
+            payload["attention_mask"] = textPayload["attention_mask"]
+        for key, value in samplePayload.items():
+            if key in {"motion", "time", "meta"}:
+                continue
+            payload[key] = value
 
-        Parameters
-        ----------
-        index : int
-            Global sample index.
-
-        Returns
-        -------
-        Dict[str, object]
-            Sample dictionary with tensors.
-        """
-        entry = self.indexEntries[index]
-        samples = self._loadShard(entry.shardIndex)
-        return samples[entry.shardOffset]
+        if self.generationCacheManifest is not None:
+            generationPayload = self._loadGenerationShard(textEntry.shardIndex)[
+                textEntry.shardOffset
+            ]
+            payload["generation_text_embedding"] = generationPayload[
+                "text_embedding"
+            ]
+        return payload
 
     def getAverageSampleBytes(self) -> float:
-        """
-        Return the average sample size from the manifest.
-
-        Returns
-        -------
-        float
-            Average sample size in bytes.
-        """
-        return self.manifest.averageSampleBytes
+        return self.manifest.averagePairBytes
 
     def getMaxSampleBytes(self) -> int:
-        """
-        Return the maximum sample size from the manifest.
-
-        Returns
-        -------
-        int
-            Maximum sample size in bytes.
-        """
-        return self.manifest.maxSampleBytes
+        return self._maxPairBytes
 
     def getMaxFrames(self) -> int:
-        """
-        Return the maximum frame count from the manifest.
-
-        Returns
-        -------
-        int
-            Maximum frame count.
-        """
         return self.manifest.maxFrames
 
     def validateCompatibility(
         self,
         modelName: str,
         maxPromptLength: int,
+        requiredComponents: Optional[List[str]] = None,
+        expectedPooledTextDim: Optional[int] = None,
+        expectedGenerationEmbedDim: Optional[int] = None,
+        requireGenerationTextEmbedding: bool = False,
     ) -> None:
-        """
-        Validate dataset compatibility with training settings.
-
-        Parameters
-        ----------
-        modelName : str
-            Expected tokenizer name.
-        maxPromptLength : int
-            Expected token length.
-        """
         if self.manifest.modelName != modelName:
             raise ValueError(
                 "Preprocessed dataset was built with "
@@ -127,143 +178,384 @@ class PreprocessedMotionDataset(Dataset[Dict[str, object]]):
                 f"{self.manifest.maxPromptLength} but training expects "
                 f"{maxPromptLength}."
             )
+        if self.manifest.pooledTextDim <= 0:
+            raise ValueError(
+                "Preprocessed dataset is missing pooled_text metadata. "
+                "Re-run preprocess_dataset to rebuild the V2 dataset."
+            )
+        if (
+            expectedPooledTextDim is not None
+            and self.manifest.pooledTextDim != expectedPooledTextDim
+        ):
+            raise ValueError(
+                "Preprocessed dataset pooled_text dimension "
+                f"{self.manifest.pooledTextDim} does not match the current "
+                f"text encoder hidden size {expectedPooledTextDim}."
+            )
+        if requiredComponents:
+            available = set(self.manifest.enabledComponents or ["rotation6d"])
+            missing = [
+                component
+                for component in requiredComponents
+                if component not in available
+            ]
+            if missing:
+                raise ValueError(
+                    "Preprocessed dataset is missing required motion "
+                    f"components: {', '.join(missing)}. Re-run "
+                    "preprocess_dataset with matching network-config toggles."
+                )
+        if requireGenerationTextEmbedding and self.generationCacheManifest is None:
+            raise ValueError(
+                "Generation text cache is missing. Run "
+                "`python -m src.cli.precompute_generation_text_cache "
+                f"--dataset-root {self.datasetRoot} --clip-checkpoint "
+                f"{self.generationCacheCheckpoint}` before train_generation."
+            )
+        if (
+            expectedGenerationEmbedDim is not None
+            and self.generationCacheManifest is not None
+            and self.generationCacheManifest.embedDim != expectedGenerationEmbedDim
+        ):
+            raise ValueError(
+                "Generation text cache embed dim "
+                f"{self.generationCacheManifest.embedDim} does not match the "
+                f"current CLIP embed dim {expectedGenerationEmbedDim}."
+            )
 
     def clearCache(self) -> None:
-        """
-        Clear the cached shard.
-        """
-        self._cachedShardIndex = None
-        self._cachedSamples = None
+        self._sampleShardCache.clear()
+        self._textShardCache.clear()
+        self._generationShardCache.clear()
 
-    def _loadShard(self, shardIndex: int) -> List[Dict[str, object]]:
+    def preloadIndices(self, indices: List[int]) -> List[Dict[str, object]]:
         """
-        Load a shard into memory.
+        Materialize a subset with shard-aware locality.
 
-        Parameters
-        ----------
-        shardIndex : int
-            Index of the shard to load.
-
-        Returns
-        -------
-        List[Dict[str, object]]
-            List of samples stored in the shard.
+        The returned sample set is identical to iterating over ``indices`` with
+        ``__getitem__``, but the access order is re-arranged to minimize shard
+        cache thrashing during epoch preload.
         """
-        if self._cachedShardIndex == shardIndex:
-            if self._cachedSamples is None:
-                raise RuntimeError("Shard cache is empty.")
-            return self._cachedSamples
-        shardInfo = self.manifest.shards[shardIndex]
+        self._primeTextShardCaches(indices)
+        ordered = sorted(indices, key=self._preloadSortKey)
+        return [self[index] for index in ordered]
+
+    def _loadGenerationCache(self, checkpointPath: Path) -> None:
+        clipFingerprint = computeClipCheckpointFingerprint(checkpointPath)
+        cacheDir = resolveGenerationTextCacheDir(self.datasetRoot, clipFingerprint)
+        manifestPath = (
+            cacheDir / PREPROCESSED_GENERATION_TEXT_CACHE_MANIFEST_FILENAME
+        )
+        if not manifestPath.exists():
+            from src.shared.generation_text_cache import ensureGenerationTextCache
+
+            LOGGER.info(
+                "Generation text cache missing for %s; building it now.",
+                checkpointPath,
+            )
+            ensureGenerationTextCache(self.datasetRoot, checkpointPath)
+        manifest = _loadGenerationCacheManifest(manifestPath)
+        if manifest.clipFingerprint != clipFingerprint:
+            raise ValueError(
+                "Generation text cache fingerprint does not match the "
+                f"requested checkpoint {checkpointPath}."
+            )
+        if manifest.totalTexts != self.manifest.totalTexts:
+            raise ValueError(
+                "Generation text cache was built for a different dataset "
+                f"(cache texts={manifest.totalTexts}, dataset texts="
+                f"{self.manifest.totalTexts}). Re-run "
+                "precompute_generation_text_cache."
+            )
+        if len(manifest.shards) != len(self.manifest.textShards):
+            raise ValueError(
+                "Generation text cache shard layout does not match the "
+                "dataset text shards. Re-run precompute_generation_text_cache."
+            )
+        for index, shardInfo in enumerate(manifest.shards):
+            expectedCount = self.manifest.textShards[index].sampleCount
+            if shardInfo.sampleCount != expectedCount:
+                raise ValueError(
+                    "Generation text cache shard counts do not match the "
+                    "dataset text shards. Re-run "
+                    "precompute_generation_text_cache."
+                )
+        self.generationClipFingerprint = clipFingerprint
+        self.generationCacheDir = cacheDir
+        self.generationCacheManifest = manifest
+
+    def _loadSampleShard(self, shardIndex: int) -> List[Dict[str, object]]:
+        cachedShard = self._sampleShardCache.get(shardIndex)
+        if cachedShard is not None:
+            self._sampleShardCache.move_to_end(shardIndex)
+            return cachedShard
+        shardInfo = self.manifest.sampleShards[shardIndex]
         shardPath = self.datasetRoot / shardInfo.path
         samples = torch.load(shardPath, map_location="cpu")
-        self._cachedShardIndex = shardIndex
-        self._cachedSamples = samples
+        self._rememberShard(
+            cache=self._sampleShardCache,
+            shardIndex=shardIndex,
+            payload=samples,
+            maxEntries=self.sampleShardCacheSize,
+        )
         return samples
 
+    def _loadTextShard(self, shardIndex: int) -> List[Dict[str, object]]:
+        cachedShard = self._textShardCache.get(shardIndex)
+        if cachedShard is not None:
+            self._textShardCache.move_to_end(shardIndex)
+            return cachedShard
+        shardInfo = self.manifest.textShards[shardIndex]
+        shardPath = self.datasetRoot / shardInfo.path
+        texts = torch.load(shardPath, map_location="cpu")
+        self._rememberShard(
+            cache=self._textShardCache,
+            shardIndex=shardIndex,
+            payload=texts,
+            maxEntries=self.textShardCacheSize,
+        )
+        return texts
 
-def _loadManifest(datasetRoot: Path) -> PreprocessedDatasetManifest:
-    """
-    Load the dataset manifest from disk.
+    def _loadGenerationShard(self, shardIndex: int) -> List[Dict[str, object]]:
+        if self.generationCacheManifest is None or self.generationCacheDir is None:
+            raise RuntimeError("Generation text cache is not loaded.")
+        cachedShard = self._generationShardCache.get(shardIndex)
+        if cachedShard is not None:
+            self._generationShardCache.move_to_end(shardIndex)
+            return cachedShard
+        shardInfo = self.generationCacheManifest.shards[shardIndex]
+        shardPath = self.generationCacheDir / shardInfo.path
+        texts = torch.load(shardPath, map_location="cpu")
+        self._rememberShard(
+            cache=self._generationShardCache,
+            shardIndex=shardIndex,
+            payload=texts,
+            maxEntries=self.generationShardCacheSize,
+        )
+        return texts
 
-    Parameters
-    ----------
-    datasetRoot : Path
-        Dataset root containing the manifest file.
-    """
+    def _rememberShard(
+        self,
+        cache: OrderedDict[int, List[Dict[str, object]]],
+        shardIndex: int,
+        payload: List[Dict[str, object]],
+        maxEntries: int,
+    ) -> None:
+        cache[shardIndex] = payload
+        cache.move_to_end(shardIndex)
+        while len(cache) > maxEntries:
+            cache.popitem(last=False)
+
+    def _preloadSortKey(self, index: int) -> tuple[int, int, int, int]:
+        """Return a shard-locality key for bulk preload ordering."""
+        linkEntry = self.linkEntries[index]
+        sampleEntry = self.sampleIndexEntries[linkEntry.sampleId]
+        textEntry = self.textIndexEntries[linkEntry.textId]
+        return (
+            sampleEntry.shardIndex,
+            textEntry.shardIndex,
+            sampleEntry.shardOffset,
+            textEntry.shardOffset,
+        )
+
+    def _primeTextShardCaches(self, indices: List[int]) -> None:
+        """Warm and retain every text shard needed for the current preload."""
+        if not indices:
+            return
+        textShardIndices = sorted(
+            {
+                self.textIndexEntries[self.linkEntries[index].textId].shardIndex
+                for index in indices
+            }
+        )
+        requiredTextCacheSize = max(self.textShardCacheSize, len(textShardIndices))
+        originalTextCacheSize = self.textShardCacheSize
+        self.textShardCacheSize = requiredTextCacheSize
+        try:
+            for shardIndex in textShardIndices:
+                self._loadTextShard(shardIndex)
+            if (
+                self.generationCacheManifest is not None
+                and self.generationCacheDir is not None
+            ):
+                originalGenerationCacheSize = self.generationShardCacheSize
+                self.generationShardCacheSize = max(
+                    self.generationShardCacheSize,
+                    len(textShardIndices),
+                )
+                try:
+                    for shardIndex in textShardIndices:
+                        self._loadGenerationShard(shardIndex)
+                finally:
+                    self.generationShardCacheSize = originalGenerationCacheSize
+        finally:
+            self.textShardCacheSize = originalTextCacheSize
+
+
+def _loadManifest(datasetRoot: Path) -> PreprocessedDatasetManifestV2:
     manifestPath = datasetRoot / PREPROCESSED_MANIFEST_FILENAME
     if not manifestPath.exists():
-        raise FileNotFoundError(
-            f"Missing preprocessed manifest: {manifestPath}"
-        )
+        raise FileNotFoundError(f"Missing preprocessed manifest: {manifestPath}")
     payload = json.loads(manifestPath.read_text(encoding="utf-8"))
     version = int(payload.get("version", 0))
     if version != PREPROCESSED_MANIFEST_VERSION:
         raise ValueError(
-            "Unsupported manifest version "
-            f"{version} (expected {PREPROCESSED_MANIFEST_VERSION})."
+            "Unsupported preprocessed dataset version "
+            f"{version}. This code expects V{PREPROCESSED_MANIFEST_VERSION}. "
+            "Re-run preprocess_dataset to rebuild the dataset in V2 format."
         )
-    shards = [
-        PreprocessedDatasetShardInfo(
-            path=entry["path"],
-            sampleCount=int(entry["sampleCount"]),
-        )
-        for entry in payload.get("shards", [])
-    ]
-    return PreprocessedDatasetManifest(
+    sampleShards = _loadShardInfos(payload.get("sampleShards"))
+    textShards = _loadShardInfos(payload.get("textShards"))
+    return PreprocessedDatasetManifestV2(
         version=version,
         modelName=str(payload.get("modelName", "")),
         maxPromptLength=int(payload.get("maxPromptLength", 0)),
         splitFrames=_optionalInt(payload, "splitFrames"),
         downsampleTargetFrames=_optionalInt(payload, "downsampleTargetFrames"),
         maxSegmentFrames=_optionalInt(payload, "maxSegmentFrames"),
-        shardSize=int(payload.get("shardSize", 0)),
+        sampleShardSize=int(payload.get("sampleShardSize", 0)),
+        textShardSize=int(payload.get("textShardSize", 0)),
         totalSamples=int(payload.get("totalSamples", 0)),
+        totalTexts=int(payload.get("totalTexts", 0)),
+        totalLinks=int(payload.get("totalLinks", 0)),
         averageSampleBytes=float(payload.get("averageSampleBytes", 0.0)),
         maxSampleBytes=int(payload.get("maxSampleBytes", 0)),
+        averagePairBytes=float(payload.get("averagePairBytes", 0.0)),
         averageFrames=float(payload.get("averageFrames", 0.0)),
         maxFrames=int(payload.get("maxFrames", 0)),
-        shards=shards,
-        indexPath=str(payload.get("indexPath", PREPROCESSED_INDEX_FILENAME)),
+        sampleShards=sampleShards,
+        textShards=textShards,
+        sampleIndexPath=str(
+            payload.get("sampleIndexPath", PREPROCESSED_SAMPLE_INDEX_FILENAME)
+        ),
+        textIndexPath=str(
+            payload.get("textIndexPath", PREPROCESSED_TEXT_INDEX_FILENAME)
+        ),
+        linkIndexPath=str(
+            payload.get("linkIndexPath", PREPROCESSED_LINK_INDEX_FILENAME)
+        ),
+        enabledComponents=_enabledComponents(payload),
+        pooledTextDim=int(payload.get("pooledTextDim", 0)),
     )
 
 
-def _loadIndex(
+def _loadSampleIndex(
     datasetRoot: Path,
     indexPath: str,
-) -> List[PreprocessedSampleIndex]:
-    """
-    Load the sample index from disk.
-
-    Parameters
-    ----------
-    datasetRoot : Path
-        Dataset root containing the index file.
-    """
-    resolvedPath = datasetRoot / indexPath
-    if not resolvedPath.exists():
-        raise FileNotFoundError(f"Missing preprocessed index: {resolvedPath}")
-    payload = json.loads(resolvedPath.read_text(encoding="utf-8"))
-    entries: List[PreprocessedSampleIndex] = []
-    for entry in payload:
-        entries.append(
-            PreprocessedSampleIndex(
-                shardIndex=int(entry["shardIndex"]),
-                shardOffset=int(entry["shardOffset"]),
-                frames=int(entry.get("frames", 0)),
-                sampleBytes=int(entry.get("sampleBytes", 0)),
-                datasetFolder=_resolveDatasetFolder(entry),
-                sourceFile=str(entry.get("sourceFile", "")),
-            ),
+) -> List[PreprocessedSampleIndexV2]:
+    payload = _loadJsonList(datasetRoot / indexPath, "sample index")
+    return [
+        PreprocessedSampleIndexV2(
+            sampleId=int(entry.get("sampleId", index)),
+            shardIndex=int(entry["shardIndex"]),
+            shardOffset=int(entry["shardOffset"]),
+            frames=int(entry.get("frames", 0)),
+            sampleBytes=int(entry.get("sampleBytes", 0)),
+            datasetFolder=str(entry.get("datasetFolder", "")),
+            sourceFile=str(entry.get("sourceFile", "")),
+            startFrame=int(entry.get("startFrame", 0)),
+            endFrame=int(entry.get("endFrame", 0)),
         )
-    return entries
+        for index, entry in enumerate(payload)
+    ]
+
+
+def _loadTextIndex(
+    datasetRoot: Path,
+    indexPath: str,
+) -> List[PreprocessedTextIndexV2]:
+    payload = _loadJsonList(datasetRoot / indexPath, "text index")
+    return [
+        PreprocessedTextIndexV2(
+            textId=int(entry.get("textId", index)),
+            shardIndex=int(entry["shardIndex"]),
+            shardOffset=int(entry["shardOffset"]),
+            usageCount=int(entry.get("usageCount", 0)),
+        )
+        for index, entry in enumerate(payload)
+    ]
+
+
+def _loadLinkIndex(
+    datasetRoot: Path,
+    indexPath: str,
+) -> List[PreprocessedLinkIndexV2]:
+    payload = _loadJsonList(datasetRoot / indexPath, "link index")
+    return [
+        PreprocessedLinkIndexV2(
+            linkId=int(entry.get("linkId", index)),
+            sampleId=int(entry["sampleId"]),
+            textId=int(entry["textId"]),
+            datasetFolder=str(entry.get("datasetFolder", "")),
+            sourceFile=str(entry.get("sourceFile", "")),
+            frames=int(entry.get("frames", 0)),
+            pairBytes=int(entry.get("pairBytes", 0)),
+        )
+        for index, entry in enumerate(payload)
+    ]
+
+
+def _loadGenerationCacheManifest(path: Path) -> GenerationTextCacheManifest:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    version = int(payload.get("version", 0))
+    if version != PREPROCESSED_GENERATION_TEXT_CACHE_VERSION:
+        raise ValueError(
+            "Unsupported generation text cache version "
+            f"{version}. Re-run precompute_generation_text_cache."
+        )
+    return GenerationTextCacheManifest(
+        version=version,
+        clipFingerprint=str(payload.get("clipFingerprint", "")),
+        embedDim=int(payload.get("embedDim", 0)),
+        totalTexts=int(payload.get("totalTexts", 0)),
+        shardSize=int(payload.get("shardSize", 0)),
+        shards=_loadShardInfos(payload.get("shards")),
+    )
+
+
+def _loadJsonList(path: Path, label: str) -> List[dict[str, object]]:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing preprocessed {label}: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError(f"Invalid preprocessed {label}: expected a JSON list.")
+    return payload
+
+
+def _loadShardInfos(rawValue: object) -> List[PreprocessedDatasetShardInfo]:
+    if not isinstance(rawValue, list):
+        return []
+    shardInfos: List[PreprocessedDatasetShardInfo] = []
+    for entry in rawValue:
+        if not isinstance(entry, dict):
+            continue
+        shardInfos.append(
+            PreprocessedDatasetShardInfo(
+                path=str(entry.get("path", "")),
+                sampleCount=int(entry.get("sampleCount", 0)),
+            )
+        )
+    return shardInfos
+
+
+def _enabledComponents(payload: Dict[str, object]) -> List[str]:
+    rawValue = payload.get("enabledComponents")
+    if not isinstance(rawValue, list):
+        return ["rotation6d"]
+    normalized = [
+        str(component).strip()
+        for component in rawValue
+        if str(component).strip()
+    ]
+    return normalized or ["rotation6d"]
 
 
 def _optionalInt(payload: Dict[str, object], key: str) -> Optional[int]:
-    """
-    Extract an optional integer from a payload.
-
-    Parameters
-    ----------
-    payload : Dict[str, object]
-        JSON payload dictionary.
-    key : str
-        Key to read from the payload.
-    """
-    value = payload.get(key)
-    if value in (None, "null"):
+    rawValue = payload.get(key)
+    if rawValue is None:
         return None
-    return int(value)
+    return int(rawValue)
 
 
-def _resolveDatasetFolder(entry: Dict[str, object]) -> str:
-    """Resolve dataset folder from index payload with backward compatibility."""
-    rawFolder = str(entry.get("datasetFolder", "")).strip()
-    if rawFolder:
-        return rawFolder
-    sourceFile = str(entry.get("sourceFile", "")).strip().replace("\\", "/")
-    if not sourceFile:
-        return ""
-    parts = [part for part in sourceFile.split("/") if part and part != "."]
-    if not parts:
-        return ""
-    return parts[0]
+# Temporary alias to reduce churn in callers that still import the legacy name.
+PreprocessedMotionDataset = PreprocessedLinkDataset

@@ -12,6 +12,7 @@ import torch
 
 from src.shared.config_loader import loadGenerationConfig
 from src.features.generation.train_generation import (
+    disableDropoutModules,
     buildOptimizer,
     evaluateValidation,
     loadCheckpoint,
@@ -23,7 +24,9 @@ from src.shared.dataset_manager import (
     MemoryManagerConfig,
     estimateModelBytes,
 )
+from src.shared.preprocessed_dataset import computeClipCheckpointFingerprint
 from src.shared.config_loader import loadNetworkConfig
+from src.shared.model.components import buildEnabledComponents
 from src.shared.model.generation.ddim import DDIM
 from src.shared.model.generation.motion_generator import MotionGenerator
 from src.shared.types import GenerationTrainingConfig, GenerationTrainingResult
@@ -108,6 +111,15 @@ def buildArgumentParser() -> argparse.ArgumentParser:
             "This value is reapplied after resume."
         ),
     )
+    parser.add_argument(
+        "--network-config",
+        type=Path,
+        default=None,
+        help=(
+            "Optional override for the shared network.yaml file used "
+            "for architecture and motion feature toggles."
+        ),
+    )
     return parser
 
 
@@ -128,6 +140,7 @@ def main() -> None:
             datasetFolders=_parseFolderList(arguments.dataset_folders),
             overfitSamples=arguments.overfit_samples,
             learningRateOverride=arguments.learning_rate,
+            networkConfigPathOverride=arguments.network_config,
         )
         
         parser.exit(
@@ -146,6 +159,7 @@ def _runTraining(
     datasetFolders: Optional[list[str]] = None,
     overfitSamples: Optional[str] = None,
     learningRateOverride: Optional[float] = None,
+    networkConfigPathOverride: Optional[Path] = None,
 ) -> GenerationTrainingResult:
     """
     Execute the end-to-end training workflow.
@@ -177,8 +191,13 @@ def _runTraining(
     )
 
     # Load network configuration
+    resolvedNetworkConfigPath = (
+        networkConfigPathOverride.expanduser()
+        if networkConfigPathOverride is not None
+        else config.networkConfigPath
+    )
     networkConfig = loadNetworkConfig(
-        configPath=config.networkConfigPath,
+        configPath=resolvedNetworkConfigPath,
         profile=profile,
     )
     LOGGER.info(
@@ -189,6 +208,40 @@ def _runTraining(
         networkConfig.generation.numHeads,
         networkConfig.generation.numLayers,
         networkConfig.generation.diffusionSteps,
+    )
+    enabledComponents = buildEnabledComponents(networkConfig.generation.boneData)
+    enabledComponentKeys = [component.key for component in enabledComponents]
+    clipMotionComponents = (
+        buildEnabledComponents(networkConfig.clip.boneData)
+        if networkConfig.clip.boneData is not None
+        else ()
+    )
+    if networkConfig.clip.boneData is not None and not clipMotionComponents:
+        raise ValueError(
+            "clip.bone-data is configured but enables no motion features. "
+            "Enable at least one component or remove clip.bone-data to keep "
+            "the legacy rotation-only CLIP input."
+        )
+    clipMotionKeys = (
+        [component.key for component in clipMotionComponents]
+        if clipMotionComponents
+        else ["rotation6d"]
+    )
+    if "rotation6d" not in enabledComponentKeys:
+        raise ValueError(
+            "The current generation model still requires `rotation6d` in "
+            "bone-data because `motion` is the only input consumed by the "
+            "denoiser."
+        )
+    LOGGER.info(
+        "Enabled motion components: %s",
+        ", ".join(enabledComponentKeys),
+    )
+    LOGGER.info("CLIP motion components: %s", ", ".join(clipMotionKeys))
+    LOGGER.info(
+        "CLIP motion encoder: heads=%d, layers=%d",
+        networkConfig.clip.motionNumHeads,
+        networkConfig.clip.motionNumLayers,
     )
 
     # Build model with network config
@@ -201,23 +254,46 @@ def _runTraining(
         diffusionSteps=networkConfig.generation.diffusionSteps,
         modelName=config.training.modelName,
         clipCheckpoint=config.paths.clipCheckpoint,
+        clipMotionNumHeads=networkConfig.clip.motionNumHeads,
+        clipMotionNumLayers=networkConfig.clip.motionNumLayers,
         xyzWeight=config.training.xyzWeight,
         xyzWeightSchedule=config.training.xyzWeightSchedule,
         velXyzWeight=config.training.velXyzWeight,
         diffusionWeight=config.training.diffusionWeight,
         accelerationWeight=config.training.accelerationWeight,
+        clipGuidanceWeight=config.training.clipGuidanceWeight,
         numSpatialLayers=networkConfig.generation.numSpatialLayers,
         numSpatioTemporalLayers=networkConfig.generation.numSpatioTemporalLayers,
         maxPromptLength=config.training.maxPromptLength,
+        clipMotionComponents=clipMotionComponents,
+        generationMotionComponents=enabledComponents,
     ).to(device)
     LOGGER.info(
         "Model initialized with CLIP from %s",
         config.paths.clipCheckpoint,
     )
+    if config.training.disableDropout:
+        updatedDropouts = disableDropoutModules(model.denoiser)
+        LOGGER.info(
+            "Overfit dropout override enabled: %d dropout modules set to 0.0",
+            updatedDropouts,
+        )
+    clipFingerprint = computeClipCheckpointFingerprint(config.paths.clipCheckpoint)
     LOGGER.info(
-        "Rotation-only training input enabled (6D joints, no root "
-        "translation fed to the network)."
+        "Generation text cache fingerprint: %s",
+        clipFingerprint,
     )
+    if enabledComponentKeys == ["rotation6d"]:
+        LOGGER.info(
+            "Rotation-only training input enabled (6D joints only)."
+        )
+    else:
+        LOGGER.info(
+            "Auxiliary generation supervision enabled for: %s",
+            ", ".join(
+                key for key in enabledComponentKeys if key != "rotation6d"
+            ),
+        )
     xyzSchedule = config.training.xyzWeightSchedule.lower()
     effectiveXyzWeight = config.training.xyzWeight
     if xyzSchedule == "timestep":
@@ -236,6 +312,15 @@ def _runTraining(
         config.training.velXyzWeight,
         config.training.accelerationWeight,
     )
+    if config.training.clipGuidanceWeight > 0.0:
+        LOGGER.info(
+            "CLIP guidance enabled with weight %.4f",
+            config.training.clipGuidanceWeight,
+        )
+    if config.training.deterministicCorruption:
+        LOGGER.info(
+            "Deterministic diffusion corruption enabled for stable overfit runs."
+        )
     if config.training.accelerationWeight > 0.1:
         LOGGER.warning(
             "Acceleration weight %.4f is high for rotation-only 6D "
@@ -315,10 +400,19 @@ def _runTraining(
         maxSamplesPerEpoch=selectedMaxSamplesPerEpoch,
         datasetFolders=selectedFolders,
         fixedSampleRange=selectedFixedSampleRange,
+        generationCacheCheckpoint=config.paths.clipCheckpoint,
+        includeTokenizedText=True,
+        preloadEpochChunks=True,
     )
     datasetManager.dataset.validateCompatibility(
         modelName=config.training.modelName,
         maxPromptLength=config.training.maxPromptLength,
+        requiredComponents=sorted(
+            set(enabledComponentKeys) | set(clipMotionKeys)
+        ),
+        expectedPooledTextDim=model.clip.textEncoder.config.hidden_size,
+        expectedGenerationEmbedDim=model.embedDim,
+        requireGenerationTextEmbedding=True,
     )
     LOGGER.info("Dataset indexed: %d total samples", datasetManager.totalSize)
     if overfitSelection is not None:
@@ -430,6 +524,7 @@ def _runTraining(
             chunkInfo=chunkInfo,
             memoryLimitGB=config.training.MM_memoryLimitGB,
             clearMpsCache=config.training.clearMpsCache,
+            deterministicCorruption=config.training.deterministicCorruption,
         )
         valLoss: Optional[float] = None
         valComponents = _nanLossComponents()
@@ -441,6 +536,7 @@ def _runTraining(
                 model,
                 ddim,
                 device,
+                deterministicCorruption=config.training.deterministicCorruption,
             )
             # Checkpointing - save best model
             if bestValLoss is None or valLoss < bestValLoss:
@@ -481,6 +577,8 @@ def _runTraining(
             epoch=epochIndex + 1,
             totalEpochs=config.training.epochs,
             learningRate=currentLr,
+            trainLoss=trainLoss,
+            valLoss=valLoss,
             trainComponents=trainComponents,
             valComponents=valComponents,
         )
@@ -633,15 +731,32 @@ def _formatComponents(components: Mapping[str, float]) -> str:
         ),
     ):
         return "disabled"
-    return (
-        "diff= %.4f, xyz= %.4f, vel_xyz= %.4f, acc= %.4f"
-        % (
-            components.get("loss_diffusion", float("nan")),
-            components.get("loss_xyz", float("nan")),
-            components.get("loss_vel_xyz", float("nan")),
-            components.get("loss_acceleration", float("nan")),
+    formatted = [
+        "diff= %.4f" % components.get("loss_diffusion", float("nan")),
+        "xyz= %.4f" % components.get("loss_xyz", float("nan")),
+        "vel_xyz= %.4f" % components.get("loss_vel_xyz", float("nan")),
+        "acc= %.4f" % components.get("loss_acceleration", float("nan")),
+    ]
+    if "loss_components" in components:
+        formatted.append(
+            "aux= %.4f" % components.get("loss_components", float("nan"))
         )
-    )
+    if "loss_root_translation" in components:
+        formatted.append(
+            "rtrans= %.4f"
+            % components.get("loss_root_translation", float("nan"))
+        )
+    if "loss_root_velocity" in components:
+        formatted.append(
+            "rvel= %.4f"
+            % components.get("loss_root_velocity", float("nan"))
+        )
+    if "loss_clip_guidance" in components:
+        formatted.append(
+            "clip= %.4f"
+            % components.get("loss_clip_guidance", float("nan"))
+        )
+    return ", ".join(formatted)
 
 
 def _componentsDisabled(
@@ -660,6 +775,8 @@ def _logEpochSummary(
     epoch: int,
     totalEpochs: int,
     learningRate: float,
+    trainLoss: float,
+    valLoss: float | None,
     trainComponents: Mapping[str, float],
     valComponents: Mapping[str, float],
 ) -> None:
@@ -667,10 +784,12 @@ def _logEpochSummary(
     Log one compact epoch line following the requested format.
     """
     LOGGER.info(
-        "epoch: %s/%s, lr = %.6f, train: [ %s ], val: [ %s ]",
+        "epoch: %s/%s, lr = %.6f, train_loss= %.4f, val_loss= %s, train: [ %s ], val: [ %s ]",
         epoch,
         totalEpochs,
         learningRate,
+        trainLoss,
+        "disabled" if valLoss is None else f"{valLoss:.4f}",
         _formatComponents(trainComponents),
         _formatComponents(valComponents),
     )

@@ -17,7 +17,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 from src.shared.model.clip.data import motionTextCollate
-from src.shared.preprocessed_dataset import PreprocessedMotionDataset
+from src.shared.preprocessed_dataset import PreprocessedLinkDataset
 
 LOGGER = logging.getLogger("shared.dataset_manager")
 
@@ -27,11 +27,18 @@ AUTO_MIN_SAMPLE_MULTIPLIER = 4
 MIN_SAMPLES = 1
 MODEL_MEMORY_MULTIPLIER = 3
 DEFAULT_VALIDATION_SEED = 42
+DEFAULT_CHUNK_SELECTION_SEED = 42
 VALIDATION_INDICES_KEY = "indices"
 VALIDATION_METADATA_KEY = "metadata"
 VALIDATION_META_TOTAL = "total_size"
 VALIDATION_META_SPLIT = "validation_split"
 VALIDATION_META_SEED = "seed"
+VALIDATION_META_FOLDERS = "dataset_folders"
+
+
+def _normalizeFolderName(value: str) -> str:
+    """Normalize folder labels for stable comparisons."""
+    return value.replace("\\", "/").strip().lower()
 
 
 @dataclass
@@ -228,6 +235,9 @@ class DatasetManager:
         maxSamplesPerEpoch: Optional[int] = None,
         datasetFolders: Optional[List[str]] = None,
         fixedSampleRange: Optional[Tuple[int, int]] = None,
+        generationCacheCheckpoint: Optional[Path] = None,
+        includeTokenizedText: bool = True,
+        preloadEpochChunks: bool = False,
     ) -> None:
         self.datasetRoot = datasetRoot
         self.batchSize = batchSize
@@ -238,11 +248,14 @@ class DatasetManager:
         self.maxSamplesPerEpoch = maxSamplesPerEpoch
         self.datasetFolders = datasetFolders
         self.fixedSampleRange = fixedSampleRange
+        self.generationCacheCheckpoint = generationCacheCheckpoint
+        self.includeTokenizedText = includeTokenizedText
+        self.preloadEpochChunks = preloadEpochChunks
 
         self.memoryConfig = memoryConfig or MemoryManagerConfig()
         self.memoryManager = MemoryManager(self.memoryConfig, device)
 
-        self._dataset: Optional[PreprocessedMotionDataset] = None
+        self._dataset: Optional[PreprocessedLinkDataset] = None
         self._totalSize: Optional[int] = None
         self._activeIndices: Optional[List[int]] = None
         self._activeIndexSet: Optional[set[int]] = None
@@ -252,14 +265,16 @@ class DatasetManager:
         self._fixedValidationLoader: Optional[DataLoader] = None
         self._fixedSampleIndices: Optional[List[int]] = None
         self._fixedSampleChunkInfo: Optional[str] = None
+        self._shuffledCycleIndex: Optional[int] = None
+        self._shuffledCycleOrder: Optional[List[int]] = None
 
-    def _ensureDataset(self) -> PreprocessedMotionDataset:
+    def _ensureDataset(self) -> PreprocessedLinkDataset:
         """
         Lazy-load dataset metadata.
 
         Returns
         -------
-        PreprocessedMotionDataset
+        PreprocessedLinkDataset
             Loaded preprocessed dataset.
         """
         if self._dataset is None:
@@ -267,7 +282,11 @@ class DatasetManager:
                 "MM: Loading preprocessed dataset from %s",
                 self.datasetRoot,
             )
-            self._dataset = PreprocessedMotionDataset(self.datasetRoot)
+            self._dataset = PreprocessedLinkDataset(
+                self.datasetRoot,
+                generationCacheCheckpoint=self.generationCacheCheckpoint,
+                includeTokenizedText=self.includeTokenizedText,
+            )
             self._activeIndices = self._buildActiveIndices(self._dataset)
             self._activeIndexSet = set(self._activeIndices)
             self._totalSize = len(self._activeIndices)
@@ -279,7 +298,7 @@ class DatasetManager:
         return self._dataset
 
     @property
-    def dataset(self) -> PreprocessedMotionDataset:
+    def dataset(self) -> PreprocessedLinkDataset:
         """Return the underlying dataset instance."""
         return self._ensureDataset()
 
@@ -289,7 +308,7 @@ class DatasetManager:
         self._ensureDataset()
         return self._totalSize or 0
 
-    def _buildActiveIndices(self, dataset: PreprocessedMotionDataset) -> List[int]:
+    def _buildActiveIndices(self, dataset: PreprocessedLinkDataset) -> List[int]:
         """Build the list of sample indices active for this training run."""
         totalIndices = list(range(len(dataset)))
         if not self.datasetFolders:
@@ -322,7 +341,7 @@ class DatasetManager:
 
     def _normalizeFolderName(self, value: str) -> str:
         """Normalize folder labels for stable comparisons."""
-        return value.replace("\\", "/").strip().lower()
+        return _normalizeFolderName(value)
 
     @property
     def effectiveSamplesPerEpoch(self) -> int:
@@ -421,13 +440,20 @@ class DatasetManager:
         if chunkSize >= totalSize:
             return activeIndices, f"all {totalSize} samples"
 
-        startIndex, indices = _selectChunkIndices(
-            totalSize=totalSize,
-            chunkSize=chunkSize,
-            epochIndex=epochIndex,
-        )
+        cycleEpochs = _estimateCoverage(totalSize, chunkSize)
+        cycleIndex = epochIndex // cycleEpochs
+        chunkIndex = epochIndex % cycleEpochs
+        cycleOrder = self._getShuffledCycleOrder(totalSize, cycleIndex)
+        startIndex = chunkIndex * chunkSize
+        endIndex = min(startIndex + chunkSize, totalSize)
+        indices = cycleOrder[startIndex:endIndex]
         mappedIndices = [activeIndices[idx] for idx in indices]
-        chunkInfo = _formatChunkInfo(startIndex, chunkSize, totalSize)
+        chunkInfo = _formatShuffledChunkInfo(
+            chunkIndex=chunkIndex,
+            cycleEpochs=cycleEpochs,
+            chunkSize=len(indices),
+            totalSize=totalSize,
+        )
         return mappedIndices, chunkInfo
 
     def _getFixedSampleSelection(
@@ -476,26 +502,75 @@ class DatasetManager:
             raise RuntimeError("Dataset not initialized.")
         if valIndexSet:
             trainIndices = self._filterTrainingIndices(indices, valIndexSet)
+            trainDataset = self._buildEpochDataset(
+                trainIndices,
+                label=f"train {chunkInfo}",
+            )
             trainLoader = self._makeDataloader(
-                Subset(dataset, trainIndices),
+                trainDataset,
                 shuffle=True,
             )
             valLoader = self._buildFixedValidationLoader()
             return trainLoader, valLoader, chunkInfo
-        chunkSubset = Subset(dataset, indices)
+        chunkDataset = self._buildEpochDataset(indices, label=chunkInfo)
 
         if self.validationSplit <= 0.0 or len(indices) < 2:
-            trainLoader = self._makeDataloader(chunkSubset, shuffle=True)
+            trainLoader = self._makeDataloader(chunkDataset, shuffle=True)
             return trainLoader, None, chunkInfo
 
         valSize = max(1, int(len(indices) * self.validationSplit))
         trainSize = len(indices) - valSize
-        trainSubset, valSubset = random_split(chunkSubset, [trainSize, valSize])
+        trainSubset, valSubset = random_split(chunkDataset, [trainSize, valSize])
 
         trainLoader = self._makeDataloader(trainSubset, shuffle=True)
         valLoader = self._makeDataloader(valSubset, shuffle=False)
 
         return trainLoader, valLoader, chunkInfo
+
+    def _buildEpochDataset(
+        self,
+        indices: List[int],
+        label: str,
+    ) -> Dataset[Dict[str, object]]:
+        """Build a dataset view for the current epoch selection."""
+        dataset = self._dataset
+        if dataset is None:
+            raise RuntimeError("Dataset not initialized.")
+        if not self.preloadEpochChunks:
+            return Subset(dataset, indices)
+        if not indices:
+            return _InMemorySampleDataset([])
+        LOGGER.info(
+            "MM: Preloading %d samples in RAM for %s",
+            len(indices),
+            label,
+        )
+        if isinstance(dataset, PreprocessedLinkDataset):
+            samples = dataset.preloadIndices(indices)
+        else:
+            preloadIndices = sorted(indices)
+            samples = [dataset[index] for index in preloadIndices]
+        dataset.clearCache()
+        return _InMemorySampleDataset(samples)
+
+    def _getShuffledCycleOrder(
+        self,
+        totalSize: int,
+        cycleIndex: int,
+    ) -> List[int]:
+        """Return the cached shuffled order for a full dataset-coverage cycle."""
+        if (
+            self._shuffledCycleOrder is not None
+            and self._shuffledCycleIndex == cycleIndex
+            and len(self._shuffledCycleOrder) == totalSize
+        ):
+            return self._shuffledCycleOrder
+        order = list(range(totalSize))
+        generator = random.Random(DEFAULT_CHUNK_SELECTION_SEED + cycleIndex)
+        generator.shuffle(order)
+        self._shuffledCycleIndex = cycleIndex
+        self._shuffledCycleOrder = order
+        return order
 
     def _makeDataloader(
         self,
@@ -611,10 +686,10 @@ class DatasetManager:
         valIndices = self._getFixedValidationIndices()
         if valIndices is None:
             return None
-        dataset = self._dataset
-        if dataset is None:
-            raise RuntimeError("Dataset not initialized.")
-        valSubset = Subset(dataset, valIndices)
+        valSubset = self._buildEpochDataset(
+            valIndices,
+            label="fixed validation",
+        )
         self._fixedValidationLoader = self._makeDataloader(
             valSubset,
             shuffle=False,
@@ -680,11 +755,26 @@ class DatasetManager:
         dataset = self._dataset
         if dataset is None:
             raise RuntimeError("Dataset not initialized.")
-        totalSize = len(dataset)
+        activeIndices = self._activeIndices
+        if activeIndices is None:
+            raise RuntimeError("Active dataset indices are not initialized.")
+        totalSize = len(activeIndices)
+        metadata = payload.get(VALIDATION_METADATA_KEY)
+        if not _validationMetadataMatches(
+            metadata=metadata,
+            totalSize=totalSize,
+            validationSplit=self.validationSplit,
+            datasetFolders=self.datasetFolders,
+        ):
+            LOGGER.warning(
+                "MM: Validation indices metadata mismatch, regenerating: %s",
+                self.validationIndicesPath,
+            )
+            return None
         if any(
             not isinstance(idx, int)
             or idx < 0
-            or idx >= totalSize
+            or idx >= len(dataset)
             for idx in indices
         ):
             LOGGER.warning(
@@ -733,6 +823,9 @@ class DatasetManager:
                 VALIDATION_META_TOTAL: self.totalSize,
                 VALIDATION_META_SPLIT: self.validationSplit,
                 VALIDATION_META_SEED: DEFAULT_VALIDATION_SEED,
+                VALIDATION_META_FOLDERS: _normalizeValidationFolders(
+                    self.datasetFolders
+                ),
             },
             VALIDATION_INDICES_KEY: indices,
         }
@@ -740,6 +833,60 @@ class DatasetManager:
             json.dumps(payload, indent=2),
             encoding="utf-8",
         )
+
+
+def _normalizeValidationFolders(
+    datasetFolders: Optional[List[str]],
+) -> Optional[List[str]]:
+    """Return a stable folder signature for validation-split cache files."""
+    if not datasetFolders:
+        return None
+    normalized = sorted(
+        {
+            _normalizeFolderName(folder)
+            for folder in datasetFolders
+            if folder and folder.strip()
+        }
+    )
+    return normalized or None
+
+
+def _validationMetadataMatches(
+    metadata: object,
+    totalSize: int,
+    validationSplit: float,
+    datasetFolders: Optional[List[str]],
+) -> bool:
+    """Return True when cached validation indices match the active run."""
+    if not isinstance(metadata, dict):
+        return False
+    expectedFolders = _normalizeValidationFolders(datasetFolders)
+    cachedTotal = metadata.get(VALIDATION_META_TOTAL)
+    cachedSplit = metadata.get(VALIDATION_META_SPLIT)
+    cachedFolders = metadata.get(VALIDATION_META_FOLDERS)
+    if cachedTotal != totalSize:
+        return False
+    try:
+        cachedSplitValue = float(cachedSplit)
+    except (TypeError, ValueError):
+        return False
+    if not math.isclose(
+        cachedSplitValue,
+        validationSplit,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        return False
+    if expectedFolders is None:
+        return cachedFolders is None
+    if not isinstance(cachedFolders, list):
+        return False
+    normalizedCachedFolders = sorted(
+        str(folder).strip().lower()
+        for folder in cachedFolders
+        if str(folder).strip()
+    )
+    return normalizedCachedFolders == expectedFolders
 
 
 def estimateModelBytes(model: torch.nn.Module) -> int:
@@ -767,7 +914,7 @@ def estimateModelBytes(model: torch.nn.Module) -> int:
 
 
 def _computeAutoChunkSize(
-    dataset: PreprocessedMotionDataset,
+    dataset: PreprocessedLinkDataset,
     batchSize: int,
     modelMemoryBytes: int,
 ) -> int:
@@ -776,7 +923,7 @@ def _computeAutoChunkSize(
 
     Parameters
     ----------
-    dataset : PreprocessedMotionDataset
+    dataset : PreprocessedLinkDataset
         Dataset providing average sample size.
     batchSize : int
         Training batch size.
@@ -812,13 +959,14 @@ def _estimateCoverage(totalSize: int, chunkSize: int) -> int:
     return math.ceil(totalSize / chunkSize)
 
 
-def _selectChunkIndices(
+def _selectShuffledChunkIndices(
     totalSize: int,
     chunkSize: int,
-    epochIndex: int,
-) -> Tuple[int, List[int]]:
+    chunkIndex: int,
+    cycleIndex: int,
+) -> List[int]:
     """
-    Select indices for a rotating dataset chunk.
+    Select indices for a shuffled dataset chunk.
 
     Parameters
     ----------
@@ -826,32 +974,53 @@ def _selectChunkIndices(
         Total number of samples in the dataset.
     chunkSize : int
         Number of samples per epoch.
-    epochIndex : int
-        Zero-based epoch index.
+    chunkIndex : int
+        Zero-based chunk index inside the current full-coverage cycle.
+    cycleIndex : int
+        Zero-based index of the current full-coverage cycle.
     """
-    startIndex = (epochIndex * chunkSize) % totalSize
+    order = list(range(totalSize))
+    generator = random.Random(DEFAULT_CHUNK_SELECTION_SEED + cycleIndex)
+    generator.shuffle(order)
+    startIndex = chunkIndex * chunkSize
     endIndex = min(startIndex + chunkSize, totalSize)
-    if startIndex + chunkSize > totalSize:
-        indices = list(range(startIndex, totalSize)) + list(
-            range(0, (startIndex + chunkSize) % totalSize)
-        )
-    else:
-        indices = list(range(startIndex, endIndex))
-    return startIndex, indices
+    return order[startIndex:endIndex]
 
 
-def _formatChunkInfo(startIndex: int, chunkSize: int, totalSize: int) -> str:
+def _formatShuffledChunkInfo(
+    chunkIndex: int,
+    cycleEpochs: int,
+    chunkSize: int,
+    totalSize: int,
+) -> str:
     """
     Format a human-readable chunk description.
 
     Parameters
     ----------
-    startIndex : int
-        Chunk start index.
+    chunkIndex : int
+        Zero-based chunk index inside the current full-coverage cycle.
+    cycleEpochs : int
+        Number of epochs required to cover the whole dataset once.
     chunkSize : int
         Chunk size.
     totalSize : int
         Total dataset size.
     """
-    endIndex = min(startIndex + chunkSize, totalSize)
-    return f"samples {startIndex + 1}-{endIndex}/{totalSize}"
+    return (
+        f"shuffled chunk {chunkIndex + 1}/{cycleEpochs} "
+        f"({chunkSize}/{totalSize} samples)"
+    )
+
+
+class _InMemorySampleDataset(Dataset[Dict[str, object]]):
+    """Dataset wrapper for a chunk fully materialized in RAM."""
+
+    def __init__(self, samples: List[Dict[str, object]]) -> None:
+        self.samples = samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> Dict[str, object]:
+        return self.samples[index]

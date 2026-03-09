@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Iterable, Mapping, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from src.shared.constants.clip import DEFAULT_LEARNING_RATE
@@ -13,6 +15,12 @@ from src.shared.model.clip.core import ClipModel
 from src.shared.progress import TrainingProgressBar
 
 BatchDict = Mapping[str, object]
+LossComponents = dict[str, float]
+LOSS_COMPONENT_KEYS = (
+    "loss_text_contrastive",
+    "loss_motion_contrastive",
+    "loss_motion_cosine",
+)
 
 
 
@@ -45,6 +53,16 @@ def buildOptimizer(
     )
 
 
+def disableDropoutModules(module: nn.Module) -> int:
+    """Set every dropout probability in ``module`` to zero."""
+    updated = 0
+    for child in module.modules():
+        if isinstance(child, nn.Dropout):
+            child.p = 0.0
+            updated += 1
+    return updated
+
+
 def trainOneEpoch(
     dataloader: Iterable[BatchDict],
     model: ClipModel,
@@ -53,7 +71,7 @@ def trainOneEpoch(
     epoch: int = 1,
     totalEpochs: int = 1,
     chunkInfo: Optional[str] = None,
-) -> float:
+) -> tuple[float, LossComponents]:
     """
     Run a single training epoch and return the average loss.
 
@@ -76,10 +94,12 @@ def trainOneEpoch(
 
     Returns
     -------
-    float
-        Average training loss across the epoch.
+    tuple[float, LossComponents]
+        Average training loss across the epoch and its components.
     """
     model.train()
+    componentSums = _initLossComponents()
+    numBatches = 0
 
     with TrainingProgressBar(
         dataloader,
@@ -90,15 +110,20 @@ def trainOneEpoch(
         chunkInfo=chunkInfo,
     ) as pbar:
         for batch in pbar:
-            batchLoss, outputs = _runBatch(
+            batchLoss, batchComponents = _runBatch(
                 batch,
                 model,
                 optimizer,
                 device,
             )
             pbar.updateLoss(batchLoss)
+            _updateLossComponents(componentSums, batchComponents)
+            numBatches += 1
 
-        return pbar.metrics.avgLoss
+        return pbar.metrics.avgLoss, _averageLossComponents(
+            componentSums,
+            numBatches,
+        )
 
 
 def _runBatch(
@@ -106,7 +131,7 @@ def _runBatch(
     model: ClipModel,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-) -> tuple[float, Mapping[str, torch.Tensor]]:
+) -> tuple[float, LossComponents]:
     """
     Execute a forward/backward pass for a single batch.
 
@@ -123,20 +148,26 @@ def _runBatch(
 
     Returns
     -------
-    tuple[float, Mapping[str, torch.Tensor]]
-        Detached loss value and model outputs.
+    tuple[float, LossComponents]
+        Detached loss value and loss components.
     """
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
+    motionInput = model.buildMotionInput(batch).to(device)
+    positiveMask = _buildPositiveMask(batch, device)
     outputs = model(
-        textInputIds=_toDevice(batch["input_ids"], device),
-        textAttentionMask=_toDevice(batch["attention_mask"], device),
-        motionInput=_toDevice(batch["motion"], device),
+        textInputIds=None,
+        textAttentionMask=None,
+        motionInput=motionInput,
+        motionMask=_optionalMotionMask(batch, device),
+        positiveMask=positiveMask,
         computeLoss=True,
+        pooledText=_toDevice(batch["pooled_text"], device),
     )
     loss = outputs["clip_loss"]
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(_trainableParameters(model), max_norm=1.0)
     optimizer.step()
-    return float(loss.detach().item()), outputs
+    return float(loss.detach().item()), _extractLossComponents(outputs)
 
 
 def _runBatchAccumulate(
@@ -144,7 +175,7 @@ def _runBatchAccumulate(
     model: ClipModel,
     device: torch.device,
     accumulationSteps: int,
-) -> tuple[float, Mapping[str, torch.Tensor]]:
+) -> tuple[float, LossComponents]:
     """
     Execute a forward/backward pass for gradient accumulation.
 
@@ -161,18 +192,26 @@ def _runBatchAccumulate(
 
     Returns
     -------
-    tuple[float, Mapping[str, torch.Tensor]]
-        Detached loss value and model outputs.
+    tuple[float, LossComponents]
+        Detached loss value and loss components.
     """
+    motionInput = model.buildMotionInput(batch).to(device)
+    positiveMask = _buildPositiveMask(batch, device)
     outputs = model(
-        textInputIds=_toDevice(batch["input_ids"], device),
-        textAttentionMask=_toDevice(batch["attention_mask"], device),
-        motionInput=_toDevice(batch["motion"], device),
+        textInputIds=None,
+        textAttentionMask=None,
+        motionInput=motionInput,
+        motionMask=_optionalMotionMask(batch, device),
+        positiveMask=positiveMask,
         computeLoss=True,
+        pooledText=_toDevice(batch["pooled_text"], device),
     )
     loss = outputs["clip_loss"] / accumulationSteps
     loss.backward()
-    return float(outputs["clip_loss"].detach().item()), outputs
+    return (
+        float(outputs["clip_loss"].detach().item()),
+        _extractLossComponents(outputs),
+    )
 
 
 def trainOneEpochWithAccumulation(
@@ -185,7 +224,7 @@ def trainOneEpochWithAccumulation(
     totalEpochs: int = 1,
     chunkInfo: Optional[str] = None,
     memoryLimitGB: float = 0.0,
-) -> float:
+) -> tuple[float, LossComponents]:
     """
     Run a single training epoch with gradient accumulation.
 
@@ -212,16 +251,19 @@ def trainOneEpochWithAccumulation(
 
     Returns
     -------
-    float
-        Average training loss across the epoch.
+    tuple[float, LossComponents]
+        Average training loss across the epoch and its components.
     """
     model.train()
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
     
     # Setup memory manager
     from src.shared.dataset_manager import MemoryManager, MemoryManagerConfig
     memoryConfig = MemoryManagerConfig(MM_memoryLimitGB=memoryLimitGB)
     memoryManager = MemoryManager(memoryConfig, device)
+
+    componentSums = _initLossComponents()
+    numBatches = 0
 
     with TrainingProgressBar(
         dataloader,
@@ -232,28 +274,41 @@ def trainOneEpochWithAccumulation(
         chunkInfo=chunkInfo,
     ) as pbar:
         for batchIndex, batch in enumerate(pbar):
-            batchLoss, outputs = _runBatchAccumulate(
+            batchLoss, batchComponents = _runBatchAccumulate(
                 batch,
                 model,
                 device,
                 accumulationSteps,
             )
             pbar.updateLoss(batchLoss)
+            _updateLossComponents(componentSums, batchComponents)
+            numBatches += 1
 
             # Step optimizer every accumulationSteps batches
             if (batchIndex + 1) % accumulationSteps == 0:
+                torch.nn.utils.clip_grad_norm_(
+                    _trainableParameters(model),
+                    max_norm=1.0,
+                )
                 optimizer.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
             
             # Check memory and cleanup if needed
             memoryManager.checkAndCleanup(batchIndex)
 
         # Handle remaining gradients
         if len(dataloader) % accumulationSteps != 0:
+            torch.nn.utils.clip_grad_norm_(
+                _trainableParameters(model),
+                max_norm=1.0,
+            )
             optimizer.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
-        return pbar.metrics.avgLoss
+        return pbar.metrics.avgLoss, _averageLossComponents(
+            componentSums,
+            numBatches,
+        )
 
 
 def _trainableParameters(model: ClipModel) -> list[torch.nn.Parameter]:
@@ -304,11 +359,60 @@ def _toDevice(value: object, device: torch.device) -> torch.Tensor:
     return value.to(device)
 
 
+def _optionalMotionMask(
+    batch: BatchDict,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Return the batched motion padding mask when available."""
+    motionMask = batch.get("motion_mask")
+    if motionMask is None:
+        return None
+    if not isinstance(motionMask, torch.Tensor):
+        raise TypeError("Expected motion_mask batch entry to be a tensor.")
+    return motionMask.to(device=device, dtype=torch.bool)
+
+
+def _initLossComponents() -> LossComponents:
+    """Return zero-initialized CLIP loss accumulators."""
+    return {key: 0.0 for key in LOSS_COMPONENT_KEYS}
+
+
+def _extractLossComponents(
+    outputs: Mapping[str, object],
+) -> LossComponents:
+    """Extract detached CLIP loss components from one forward pass."""
+    components: LossComponents = {}
+    for key in LOSS_COMPONENT_KEYS:
+        value = outputs.get(key)
+        if isinstance(value, torch.Tensor):
+            components[key] = float(value.detach().item())
+    return components
+
+
+def _updateLossComponents(
+    componentSums: LossComponents,
+    components: Mapping[str, float],
+) -> None:
+    """Accumulate CLIP loss components."""
+    for key, value in components.items():
+        if key in componentSums:
+            componentSums[key] += value
+
+
+def _averageLossComponents(
+    componentSums: Mapping[str, float],
+    batchCount: int,
+) -> LossComponents:
+    """Average CLIP loss components across the epoch."""
+    safeCount = max(batchCount, 1)
+    return {key: value / safeCount for key, value in componentSums.items()}
+
+
 def evaluateValidation(
     dataloader: DataLoader,
     model: ClipModel,
     device: torch.device,
-) -> tuple[float, dict[str, float]]:
+) -> tuple[float, dict[str, float], LossComponents]:
     """
     Compute average loss on the validation set without gradients.
 
@@ -323,81 +427,167 @@ def evaluateValidation(
 
     Returns
     -------
-    tuple[float, dict[str, float]]
-        Average validation loss and retrieval metrics.
+    tuple[float, dict[str, float], LossComponents]
+        Average validation loss, retrieval metrics, and loss components.
     """
     model.eval()
     totalLoss = 0.0
-    retrieval = {
-        "t2m_top1": 0.0,
-        "t2m_top5": 0.0,
-        "m2t_top1": 0.0,
-        "m2t_top5": 0.0,
-        "count": 0.0,
+    componentSums = _initLossComponents()
+    retrievalGallery: dict[str, list[torch.Tensor]] = {
+        "text_embeds": [],
+        "motion_embeds": [],
+        "sample_ids": [],
+        "text_ids": [],
     }
     with torch.no_grad():
         for batch in dataloader:
+            positiveMask = _buildPositiveMask(batch, device)
             outputs = model(
-                textInputIds=_toDevice(batch["input_ids"], device),
-                textAttentionMask=_toDevice(batch["attention_mask"], device),
-                motionInput=_toDevice(batch["motion"], device),
+                textInputIds=None,
+                textAttentionMask=None,
+                motionInput=model.buildMotionInput(batch).to(device),
+                motionMask=_optionalMotionMask(batch, device),
+                positiveMask=positiveMask,
                 computeLoss=True,
+                pooledText=_toDevice(batch["pooled_text"], device),
             )
             totalLoss += float(outputs["clip_loss"].item())
-            _accumulateRetrieval(retrieval, outputs)
+            _updateLossComponents(
+                componentSums,
+                _extractLossComponents(outputs),
+            )
+            _accumulateValidationGallery(
+                storage=retrievalGallery,
+                outputs=outputs,
+                batch=batch,
+            )
     model.train()
     avgLoss = totalLoss / max(len(dataloader), 1)
-    metrics = _finalizeRetrieval(retrieval)
-    return avgLoss, metrics
+    metrics = _computeGlobalRetrieval(retrievalGallery)
+    return avgLoss, metrics, _averageLossComponents(
+        componentSums,
+        len(dataloader),
+    )
 
 
-def _accumulateRetrieval(
-    metrics: dict[str, float],
+def _accumulateValidationGallery(
+    storage: dict[str, list[torch.Tensor]],
     outputs: Mapping[str, object],
+    batch: BatchDict,
 ) -> None:
-    logitsText = outputs.get("logits_per_text")
-    logitsMotion = outputs.get("logits_per_motion")
-    if not isinstance(logitsText, torch.Tensor):
+    textEmbeds = outputs.get("text_embeds")
+    motionEmbeds = outputs.get("motion_embeds")
+    sampleIds = batch.get("sample_id")
+    textIds = batch.get("text_id")
+    if not isinstance(textEmbeds, torch.Tensor):
         return
-    if not isinstance(logitsMotion, torch.Tensor):
+    if not isinstance(motionEmbeds, torch.Tensor):
         return
-    batchSize = logitsText.shape[0]
+    if not isinstance(sampleIds, torch.Tensor):
+        raise TypeError("Validation batch is missing sample_id tensor.")
+    if not isinstance(textIds, torch.Tensor):
+        raise TypeError("Validation batch is missing text_id tensor.")
+    batchSize = int(textEmbeds.shape[0])
+    if (
+        batchSize != int(motionEmbeds.shape[0])
+        or batchSize != int(sampleIds.shape[0])
+        or batchSize != int(textIds.shape[0])
+    ):
+        raise ValueError("Validation embeddings and sample_ids must share batch size.")
     if batchSize == 0:
         return
-
-    target = torch.arange(batchSize, device=logitsText.device)
-    for k in (1, 5):
-        k = min(k, batchSize)
-        correctText = (
-            logitsText.topk(k, dim=1).indices == target[:, None]
-        ).any(dim=1).sum()
-        correctMotion = (
-            logitsMotion.topk(k, dim=1).indices == target[:, None]
-        ).any(dim=1).sum()
-        if k == 1:
-            metrics["t2m_top1"] += float(correctText.item())
-            metrics["m2t_top1"] += float(correctMotion.item())
-        else:
-            metrics["t2m_top5"] += float(correctText.item())
-            metrics["m2t_top5"] += float(correctMotion.item())
-    metrics["count"] += float(batchSize)
+    storage["text_embeds"].append(textEmbeds.detach().cpu())
+    storage["motion_embeds"].append(motionEmbeds.detach().cpu())
+    storage["sample_ids"].append(sampleIds.detach().cpu())
+    storage["text_ids"].append(textIds.detach().cpu())
 
 
-def _finalizeRetrieval(metrics: dict[str, float]) -> dict[str, float]:
-    count = metrics.get("count", 0.0)
-    if count <= 0:
+def _computeGlobalRetrieval(
+    storage: dict[str, list[torch.Tensor]],
+) -> dict[str, float]:
+    textChunks = storage.get("text_embeds", [])
+    motionChunks = storage.get("motion_embeds", [])
+    sampleIdChunks = storage.get("sample_ids", [])
+    textIdChunks = storage.get("text_ids", [])
+    if not textChunks or not motionChunks or not sampleIdChunks:
         return {
             "t2m_top1": 0.0,
             "t2m_top5": 0.0,
             "m2t_top1": 0.0,
             "m2t_top5": 0.0,
         }
-    return {
-        "t2m_top1": metrics["t2m_top1"] / count,
-        "t2m_top5": metrics["t2m_top5"] / count,
-        "m2t_top1": metrics["m2t_top1"] / count,
-        "m2t_top5": metrics["m2t_top5"] / count,
+    textEmbeds = torch.cat(textChunks, dim=0)
+    motionEmbeds = torch.cat(motionChunks, dim=0)
+    sampleIds = torch.cat(sampleIdChunks, dim=0).to(dtype=torch.long)
+    textIds = None
+    if textIdChunks:
+        textIds = torch.cat(textIdChunks, dim=0).to(dtype=torch.long)
+    count = int(textEmbeds.shape[0])
+    if count == 0:
+        return {
+            "t2m_top1": 0.0,
+            "t2m_top5": 0.0,
+            "m2t_top1": 0.0,
+            "m2t_top5": 0.0,
+        }
+    if (
+        count != int(motionEmbeds.shape[0])
+        or count != int(sampleIds.shape[0])
+        or (textIds is not None and count != int(textIds.shape[0]))
+    ):
+        raise ValueError(
+            "Global validation retrieval expects matching text/motion/sample counts."
+        )
+
+    logitsText = torch.matmul(textEmbeds, motionEmbeds.t())
+    logitsMotion = logitsText.t()
+    positiveMask = sampleIds[:, None].eq(sampleIds[None, :])
+    if textIds is not None:
+        positiveMask = positiveMask | textIds[:, None].eq(textIds[None, :])
+
+    metrics = {
+        "t2m_top1": 0.0,
+        "t2m_top5": 0.0,
+        "m2t_top1": 0.0,
+        "m2t_top5": 0.0,
     }
+    for k in (1, 5):
+        k = min(k, count)
+        topTextIndices = logitsText.topk(k, dim=1).indices
+        topMotionIndices = logitsMotion.topk(k, dim=1).indices
+        correctText = positiveMask.gather(1, topTextIndices).any(dim=1).sum()
+        correctMotion = positiveMask.t().gather(1, topMotionIndices).any(dim=1).sum()
+        if k == 1:
+            metrics["t2m_top1"] = float(correctText.item()) / count
+            metrics["m2t_top1"] = float(correctMotion.item()) / count
+        else:
+            metrics["t2m_top5"] = float(correctText.item()) / count
+            metrics["m2t_top5"] = float(correctMotion.item()) / count
+    return {
+        "t2m_top1": metrics["t2m_top1"],
+        "t2m_top5": metrics["t2m_top5"],
+        "m2t_top1": metrics["m2t_top1"],
+        "m2t_top5": metrics["m2t_top5"],
+    }
+
+
+def _buildPositiveMask(
+    batch: BatchDict,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Mark links sharing the same sample or raw text as positives.
+    """
+    sampleIds = batch.get("sample_id")
+    textIds = batch.get("text_id")
+    if not isinstance(sampleIds, torch.Tensor):
+        raise TypeError("Expected tensor batch entry.")
+    sampleIds = sampleIds.to(device=device, dtype=torch.long)
+    positiveMask = sampleIds[:, None].eq(sampleIds[None, :])
+    if isinstance(textIds, torch.Tensor):
+        textIds = textIds.to(device=device, dtype=torch.long)
+        positiveMask = positiveMask | textIds[:, None].eq(textIds[None, :])
+    return positiveMask
 
 
 def saveCheckpoint(
@@ -468,7 +658,20 @@ def loadCheckpoint(
         Epoch number and loss from the checkpoint.
     """
     checkpoint = torch.load(checkpointPath, weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    try:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    except RuntimeError as error:
+        raise RuntimeError(
+            "Failed to load the CLIP checkpoint. The checkpoint likely does "
+            "not match the current CLIP architecture or motion component layout. "
+            f"Original error: {error}"
+        ) from error
     if optimizer is not None:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        try:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        except ValueError as error:
+            raise RuntimeError(
+                "Optimizer state is incompatible with the current CLIP "
+                "parameter set."
+            ) from error
     return checkpoint["epoch"], checkpoint["loss"]

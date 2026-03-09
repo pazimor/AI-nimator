@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
-from src.shared.constants.skeletons import (
-    SMPL22_BONE_ORDER,
-    SMPL22_DEFAULT_OFFSETS,
-    SMPL22_HIERARCHY,
+from src.shared.model.components.ops import (
+    maskedMean,
+    rot6dToJointXYZ,
+    temporalDifference,
 )
 
 DEFAULT_DIFFUSION_WEIGHT = 1.0
@@ -19,7 +18,7 @@ DEFAULT_ACCELERATION_WEIGHT = 0.001
 XYZ_SCHEDULE_NONE = "none"
 XYZ_SCHEDULE_TIMESTEP = "timestep"
 MIN_DIFFUSION_STEPS = 1
-MIN_SIXD_CHANNELS = 6
+
 
 def diffusionLoss(
     predictedNoise: torch.Tensor,
@@ -44,7 +43,7 @@ def diffusionLoss(
         Scalar MSE loss.
     """
     squaredError = (predictedNoise - targetNoise) ** 2
-    return _maskedMean(squaredError, motionMask)
+    return maskedMean(squaredError, motionMask)
 
 
 def startMotionLoss(
@@ -70,7 +69,7 @@ def startMotionLoss(
         Scalar masked MSE in raw motion space.
     """
     squaredError = (predictedMotion - targetMotion) ** 2
-    return _maskedMean(squaredError, motionMask)
+    return maskedMean(squaredError, motionMask)
 
 
 def xyzLoss(
@@ -95,10 +94,10 @@ def xyzLoss(
     torch.Tensor
         Scalar masked XYZ MSE.
     """
-    predictedXYZ = _rot6dToJointXYZ(predicted)
-    targetXYZ = _rot6dToJointXYZ(target)
+    predictedXYZ = rot6dToJointXYZ(predicted)
+    targetXYZ = rot6dToJointXYZ(target)
     squaredError = (predictedXYZ - targetXYZ) ** 2
-    return _maskedMean(squaredError, motionMask)
+    return maskedMean(squaredError, motionMask)
 
 
 def velocityLoss(
@@ -128,10 +127,10 @@ def velocityLoss(
     if motion.shape[1] < 2:
         return torch.tensor(0.0, device=motion.device)
 
-    velocity = motion[:, 1:] - motion[:, :-1]
+    velocity = temporalDifference(motion, dim=1)[:, 1:]
     if motionMask is not None:
         motionMask = motionMask[:, 1:] & motionMask[:, :-1]
-    return weight * _maskedMean(velocity ** 2, motionMask)
+    return weight * maskedMean(velocity ** 2, motionMask)
 
 
 def velocityXyzLoss(
@@ -162,15 +161,15 @@ def velocityXyzLoss(
     if predictedMotion.shape[1] < 2:
         return torch.tensor(0.0, device=predictedMotion.device)
 
-    predictedXyz = _rot6dToJointXYZ(predictedMotion)
-    targetXyz = _rot6dToJointXYZ(targetMotion)
-    predictedVelocity = predictedXyz[:, 1:] - predictedXyz[:, :-1]
-    targetVelocity = targetXyz[:, 1:] - targetXyz[:, :-1]
+    predictedXyz = rot6dToJointXYZ(predictedMotion)
+    targetXyz = rot6dToJointXYZ(targetMotion)
+    predictedVelocity = temporalDifference(predictedXyz, dim=1)[:, 1:]
+    targetVelocity = temporalDifference(targetXyz, dim=1)[:, 1:]
     velocityError = (predictedVelocity - targetVelocity) ** 2
 
     if motionMask is not None:
         motionMask = motionMask[:, 1:] & motionMask[:, :-1]
-    return weight * _maskedMean(velocityError, motionMask)
+    return weight * maskedMean(velocityError, motionMask)
 
 
 def accelerationLoss(
@@ -200,15 +199,15 @@ def accelerationLoss(
     if motion.shape[1] < 3:
         return torch.tensor(0.0, device=motion.device)
 
-    velocity = motion[:, 1:] - motion[:, :-1]
-    acceleration = velocity[:, 1:] - velocity[:, :-1]
+    velocity = temporalDifference(motion, dim=1)
+    acceleration = temporalDifference(velocity, dim=1)[:, 2:]
     if motionMask is not None:
         motionMask = (
             motionMask[:, 2:]
             & motionMask[:, 1:-1]
             & motionMask[:, :-2]
         )
-    return weight * _maskedMean(acceleration ** 2, motionMask)
+    return weight * maskedMean(acceleration ** 2, motionMask)
 
 
 def combinedGenerationLoss(
@@ -330,150 +329,3 @@ def _resolveXyzWeight(
         weights = 1.0 - (timesteps.float() / float(denom))
         return weights.mean() * baseWeight
     raise ValueError(f"Unknown XYZ schedule: {schedule}")
-
-def _maskedMean(
-    values: torch.Tensor,
-    motionMask: torch.Tensor | None,
-) -> torch.Tensor:
-    """
-    Compute mean over valid frames when a motion mask is provided.
-    """
-    values = torch.nan_to_num(values)
-    if motionMask is None:
-        return values.mean()
-    mask = motionMask.to(values.device).float()
-    while mask.dim() < values.dim():
-        mask = mask.unsqueeze(-1)
-    masked = values * mask
-    valid = mask.sum()
-    if float(valid.item()) == 0.0:
-        return torch.tensor(0.0, device=values.device)
-    scale = values.numel() / mask.numel()
-    return masked.sum() / (valid * scale)
-
-
-def _sixdToRotationMatrix(sixd: torch.Tensor) -> torch.Tensor:
-    """
-    Convert 6D rotation representation to rotation matrix.
-
-    Uses Gram-Schmidt orthogonalization.
-
-    Parameters
-    ----------
-    sixd : torch.Tensor
-        6D rotation shaped (..., 6).
-
-    Returns
-    -------
-    torch.Tensor
-        Rotation matrix shaped (..., 3, 3).
-    """
-    a1 = sixd[..., :3]
-    a2 = sixd[..., 3:6]
-
-    # Normalize first vector
-    b1 = F.normalize(a1, dim=-1)
-
-    # Make second vector orthogonal to first
-    dot = (b1 * a2).sum(dim=-1, keepdim=True)
-    b2 = a2 - dot * b1
-    b2 = F.normalize(b2, dim=-1)
-
-    # Third vector is cross product
-    b3 = torch.cross(b1, b2, dim=-1)
-
-    # Stack into rotation matrix
-    return torch.stack([b1, b2, b3], dim=-1)
-
-
-def _rot6dToJointXYZ(rot6d: torch.Tensor) -> torch.Tensor:
-    """
-    Convert local 6D rotations to global joint XYZ via FK.
-
-    Parameters
-    ----------
-    rot6d : torch.Tensor
-        Tensor shaped (batch, frames, bones, 6).
-
-    Returns
-    -------
-    torch.Tensor
-        Global joint positions shaped (batch, frames, bones, 3).
-    """
-    if rot6d.dim() != 4 or rot6d.shape[-1] != MIN_SIXD_CHANNELS:
-        raise ValueError(
-            "Expected rot6d shape (batch, frames, bones, 6), got "
-            f"{tuple(rot6d.shape)}"
-        )
-
-    batchSize, frameCount, boneCount, _ = rot6d.shape
-    parentIndices, offsets = _smpl22KinematicParams(
-        boneCount,
-        rot6d.device,
-        rot6d.dtype,
-    )
-    localRotations = _sixdToRotationMatrix(rot6d)
-
-    globalRotations: list[torch.Tensor] = []
-    globalPositions: list[torch.Tensor] = []
-
-    for boneIndex in range(boneCount):
-        localRotation = localRotations[:, :, boneIndex]
-        if parentIndices[boneIndex] < 0:
-            globalRotations.append(localRotation)
-            rootOffset = offsets[boneIndex].view(1, 1, 3)
-            rootOffset = rootOffset.expand(batchSize, frameCount, 3)
-            globalPositions.append(rootOffset)
-            continue
-
-        parentIndex = parentIndices[boneIndex]
-        parentRotation = globalRotations[parentIndex]
-        parentPosition = globalPositions[parentIndex]
-        globalRotation = torch.matmul(parentRotation, localRotation)
-        childOffset = offsets[boneIndex].view(1, 1, 3, 1)
-        childOffset = torch.matmul(parentRotation, childOffset).squeeze(-1)
-        globalRotations.append(globalRotation)
-        globalPositions.append(parentPosition + childOffset)
-
-    return torch.stack(globalPositions, dim=2)
-
-
-def _smpl22KinematicParams(
-    boneCount: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> tuple[list[int], torch.Tensor]:
-    """
-    Return parent indices and offsets for the first SMPL22 joints.
-    """
-    maxBones = len(SMPL22_BONE_ORDER)
-    if boneCount > maxBones:
-        raise ValueError(
-            f"Unsupported boneCount={boneCount}, max supported is {maxBones}"
-        )
-
-    boneNames = SMPL22_BONE_ORDER[:boneCount]
-    indexByName = {name: idx for idx, name in enumerate(boneNames)}
-    parentIndices: list[int] = []
-    offsetValues: list[list[float]] = []
-
-    for boneName in boneNames:
-        parentName = SMPL22_HIERARCHY[boneName]
-        if parentName is None:
-            parentIndices.append(-1)
-        else:
-            parentIndex = indexByName.get(parentName)
-            if parentIndex is None:
-                raise ValueError(
-                    "Invalid skeleton order: parent "
-                    f"{parentName} missing for {boneName}"
-                )
-            parentIndices.append(parentIndex)
-        offsetValues.append(SMPL22_DEFAULT_OFFSETS[boneName])
-
-    offsets = torch.tensor(
-        offsetValues,
-        device=device,
-        dtype=dtype,
-    )
-    return parentIndices, offsets

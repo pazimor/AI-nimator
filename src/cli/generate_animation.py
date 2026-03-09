@@ -510,6 +510,7 @@ def runGeneration(
         modelSettings=modelSettings,
         outputOptions=outputOptions,
         datasetConfigPath=arguments.datasetConfigPath,
+        generationConfigPath=arguments.configPath,
     )
     parser.exit(
         0,

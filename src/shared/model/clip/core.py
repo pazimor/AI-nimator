@@ -2,18 +2,29 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, Mapping, Optional, Sequence
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import (
     PreTrainedTokenizerBase,
     XLMRobertaModel,
     XLMRobertaTokenizerFast,
 )
 from src.shared.constants.clip import DEFAULT_LOGIT_SCALE, EPSILON, LOGIT_SCALE_MAX
+from src.shared.model.components.base import MotionComponent
 from src.shared.model.layers.temporal_unet import TemporalUNet
+from src.shared.model.clip.motion_input import (
+    buildMotionInputFromBatch,
+    buildMotionInputFromMotion,
+    extractMotionContext,
+    motionInputChannels,
+    motionInputScopeChannels,
+    requiredComponentKeys,
+    splitMotionInput,
+)
+
+DEFAULT_COSINE_LOSS_WEIGHT = 0.25
 
 
 class ClipModel(nn.Module):
@@ -28,6 +39,8 @@ class ClipModel(nn.Module):
         freezeTextEncoder: bool = True,
         motionNumHeads: int = 4,
         motionNumLayers: int = 2,
+        motionComponents: Optional[Sequence[MotionComponent]] = None,
+        numBones: int = 22,
     ) -> None:
         """
         Initialize ClipModel.
@@ -48,9 +61,22 @@ class ClipModel(nn.Module):
             Number of attention heads in motion encoder, by default 4.
         motionNumLayers : int, optional
             Number of transformer layers in motion encoder, by default 2.
+        motionComponents : Optional[Sequence[MotionComponent]], optional
+            Optional motion feature layout consumed by the motion encoder.
+            When omitted, the model falls back to the legacy rotation-only
+            input tensor.
+        numBones : int, optional
+            Number of skeleton bones in the motion tensors.
         """
         super().__init__()
         self.modelName = modelName
+        self.numBones = int(numBones)
+        self.motionComponents = tuple(motionComponents or ())
+        self.motionInputChannels = motionInputChannels(self.motionComponents)
+        (
+            self.motionBoneChannels,
+            self.motionGlobalChannels,
+        ) = motionInputScopeChannels(self.motionComponents)
         self.textEncoder = textEncoder or XLMRobertaModel.from_pretrained(
             modelName,
             low_cpu_mem_usage=True,  # Reduce memory during loading
@@ -68,41 +94,69 @@ class ClipModel(nn.Module):
             embedDim=embedDim,
             numHeads=motionNumHeads,
             numLayers=motionNumLayers,
+            numBones=self.numBones,
+            numChannels=self.motionBoneChannels,
+            globalChannels=self.motionGlobalChannels,
         )
         self.motionProj = nn.Linear(embedDim, embedDim)
         self.logitScale = nn.Parameter(torch.ones([]) * DEFAULT_LOGIT_SCALE)
 
     def forward(
         self,
-        textInputIds: torch.Tensor,
-        textAttentionMask: torch.Tensor,
-        motionInput: torch.Tensor,
+        textInputIds: Optional[torch.Tensor] = None,
+        textAttentionMask: Optional[torch.Tensor] = None,
+        motionInput: Optional[torch.Tensor] = None,
+        motionMask: Optional[torch.Tensor] = None,
+        positiveMask: Optional[torch.Tensor] = None,
         computeLoss: bool = False,
+        pooledText: Optional[torch.Tensor] = None,
     ) -> Dict[str, object]:
         """
         Forward pass orchestrating text and motion encoders.
 
         Parameters
         ----------
-        textInputIds : torch.Tensor
+        textInputIds : Optional[torch.Tensor]
             Token IDs shaped (batch, sequenceLength).
-        textAttentionMask : torch.Tensor
+        textAttentionMask : Optional[torch.Tensor]
             Attention mask aligned with `textInputIds`.
-        motionInput : torch.Tensor
-            Motion payload shaped (batch, frames, bones, 6).
+        motionInput : Optional[torch.Tensor]
+            Motion payload shaped (batch, frames, bones, channels).
+        motionMask : Optional[torch.Tensor], optional
+            Boolean tensor shaped (batch, frames) marking valid motion frames.
+        positiveMask : Optional[torch.Tensor], optional
+            Boolean matrix marking every valid text<->motion positive pair
+            inside the batch. When omitted, only the batch diagonal is treated
+            as positive.
         computeLoss : bool, optional
             When True the contrastive loss is returned.
+        pooledText : Optional[torch.Tensor], optional
+            Precomputed pooled text representation shaped (batch, hiddenSize).
 
         Returns
         -------
         Dict[str, object]
             Embeddings, logits and optional contrastive loss.
         """
-        textEmbeds, textHidden = self.encodeText(
-            inputIds=textInputIds,
-            attentionMask=textAttentionMask,
-        )
-        motionEmbeds = self.encodeMotion(motionInput)
+        if motionInput is None:
+            raise ValueError("motionInput is required.")
+        if pooledText is not None:
+            if textInputIds is not None or textAttentionMask is not None:
+                raise ValueError(
+                    "Provide either pooledText or tokenized text inputs, not both."
+                )
+            textEmbeds, textHidden = self.encodePooledText(pooledText)
+        else:
+            if textInputIds is None or textAttentionMask is None:
+                raise ValueError(
+                    "textInputIds and textAttentionMask are required when "
+                    "pooledText is not provided."
+                )
+            textEmbeds, textHidden = self.encodeText(
+                inputIds=textInputIds,
+                attentionMask=textAttentionMask,
+            )
+        motionEmbeds = self.encodeMotion(motionInput, motionMask=motionMask)
         logitScale = self._clampedLogitScale()
         logitsPerText, logitsPerMotion = self.computeLogits(
             textEmbeds=textEmbeds,
@@ -123,6 +177,7 @@ class ClipModel(nn.Module):
                 logitsPerMotion=logitsPerMotion,
                 textEmbeds=textEmbeds,
                 motionEmbeds=motionEmbeds,
+                positiveMask=positiveMask,
             )
             output["clip_loss"] = loss
             output.update(components)
@@ -157,23 +212,121 @@ class ClipModel(nn.Module):
         projected = self.textProj(pooled)
         return self._normalize(projected), outputs.last_hidden_state
 
-    def encodeMotion(self, motionInput: torch.Tensor) -> torch.Tensor:
+    def encodePooledText(
+        self,
+        pooledText: torch.Tensor,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Project a precomputed pooled text representation into CLIP space.
+
+        Parameters
+        ----------
+        pooledText : torch.Tensor
+            Pooled XLM-R representation shaped (batch, hiddenSize).
+
+        Returns
+        -------
+        tuple[torch.Tensor, Optional[torch.Tensor]]
+            Normalized text embeddings and no hidden state payload.
+        """
+        projected = self.textProj(pooledText)
+        return self._normalize(projected), None
+
+    def encodeMotion(
+        self,
+        motionInput: torch.Tensor,
+        motionMask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Encode motion inputs into the shared embedding space.
 
         Parameters
         ----------
         motionInput : torch.Tensor
-            Motion payload shaped (batch, frames, bones, 6).
+            Motion payload shaped (batch, frames, bones, channels).
+        motionMask : Optional[torch.Tensor], optional
+            Boolean tensor shaped (batch, frames) marking valid motion frames.
 
         Returns
         -------
         torch.Tensor
             Normalized motion embeddings shaped (batch, embedDim).
         """
-        features = self.motionBackbone(motionInput)
+        if motionInput.dim() != 4:
+            raise ValueError(
+                "Expected CLIP motion input with shape "
+                "(batch, frames, bones, channels), got "
+                f"{tuple(motionInput.shape)}."
+            )
+        if motionInput.shape[-2] != self.numBones:
+            raise ValueError(
+                f"Expected {self.numBones} bones in CLIP motion input, got "
+                f"{motionInput.shape[-2]}."
+            )
+        if motionInput.shape[-1] != self.motionInputChannels:
+            raise ValueError(
+                "Unexpected CLIP motion channel count: expected "
+                f"{self.motionInputChannels}, got {motionInput.shape[-1]}."
+            )
+        if motionMask is not None:
+            if motionMask.dim() != 2:
+                raise ValueError(
+                    "Expected motionMask with shape (batch, frames), got "
+                    f"{tuple(motionMask.shape)}."
+                )
+            if motionMask.shape != motionInput.shape[:2]:
+                raise ValueError(
+                    "motionMask must match motionInput temporal axes: "
+                    f"expected {tuple(motionInput.shape[:2])}, got "
+                    f"{tuple(motionMask.shape)}."
+                )
+            motionMask = motionMask.to(
+                device=motionInput.device,
+                dtype=torch.bool,
+            )
+        boneInput, globalInput = splitMotionInput(
+            motionInput,
+            self.motionComponents,
+        )
+        features = self.motionBackbone(
+            boneInput=boneInput,
+            globalInput=globalInput,
+            motionMask=motionMask,
+        )
         projected = self.motionProj(features)
         return self._normalize(projected)
+
+    def buildMotionInput(self, batch: Mapping[str, object]) -> torch.Tensor:
+        """Assemble the motion tensor expected by ``encodeMotion``."""
+        return buildMotionInputFromBatch(
+            batch=batch,
+            components=self.motionComponents,
+            numBones=self.numBones,
+        )
+
+    def buildMotionInputFromMotion(
+        self,
+        motion: torch.Tensor,
+        context: Mapping[str, object] | None = None,
+    ) -> torch.Tensor:
+        """Build CLIP motion input from predicted rotations and batch context."""
+        return buildMotionInputFromMotion(
+            motion=motion,
+            components=self.motionComponents,
+            numBones=self.numBones,
+            context=context,
+        )
+
+    def extractMotionContext(
+        self,
+        batch: Mapping[str, object],
+    ) -> dict[str, torch.Tensor]:
+        """Return batch tensors needed to rebuild CLIP motion inputs later."""
+        return extractMotionContext(batch, self.motionComponents)
+
+    def requiredMotionComponentKeys(self) -> tuple[str, ...]:
+        """Return manifest component keys required by this model."""
+        return requiredComponentKeys(self.motionComponents)
 
     def computeLogits(
         self,
@@ -208,6 +361,7 @@ class ClipModel(nn.Module):
         logitsPerMotion: torch.Tensor,
         textEmbeds: torch.Tensor,
         motionEmbeds: torch.Tensor,
+        positiveMask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Compute contrastive + cosine losses following the graph spec.
@@ -222,25 +376,77 @@ class ClipModel(nn.Module):
             Normalized text embeddings.
         motionEmbeds : torch.Tensor
             Normalized motion embeddings.
+        positiveMask : Optional[torch.Tensor], optional
+            Boolean matrix marking every valid text<->motion positive pair.
 
         Returns
         -------
         tuple[torch.Tensor, Dict[str, torch.Tensor]]
             Total loss and detailed components.
         """
-        labels = torch.arange(
-            logitsPerText.size(0),
-            device=logitsPerText.device,
+        if positiveMask is None:
+            positiveMask = torch.eye(
+                logitsPerText.size(0),
+                dtype=torch.bool,
+                device=logitsPerText.device,
+            )
+        else:
+            positiveMask = positiveMask.to(
+                device=logitsPerText.device,
+                dtype=torch.bool,
+            )
+        if positiveMask.shape != logitsPerText.shape:
+            raise ValueError(
+                "positiveMask must match logits shape "
+                f"{tuple(logitsPerText.shape)}, got "
+                f"{tuple(positiveMask.shape)}."
+            )
+
+        lossText = self._contrastiveLoss(
+            logits=logitsPerText,
+            positiveMask=positiveMask,
         )
-        lossText = F.cross_entropy(logitsPerText, labels)
+        lossMotionContrastive = self._contrastiveLoss(
+            logits=logitsPerMotion,
+            positiveMask=positiveMask.t(),
+        )
         cosineDiag = torch.sum(textEmbeds * motionEmbeds, dim=-1)
         lossMotion = 1.0 - cosineDiag.mean()
-        totalLoss = (lossText + lossMotion) / 2.0
+        totalLoss = (
+            lossText
+            + lossMotionContrastive
+            + (DEFAULT_COSINE_LOSS_WEIGHT * lossMotion)
+        ) / (2.0 + DEFAULT_COSINE_LOSS_WEIGHT)
         components = {
             "loss_text_contrastive": lossText.detach(),
+            "loss_motion_contrastive": lossMotionContrastive.detach(),
             "loss_motion_cosine": lossMotion.detach(),
         }
         return totalLoss, components
+
+    def _contrastiveLoss(
+        self,
+        logits: torch.Tensor,
+        positiveMask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Average negative log-probability over one-or-more positives."""
+        if positiveMask.shape != logits.shape:
+            raise ValueError(
+                "positiveMask must match logits for contrastive loss."
+            )
+        positiveCounts = positiveMask.sum(dim=1)
+        if torch.any(positiveCounts <= 0):
+            raise ValueError(
+                "Each batch item must keep at least one positive pair."
+            )
+        logProb = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+        positiveLogProb = torch.where(
+            positiveMask,
+            logProb,
+            torch.zeros_like(logProb),
+        )
+        lossPerSample = -positiveLogProb.sum(dim=1) / positiveCounts.clamp(min=1)
+        return lossPerSample.mean()
 
     def _maskedMean(
         self,

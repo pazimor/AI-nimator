@@ -1,7 +1,8 @@
 paths:
   dataset-root: "/Users/pazimor/dataset_preprocessed"
-  dataset-folders: ["ACCAD", "BioMotionLab_NTroje", "BMLHandball", "BMLmovi", "CMU", "DFaust_67", "EKUT", "Eyes_Japan_Dataset", "HumanEva", "KIT", "MPI_HDM05", "MPI_Limits", "MPI_mosh", "SFU", "SSM_synced", "TotalCapture", "Transitions_mocap"]
-  clip-checkpoint: "../../output/clip/best_model-512-quat.pt"
+  # dataset-folders: ["ACCAD", "BioMotionLab_NTroje", "BMLHandball", "BMLmovi", "CMU", "DFaust_67", "EKUT", "Eyes_Japan_Dataset", "HumanEva", "KIT", "MPI_HDM05", "MPI_Limits", "MPI_mosh", "SFU", "SSM_synced", "TotalCapture", "Transitions_mocap"]
+  dataset-folders: ["ACCAD"] # for quick preview
+  clip-checkpoint: "../../output/clip/best_model-4-4-768-ACCAD.pt"
   checkpoint-dir: "../../output/generation"
   
   # Network architecture is loaded from network.yaml
@@ -30,6 +31,7 @@ training:
   vel-xyz-weight: 1.0
   diffusion-weight: 1.0
   acceleration-weight: 0.02
+  clip-guidance-weight: 0.1
 
 # ============================================
 # Profile: Overfit 16
@@ -39,19 +41,22 @@ overfit:
   device: mps
   max-length: 256
   model-name: xlm-roberta-base
-  validation-split: 0.01
+  validation-split: 0.0
   early-stopping-patience: 30
   batch-size: 4
   gradient-accumulation: 1
   max-samples-per-epoch: 10000
   
   # overfit: fixed count ("16") or 1-based inclusive range ("3:6")
-  overfit-samples: "3:6"
+  overfit-samples: "10:10"
   clear-mps-cache: false
+  deterministic-corruption: true
+  disable-dropout: true
 
   MM-memory-limit-gb: 20.0
-  # Leave null by default; pass a checkpoint only when architecture matches.
-  resume-checkpoint: output/generation/best_model.pt # null
+  # Overfit debugging should start from scratch to keep the loss curve
+  # interpretable when the objective or enabled features change.
+  resume-checkpoint: output/generation/best_model.pt
   
   learning-rate: 0.00001
   xyz-weight: 1.0
@@ -59,3 +64,4 @@ overfit:
   vel-xyz-weight: 1.0
   diffusion-weight: 1.0
   acceleration-weight: 0.0
+  clip-guidance-weight: 0.0
