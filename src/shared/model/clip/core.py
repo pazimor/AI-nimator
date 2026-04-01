@@ -24,7 +24,8 @@ from src.shared.model.clip.motion_input import (
     splitMotionInput,
 )
 
-DEFAULT_COSINE_LOSS_WEIGHT = 0.25
+DEFAULT_COSINE_LOSS_WEIGHT = 0.5
+DEFAULT_LABEL_SMOOTHING = 0.1
 
 
 class ClipModel(nn.Module):
@@ -428,8 +429,16 @@ class ClipModel(nn.Module):
         self,
         logits: torch.Tensor,
         positiveMask: torch.Tensor,
+        labelSmoothing: float = DEFAULT_LABEL_SMOOTHING,
     ) -> torch.Tensor:
-        """Average negative log-probability over one-or-more positives."""
+        """Average negative log-probability with label smoothing.
+
+        Label smoothing redistributes a fraction of each positive's mass
+        uniformly over all candidates. This prevents the model from treating
+        semantically similar but un-paired motion-text pairs as hard
+        negatives, which is common in AMASS/HumanML3D batches that contain
+        many similar locomotion clips.
+        """
         if positiveMask.shape != logits.shape:
             raise ValueError(
                 "positiveMask must match logits for contrastive loss."
@@ -439,13 +448,15 @@ class ClipModel(nn.Module):
             raise ValueError(
                 "Each batch item must keep at least one positive pair."
             )
+        batchSize = logits.shape[1]
         logProb = logits - torch.logsumexp(logits, dim=1, keepdim=True)
-        positiveLogProb = torch.where(
-            positiveMask,
-            logProb,
-            torch.zeros_like(logProb),
-        )
-        lossPerSample = -positiveLogProb.sum(dim=1) / positiveCounts.clamp(min=1)
+
+        # Build soft targets: (1 - eps) on positives, eps / N everywhere
+        hardTarget = positiveMask.float() / positiveCounts.clamp(min=1).unsqueeze(1)
+        uniform = torch.full_like(hardTarget, 1.0 / batchSize)
+        smoothTarget = (1.0 - labelSmoothing) * hardTarget + labelSmoothing * uniform
+
+        lossPerSample = -(smoothTarget * logProb).sum(dim=1)
         return lossPerSample.mean()
 
     def _maskedMean(

@@ -333,11 +333,13 @@ class MotionDenoiser(nn.Module):
         textH = textH + self.textAdapter(textH)
 
         # Expand text embedding to sequence length and add
-        textH = textH.unsqueeze(1).expand(-1, frames, -1)
-        h = motionH + textH
+        textExpanded = textH.unsqueeze(1).expand(-1, frames, -1)
+        h = motionH + textExpanded
 
-        # Get conditioning embeddings
-        cond = self.timestepEmbed(timesteps)
+        # Combine timestep and text embeddings for per-layer conditioning.
+        # This ensures every DenoiserBlock (FiLM + AdaLN) is aware of the
+        # text prompt, not just the diffusion timestep.
+        cond = self.timestepEmbed(timesteps) + textH
 
         # Apply denoising blocks
         for block in self.blocks:

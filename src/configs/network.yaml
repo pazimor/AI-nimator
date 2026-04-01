@@ -45,15 +45,15 @@ default:
 
     bone-data:
       rotation6d: true
-      foot-contact: false
+      foot-contact: true
       hand-contact: false
       root-translation: true
-      root-velocity: false
+      root-velocity: true
       root-yaw: false
       root-yaw-velocity: false
       joint-xyz: true
-      joint-velocity: false
-      end-effector-velocity: false
+      joint-velocity: true
+      end-effector-velocity: true
       pelvis-height: false
 
 # ============================================
@@ -92,13 +92,13 @@ overfit:
 
     bone-data:
       rotation6d: true
-      foot-contact: false
+      foot-contact: true
       hand-contact: false
       root-translation: true
-      root-velocity: false
+      root-velocity: true
       root-yaw: false
       root-yaw-velocity: false
       joint-xyz: true
-      joint-velocity: false
-      end-effector-velocity: false
+      joint-velocity: true
+      end-effector-velocity: true
       pelvis-height: false

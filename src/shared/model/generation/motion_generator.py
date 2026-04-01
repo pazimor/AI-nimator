@@ -286,6 +286,11 @@ class MotionGenerator(nn.Module):
         if targetMotion is not None:
             from src.shared.model.generation.losses import combinedGenerationLoss
 
+            footContact = (
+                componentTargets.get("foot_contact")
+                if componentTargets
+                else None
+            )
             loss, components = combinedGenerationLoss(
                 predictedMotion=predictedMotion,
                 targetMotion=targetMotion,
@@ -297,6 +302,7 @@ class MotionGenerator(nn.Module):
                 timesteps=timesteps,
                 numTimesteps=self.ddim.num_timesteps,
                 motionMask=motionMask,
+                footContact=footContact,
             )
             componentLoss, componentLosses = self._generationComponentLoss(
                 predictedMotion=predictedMotion,

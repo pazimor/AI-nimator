@@ -47,6 +47,7 @@ LOSS_COMPONENT_KEYS = (
     "loss_root_translation",
     "loss_root_velocity",
     "loss_components",
+    "loss_foot_skating",
 )
 LOSS_COMPONENT_LABELS = {
     "loss_xyz": "xyz",
@@ -55,6 +56,7 @@ LOSS_COMPONENT_LABELS = {
     "loss_root_translation": "rtrans",
     "loss_root_velocity": "rvel",
     "loss_components": "aux",
+    "loss_foot_skating": "skate",
 }
 
 

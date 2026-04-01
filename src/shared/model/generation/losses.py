@@ -210,6 +210,57 @@ def accelerationLoss(
     return weight * maskedMean(acceleration ** 2, motionMask)
 
 
+DEFAULT_FOOT_SKATING_WEIGHT = 5.0
+FOOT_JOINT_INDICES = (7, 10, 8, 11)  # leftAnkle, leftFoot, rightAnkle, rightFoot
+
+
+def footSkatingLoss(
+    predictedMotion: torch.Tensor,
+    footContact: torch.Tensor | None,
+    weight: float = DEFAULT_FOOT_SKATING_WEIGHT,
+    motionMask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Penalize foot-joint velocity when the foot is in contact with the ground.
+
+    This is the standard foot-skating loss used in MDM/MLD to enforce
+    physically plausible foot plants during locomotion.
+
+    Parameters
+    ----------
+    predictedMotion : torch.Tensor
+        Predicted 6D rotations shaped (batch, frames, bones, 6).
+    footContact : torch.Tensor | None
+        Ground-truth contact labels shaped (batch, frames, 4).
+        Channels: leftAnkle, leftFoot, rightAnkle, rightFoot.
+        When None, returns zero.
+    weight : float
+        Loss weight.
+    motionMask : torch.Tensor | None
+        Valid-frame mask.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar skating penalty.
+    """
+    if footContact is None or predictedMotion.shape[1] < 2:
+        return torch.tensor(0.0, device=predictedMotion.device)
+
+    jointXyz = rot6dToJointXYZ(predictedMotion)
+    footVel = temporalDifference(jointXyz[:, :, FOOT_JOINT_INDICES, :], dim=1)
+
+    # Expand contact to match XYZ channels: (batch, frames, 4) → (batch, frames, 4, 3)
+    contactMask = footContact.unsqueeze(-1).expand_as(footVel)
+    skating = (footVel ** 2) * contactMask
+
+    if motionMask is not None:
+        frameMask = motionMask.unsqueeze(-1).unsqueeze(-1).expand_as(skating)
+        skating = skating * frameMask.float()
+
+    return weight * skating.mean()
+
+
 def combinedGenerationLoss(
     predictedMotion: torch.Tensor,
     targetMotion: torch.Tensor,
@@ -222,6 +273,8 @@ def combinedGenerationLoss(
     timesteps: torch.Tensor | None = None,
     numTimesteps: int | None = None,
     motionMask: torch.Tensor | None = None,
+    footContact: torch.Tensor | None = None,
+    footSkatingWeight: float = DEFAULT_FOOT_SKATING_WEIGHT,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
     Combined loss for motion generation training.
@@ -298,6 +351,14 @@ def combinedGenerationLoss(
         + lossAcc
     )
 
+    lossSkating = footSkatingLoss(
+        predictedMotion,
+        footContact,
+        weight=footSkatingWeight,
+        motionMask=motionMask,
+    )
+    total = total + lossSkating
+
     components = {
         "loss_diffusion": lossDiff.detach(),
         "loss_xyz": lossXyz.detach(),
@@ -305,6 +366,7 @@ def combinedGenerationLoss(
         # Backward-compatibility alias used in older logs/consumers.
         "loss_velocity": lossVel.detach(),
         "loss_acceleration": lossAcc.detach(),
+        "loss_foot_skating": lossSkating.detach(),
     }
 
     return total, components

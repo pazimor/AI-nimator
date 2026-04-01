@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import torch
+
 from src.shared.model.components.base import (
     MotionComponent,
     MotionComponentDescriptor,
     SCOPE_GLOBAL,
 )
+from src.shared.model.components.ops import maskedMean
 
 
 class FootContactComponent(MotionComponent):
@@ -15,6 +18,10 @@ class FootContactComponent(MotionComponent):
 
     The original HumanML3D/MDM representation stores four channels:
     two left-foot and two right-foot contact indicators.
+
+    The loss uses binary cross-entropy instead of plain MSE because the
+    targets are binary contact flags (0 or 1). This produces sharper
+    gradients around the decision boundary and learn cleaner contacts.
     """
 
     descriptor = MotionComponentDescriptor(
@@ -26,6 +33,20 @@ class FootContactComponent(MotionComponent):
         defaultEnabled=False,
         description="MDM-style foot contact labels (4 channels).",
     )
+
+    def loss(
+        self,
+        predicted: torch.Tensor,
+        target: torch.Tensor,
+        motionMask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Binary cross-entropy loss suited for contact indicators."""
+        bce = torch.nn.functional.binary_cross_entropy_with_logits(
+            predicted,
+            target,
+            reduction="none",
+        )
+        return maskedMean(bce, motionMask)
 
 
 class HandContactComponent(MotionComponent):
