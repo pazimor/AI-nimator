@@ -53,6 +53,7 @@ class MotionGenerator(nn.Module):
         diffusionWeight: float = 1.0,
         accelerationWeight: float = 0.0,
         clipGuidanceWeight: float = 0.0,
+        condMaskProb: float = 0.1,
         numSpatialLayers: int = 1,
         numSpatioTemporalLayers: int = 1,
         maxPromptLength: int = 64,
@@ -134,6 +135,7 @@ class MotionGenerator(nn.Module):
         self.diffusionWeight = diffusionWeight
         self.accelerationWeight = accelerationWeight
         self.clipGuidanceWeight = clipGuidanceWeight
+        self.condMaskProb = condMaskProb
         self.maxPromptLength = max(1, int(maxPromptLength))
         self.generationMotionComponents = tuple(generationMotionComponents or ())
         self._generationComponentsBySampleKey = {
@@ -353,6 +355,7 @@ class MotionGenerator(nn.Module):
         ddimSteps: int = 50,
         device: Optional[torch.device] = None,
         applyPostProcessing: bool = True,
+        cfgScale: float = 2.5,
     ) -> dict[str, torch.Tensor]:
         """
         Generate a motion sample and any exported auxiliary features.
@@ -376,21 +379,43 @@ class MotionGenerator(nn.Module):
 
         x = torch.randn(1, numFrames, self.numBones, 6, device=device)
         resolvedSteps = max(1, min(int(ddimSteps), self.diffusionSteps))
-        stepRatio = max(1, self.diffusionSteps // resolvedSteps)
-        timestepSequence = list(range(0, self.diffusionSteps, stepRatio))[::-1]
+        timestepSequence = torch.linspace(
+            self.diffusionSteps - 1, 0, resolvedSteps,
+        ).long().tolist()
+
+        # Classifier-Free Guidance: null embedding for unconditional pass
+        nullTextEmbeds = (
+            torch.zeros_like(textEmbeds) if cfgScale > 1.0 else None
+        )
 
         for i, t in enumerate(timestepSequence):
             tBatch = torch.full((1,), t, device=device, dtype=torch.long)
-            denoiserOutput = self.denoiser(
+            condOutput = self.denoiser(
                 noisyMotion=x,
                 textEmbedding=textEmbeds,
                 timesteps=tBatch,
             )
-            predictedNoise, _ = self._resolveModelPredictions(
+            condNoise, _ = self._resolveModelPredictions(
                 noisyMotion=x,
                 timesteps=tBatch,
-                modelOutput=denoiserOutput,
+                modelOutput=condOutput,
             )
+            if nullTextEmbeds is not None:
+                uncondOutput = self.denoiser(
+                    noisyMotion=x,
+                    textEmbedding=nullTextEmbeds,
+                    timesteps=tBatch,
+                )
+                uncondNoise, _ = self._resolveModelPredictions(
+                    noisyMotion=x,
+                    timesteps=tBatch,
+                    modelOutput=uncondOutput,
+                )
+                predictedNoise = uncondNoise + cfgScale * (
+                    condNoise - uncondNoise
+                )
+            else:
+                predictedNoise = condNoise
             x = self._ddimStep(x, predictedNoise, t, timestepSequence, i)
 
         rawMotion6d = x
@@ -419,6 +444,7 @@ class MotionGenerator(nn.Module):
         ddimSteps: int = 50,
         device: Optional[torch.device] = None,
         applyPostProcessing: bool = True,
+        cfgScale: float = 2.5,
     ) -> torch.Tensor:
         """
         Generate motion from text prompt using DDIM sampling.
@@ -445,6 +471,7 @@ class MotionGenerator(nn.Module):
             ddimSteps=ddimSteps,
             device=device,
             applyPostProcessing=applyPostProcessing,
+            cfgScale=cfgScale,
         )["motion_quat"]
 
     def _ddimStep(

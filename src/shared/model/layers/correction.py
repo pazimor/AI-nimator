@@ -139,9 +139,9 @@ class VelocityRegularization(BaseLayer):
         # Clamp velocity
         velocity = torch.clamp(velocity, -self.max_velocity, self.max_velocity)
         
-        # Reconstruct x (cumulative sum) - this is a simple heuristic
-        # Ideally, this is a loss term during training.
-        # During inference, we might just clamp.
-        
-        # For now, just return x as this is often a loss component.
-        return x
+        # Reconstruct from first frame + clamped velocities
+        firstFrame = x[:, :1]
+        return torch.cat(
+            [firstFrame, firstFrame + torch.cumsum(velocity, dim=1)],
+            dim=1,
+        )

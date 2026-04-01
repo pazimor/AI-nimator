@@ -349,6 +349,14 @@ def _runBatch(
 
     # Move data to device
     textEmbedding = batch["generation_text_embedding"].to(device)
+    # Classifier-Free Guidance: randomly zero text embeddings
+    if model.training and model.condMaskProb > 0.0:
+        cfgDropMask = (
+            torch.rand(textEmbedding.shape[0], device=device)
+            < model.condMaskProb
+        )
+        textEmbedding = textEmbedding.clone()
+        textEmbedding[cfgDropMask] = 0.0
     motion = batch["motion"].to(device)
     motionMask = batch.get("motion_mask")
     if motionMask is not None:
@@ -443,6 +451,14 @@ def _runBatchAccumulate(
     """
     # Move data to device
     textEmbedding = batch["generation_text_embedding"].to(device)
+    # Classifier-Free Guidance: randomly zero text embeddings
+    if model.training and model.condMaskProb > 0.0:
+        cfgDropMask = (
+            torch.rand(textEmbedding.shape[0], device=device)
+            < model.condMaskProb
+        )
+        textEmbedding = textEmbedding.clone()
+        textEmbedding[cfgDropMask] = 0.0
     motion = batch["motion"].to(device)
     motionMask = batch.get("motion_mask")
     if motionMask is not None:
