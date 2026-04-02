@@ -71,6 +71,29 @@ class TimestepEmbedding(nn.Module):
         return self.mlp(embedding)
 
 
+class SinusoidalPositionalEncoding(nn.Module):
+    """Additive sinusoidal positional encoding (MDM-style)."""
+
+    def __init__(self, embedDim: int, dropout: float = 0.1, maxLen: int = 5000) -> None:
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(maxLen, embedDim)
+        position = torch.arange(0, maxLen, dtype=torch.float32).unsqueeze(1)
+        divTerm = torch.exp(
+            torch.arange(0, embedDim, 2, dtype=torch.float32)
+            * (-math.log(10000.0) / embedDim)
+        )
+        pe[:, 0::2] = torch.sin(position * divTerm)
+        pe[:, 1::2] = torch.cos(position * divTerm)
+        # (1, maxLen, embedDim) for batch_first usage
+        self.register_buffer("pe", pe.unsqueeze(0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Add positional encoding: x shape (batch, seqLen, dim)."""
+        x = x + self.pe[:, :x.shape[1], :]
+        return self.dropout(x)
+
+
 class DenoiserBlock(nn.Module):
     """
     Single denoising transformer block.
@@ -262,6 +285,11 @@ class MotionDenoiser(nn.Module):
         # Conditioning dimension: timestep
         condDim = embedDim
 
+        # Sinusoidal positional encoding for temporal frame ordering (MDM-style)
+        self.sequencePosEncoder = SinusoidalPositionalEncoding(
+            embedDim, dropout=dropout,
+        )
+
         # Spatial blocks (GCN over bones per frame)
         self.spatialBlocks = nn.ModuleList(
             [
@@ -335,6 +363,11 @@ class MotionDenoiser(nn.Module):
         # Expand text embedding to sequence length and add
         textExpanded = textH.unsqueeze(1).expand(-1, frames, -1)
         h = motionH + textExpanded
+
+        # Add sinusoidal positional encoding so the model knows frame order.
+        # Without this, self-attention is permutation-equivariant and
+        # cannot learn any temporal structure (MDM's key design choice).
+        h = self.sequencePosEncoder(h)
 
         # Combine timestep and text embeddings for per-layer conditioning.
         # This ensures every DenoiserBlock (FiLM + AdaLN) is aware of the
