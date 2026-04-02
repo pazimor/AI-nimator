@@ -390,33 +390,38 @@ class MotionGenerator(nn.Module):
 
         for i, t in enumerate(timestepSequence):
             tBatch = torch.full((1,), t, device=device, dtype=torch.long)
+            # Conditional pass
             condOutput = self.denoiser(
                 noisyMotion=x,
                 textEmbedding=textEmbeds,
                 timesteps=tBatch,
             )
-            condNoise, _ = self._resolveModelPredictions(
+            _, condX0 = self._resolveModelPredictions(
                 noisyMotion=x,
                 timesteps=tBatch,
                 modelOutput=condOutput,
             )
             if nullTextEmbeds is not None:
+                # Unconditional pass
                 uncondOutput = self.denoiser(
                     noisyMotion=x,
                     textEmbedding=nullTextEmbeds,
                     timesteps=tBatch,
                 )
-                uncondNoise, _ = self._resolveModelPredictions(
+                _, uncondX0 = self._resolveModelPredictions(
                     noisyMotion=x,
                     timesteps=tBatch,
                     modelOutput=uncondOutput,
                 )
-                predictedNoise = uncondNoise + cfgScale * (
-                    condNoise - uncondNoise
-                )
+                # CFG in x0 space (correct for x0-prediction models)
+                guidedX0 = uncondX0 + cfgScale * (condX0 - uncondX0)
             else:
-                predictedNoise = condNoise
-            x = self._ddimStep(x, predictedNoise, t, timestepSequence, i)
+                guidedX0 = condX0
+            # Derive noise from guided x0 for DDIM stepping
+            guidedNoise = self.ddim.predict_noise_from_start(
+                x, tBatch, guidedX0,
+            )
+            x = self._ddimStep(x, guidedNoise, t, timestepSequence, i)
 
         rawMotion6d = x
         predictedRootTranslation = self._predictRootTranslation(rawMotion6d)

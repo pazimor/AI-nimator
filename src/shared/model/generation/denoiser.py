@@ -7,12 +7,8 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from src.shared.model.layers.attention import MultiHeadAttention
 from src.shared.model.layers.normalization import AdaLN, FiLM
-from src.shared.model.layers.positional import RoPE
 from src.shared.model.layers.spatial_gcn import SpatialGCNBlock
-from src.shared.model.layers.temporal import TemporalLayer
-from src.shared.model.layers.transform import TransformLayer
 
 
 class TimestepEmbedding(nn.Module):
@@ -96,9 +92,10 @@ class SinusoidalPositionalEncoding(nn.Module):
 
 class DenoiserBlock(nn.Module):
     """
-    Single denoising transformer block.
+    Single denoising transformer block (MDM-style).
 
-    Combines TemporalLayer, RoPE, MHA, and TransformLayer with conditioning.
+    Self-attention with FiLM conditioning and a feed-forward transform,
+    both wrapped in residual connections.
     """
 
     def __init__(
@@ -108,28 +105,21 @@ class DenoiserBlock(nn.Module):
         condDim: int,
         dropout: float = 0.1,
     ) -> None:
-        """
-        Initialize DenoiserBlock.
-
-        Parameters
-        ----------
-        embedDim : int
-            Hidden dimension of the block.
-        numHeads : int
-            Number of attention heads.
-        condDim : int
-            Dimension of conditioning embeddings (timestep).
-        dropout : float, optional
-            Dropout rate, by default 0.1.
-        """
         super().__init__()
-        self.temporal = TemporalLayer(embedDim, numHeads, dropout)
+        self.norm1 = nn.LayerNorm(embedDim)
+        self.attention = nn.MultiheadAttention(
+            embedDim, numHeads, dropout=dropout, batch_first=True,
+        )
         self.filmCondition = FiLM(embedDim, condDim)
-        self.rope = RoPE(embedDim)
-        self.attention = MultiHeadAttention(embedDim, numHeads, dropout)
-        self.transform = TransformLayer(embedDim, embedDim * 4, embedDim, dropout)
+        self.norm2 = nn.LayerNorm(embedDim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embedDim, embedDim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embedDim * 4, embedDim),
+        )
         self.adalnCondition = AdaLN(embedDim, condDim)
-        self.norm = nn.LayerNorm(embedDim)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(
         self,
@@ -147,31 +137,24 @@ class DenoiserBlock(nn.Module):
         cond : torch.Tensor
             Conditioning tensor shaped (batch_size, condDim).
         mask : Optional[torch.Tensor], optional
-            Temporal mask, by default None.
+            Key padding mask (True = pad), by default None.
 
         Returns
         -------
         torch.Tensor
             Output tensor shaped (batch_size, seq_len, embedDim).
         """
-        # Temporal layer with FiLM conditioning
-        h = self.temporal(x, mask)
+        # Self-attention with residual + FiLM conditioning
+        h = self.norm1(x)
+        h, _ = self.attention(
+            h, h, h, key_padding_mask=mask, need_weights=False,
+        )
+        h = x + self.dropout(h)
         h = self.filmCondition(h, cond)
 
-        # RoPE positional encoding
-        h = self.rope(h)
-
-        # Multi-head attention for temporal relationships
-        attnMask = None
-        if mask is not None:
-            # Convert key padding mask (True = pad) to attention keep-mask
-            # expected by MultiHeadAttention (True = keep, False = mask).
-            attnMask = (~mask).unsqueeze(1).unsqueeze(2)
-        h = h + self.attention(self.norm(h), mask=attnMask)
-
-        # Transform layer with AdaLN conditioning
+        # Feed-forward with residual + AdaLN conditioning
+        h = h + self.dropout(self.ffn(self.norm2(h)))
         h = self.adalnCondition(h, cond)
-        h = self.transform(h)
 
         return h
 class SpatioTemporalMixBlock(nn.Module):
