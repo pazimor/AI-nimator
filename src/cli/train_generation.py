@@ -12,6 +12,7 @@ import torch
 
 from src.shared.config_loader import loadGenerationConfig
 from src.features.generation.train_generation import (
+    computeMotionStatistics,
     disableDropoutModules,
     buildOptimizer,
     evaluateValidation,
@@ -451,6 +452,26 @@ def _runTraining(
         num_timesteps=networkConfig.generation.diffusionSteps
     ).to(device)
 
+    # Compute Z-normalization statistics from training data and store on model.
+    # These buffers are saved/restored with the checkpoint.
+    if not _hasMotionStatistics(model):
+        LOGGER.info("Computing motion Z-normalization statistics ...")
+        statsLoader, _, _ = datasetManager.getDataloadersForEpoch(0)
+        motionMean, motionStd = computeMotionStatistics(
+            statsLoader,
+            device=torch.device("cpu"),
+            maxBatches=500,
+        )
+        model.setMotionStatistics(motionMean.to(device), motionStd.to(device))
+        LOGGER.info(
+            "Motion statistics set: mean range [%.4f, %.4f], "
+            "std range [%.4f, %.4f]",
+            float(motionMean.min()),
+            float(motionMean.max()),
+            float(motionStd.min()),
+            float(motionStd.max()),
+        )
+
     bestValLoss: Optional[float] = None
     epochsWithoutImprovement = 0
     startEpoch = 0
@@ -612,6 +633,14 @@ def _parseFolderList(rawValue: str | None) -> list[str] | None:
     if not normalized:
         return None
     return normalized
+
+
+def _hasMotionStatistics(model: MotionGenerator) -> bool:
+    """Return True when the model already has non-default Z-norm stats."""
+    return not (
+        torch.all(model.motion_mean == 0.0)
+        and torch.all(model.motion_std == 1.0)
+    )
 
 
 def _parseOverfitSelection(raw: Optional[str]) -> Optional[OverfitSelection]:

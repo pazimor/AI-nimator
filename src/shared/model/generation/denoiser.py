@@ -343,23 +343,31 @@ class MotionDenoiser(nn.Module):
         textH = self.textProj(textEmbedding)
         textH = textH + self.textAdapter(textH)
 
-        # Expand text embedding to sequence length and add
-        textExpanded = textH.unsqueeze(1).expand(-1, frames, -1)
-        h = motionH + textExpanded
-
         # Add sinusoidal positional encoding so the model knows frame order.
         # Without this, self-attention is permutation-equivariant and
         # cannot learn any temporal structure (MDM's key design choice).
-        h = self.sequencePosEncoder(h)
+        h = self.sequencePosEncoder(motionH)
 
-        # Combine timestep and text embeddings for per-layer conditioning.
-        # This ensures every DenoiserBlock (FiLM + AdaLN) is aware of the
-        # text prompt, not just the diffusion timestep.
-        cond = self.timestepEmbed(timesteps) + textH
+        # Build conditioning token: timestep + text (MDM-style prepend).
+        condToken = self.timestepEmbed(timesteps) + textH  # (batch, embedDim)
+        cond = condToken  # per-layer FiLM/AdaLN conditioning
+
+        # Prepend conditioning token to the sequence (MDM-style).
+        xseq = torch.cat([condToken.unsqueeze(1), h], dim=1)  # (batch, 1+frames, embedDim)
+
+        # Extend mask for the prepended conditioning token (always valid).
+        if mask is not None:
+            condMask = torch.zeros(
+                batch, 1, dtype=torch.bool, device=mask.device,
+            )
+            mask = torch.cat([condMask, mask], dim=1)
 
         # Apply denoising blocks
         for block in self.blocks:
-            h = block(h, cond, mask)
+            xseq = block(xseq, cond, mask)
+
+        # Remove the conditioning token from the output.
+        h = xseq[:, 1:]
 
         # Output projection
         h = self.outputNorm(h)

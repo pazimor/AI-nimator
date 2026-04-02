@@ -39,7 +39,7 @@ default:
     num-heads: 4
     num-layers: 4
     num-bones: 22
-    diffusion-steps: 500
+    diffusion-steps: 1000
     num-spatial-layers: 4
     num-spatio-temporal-layers: 4
 
@@ -86,7 +86,7 @@ overfit:
     num-heads: 4
     num-layers: 4
     num-bones: 22
-    diffusion-steps: 500
+    diffusion-steps: 1000
     num-spatial-layers: 4
     num-spatio-temporal-layers: 4
 

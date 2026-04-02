@@ -366,9 +366,12 @@ def _runBatch(
     batchSize = motion.shape[0]
     _ensureRotationOnlyInput(motion)
 
+    # Z-normalize motion for diffusion; raw motion stays as loss target.
+    normalizedMotion = model.normalizeMotion(motion)
+
     timesteps, noise, noisyMotion = _prepareDiffusionInputs(
         batch=batch,
-        motion=motion,
+        motion=normalizedMotion,
         ddim=ddim,
         device=device,
         deterministicCorruption=deterministicCorruption,
@@ -468,9 +471,12 @@ def _runBatchAccumulate(
     batchSize = motion.shape[0]
     _ensureRotationOnlyInput(motion)
 
+    # Z-normalize motion for diffusion; raw motion stays as loss target.
+    normalizedMotion = model.normalizeMotion(motion)
+
     timesteps, noise, noisyMotion = _prepareDiffusionInputs(
         batch=batch,
-        motion=motion,
+        motion=normalizedMotion,
         ddim=ddim,
         device=device,
         deterministicCorruption=deterministicCorruption,
@@ -556,9 +562,12 @@ def evaluateValidation(
             batchSize = motion.shape[0]
             _ensureRotationOnlyInput(motion)
 
+            # Z-normalize for diffusion; raw motion stays as loss target.
+            normalizedMotion = model.normalizeMotion(motion)
+
             timesteps, noise, noisyMotion = _prepareDiffusionInputs(
                 batch=batch,
-                motion=motion,
+                motion=normalizedMotion,
                 ddim=ddim,
                 device=device,
                 deterministicCorruption=deterministicCorruption,
@@ -719,6 +728,41 @@ def _deterministicNoise(
         noiseSamples.append(sampleNoise)
     noise = torch.stack(noiseSamples, dim=0)
     return noise.to(device=device, dtype=dtype)
+
+
+def computeMotionStatistics(
+    dataloader: Iterable[BatchDict],
+    device: torch.device,
+    maxBatches: int = 500,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-channel mean/std of motion tensors for Z-normalization.
+
+    Returns tensors shaped ``(1, 1, bones, 6)`` suitable for broadcasting.
+    """
+    count = 0
+    runningSum: Optional[torch.Tensor] = None
+    runningSumSq: Optional[torch.Tensor] = None
+
+    for i, batch in enumerate(dataloader):
+        if i >= maxBatches:
+            break
+        motion = batch["motion"]  # (B, F, bones, 6)
+        # Flatten to (N, bones, 6)
+        flat = motion.reshape(-1, motion.shape[2], motion.shape[3]).float()
+        if runningSum is None:
+            runningSum = flat.sum(dim=0)
+            runningSumSq = (flat ** 2).sum(dim=0)
+        else:
+            runningSum = runningSum + flat.sum(dim=0)
+            runningSumSq = runningSumSq + (flat ** 2).sum(dim=0)
+        count += flat.shape[0]
+
+    if count == 0 or runningSum is None or runningSumSq is None:
+        raise RuntimeError("Cannot compute statistics on an empty dataset.")
+    mean = runningSum / count
+    std = torch.sqrt(runningSumSq / count - mean ** 2).clamp(min=1e-5)
+    # Reshape to (1, 1, bones, 6) for broadcasting
+    return mean.unsqueeze(0).unsqueeze(0), std.unsqueeze(0).unsqueeze(0)
 
 
 def saveCheckpoint(

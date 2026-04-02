@@ -184,6 +184,17 @@ class MotionGenerator(nn.Module):
         else:
             self.rootTranslationHead = None
 
+        # Z-normalization buffers (computed from training data).
+        # Until set via setMotionStatistics(), these act as identity.
+        self.register_buffer(
+            "motion_mean",
+            torch.zeros(1, 1, numBones, self.MOTION_ROTATION_CHANNELS),
+        )
+        self.register_buffer(
+            "motion_std",
+            torch.ones(1, 1, numBones, self.MOTION_ROTATION_CHANNELS),
+        )
+
         # Post-processing (inference only)
         self.renorm = Renormalization()
         self.smoothing = Smoothing(channels=numBones * 6, kernel_size=smoothingKernel)
@@ -276,6 +287,14 @@ class MotionGenerator(nn.Module):
             timesteps=timesteps,
             modelOutput=denoiserOutput,
         )
+
+        # Denormalize predicted x0 from diffusion z-space back to raw 6D
+        # rotation space.  targetMotion arrives in raw space from the
+        # training loop, so all losses (including FK-based XYZ, velocity,
+        # foot-skating) receive geometrically valid rotations.  Gradients
+        # flow through the linear denormalization into the denoiser.
+        predictedMotion = self.denormalizeMotion(predictedMotion)
+
         predictedRootTranslation = self._predictRootTranslation(predictedMotion)
 
         result = {
@@ -423,6 +442,9 @@ class MotionGenerator(nn.Module):
             )
             x = self._ddimStep(x, guidedNoise, t, timestepSequence, i)
 
+        # Denormalize from z-space back to raw 6D rotations
+        x = self.denormalizeMotion(x)
+
         rawMotion6d = x
         predictedRootTranslation = self._predictRootTranslation(rawMotion6d)
         motion6d = rawMotion6d
@@ -557,6 +579,27 @@ class MotionGenerator(nn.Module):
             predictedMotion,
         )
         return predictedNoise, predictedMotion
+
+    # ------------------------------------------------------------------
+    # Z-normalization helpers
+    # ------------------------------------------------------------------
+
+    def setMotionStatistics(
+        self,
+        mean: torch.Tensor,
+        std: torch.Tensor,
+    ) -> None:
+        """Store dataset mean/std for motion Z-normalization."""
+        self.motion_mean.copy_(mean.view(self.motion_mean.shape))
+        self.motion_std.copy_(std.view(self.motion_std.shape))
+
+    def normalizeMotion(self, motion: torch.Tensor) -> torch.Tensor:
+        """Normalize raw motion to zero-mean unit-variance."""
+        return (motion - self.motion_mean) / self.motion_std.clamp(min=1e-5)
+
+    def denormalizeMotion(self, motion: torch.Tensor) -> torch.Tensor:
+        """Inverse of normalizeMotion — map back to raw motion space."""
+        return motion * self.motion_std + self.motion_mean
 
     def trainableParameters(self) -> tuple[nn.Parameter, ...]:
         """Return every parameter optimized during generation training."""
