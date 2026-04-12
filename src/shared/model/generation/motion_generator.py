@@ -260,7 +260,10 @@ class MotionGenerator(nn.Module):
             result["predicted_global"] = predictedGlobal
 
         if targetMotion is not None:
-            from src.shared.model.generation.losses import combinedGenerationLoss
+            from src.shared.model.generation.losses import (
+                combinedGenerationLoss,
+                startMotionLoss,
+            )
 
             # Extract rotation6d for FK-based losses if available.
             rot6dPredicted = self._extractRotation6d(predictedBoneMotion)
@@ -271,10 +274,11 @@ class MotionGenerator(nn.Module):
                 if componentTargets
                 else None
             )
-            # Fall back to predicted global split if foot_contact is in global output.
-            if footContact is None and predictedGlobal is not None:
+            # Extract ground-truth foot contact from target global features
+            # (not from the model prediction which is unreliable during training).
+            if footContact is None and targetGlobalFeatures is not None:
                 footContact = self._extractGlobalComponent(
-                    predictedGlobal, "foot_contact",
+                    targetGlobalFeatures, "foot_contact",
                 )
 
             loss, components = combinedGenerationLoss(
@@ -303,6 +307,33 @@ class MotionGenerator(nn.Module):
             if componentLoss is not None:
                 loss = loss + componentLoss
                 result.update(componentLosses)
+
+            # When the bone feature tensor includes channels beyond rotation6d
+            # (e.g. joint_xyz, joint_velocity), the rotation6d-only diffusion
+            # MSE from combinedGenerationLoss does not supervise those extra
+            # channels.  Add a full-bone MSE so every denoised channel gets a
+            # proper denoising signal — noisy auxiliary channels would
+            # otherwise contaminate rotation6d predictions through the shared
+            # transformer during DDIM sampling.
+            if (
+                self._hasRotation6d
+                and self.boneChannels > self._rotation6dChannels
+            ):
+                fullBoneDiffusion = startMotionLoss(
+                    predictedBoneMotion, targetMotion, motionMask,
+                )
+                loss = loss + self.diffusionWeight * fullBoneDiffusion
+                result["loss_bone_diffusion"] = fullBoneDiffusion.detach()
+
+            # Same for global features: the denoiser predicts them as a
+            # diffusion target, so they need a proper denoising MSE beyond
+            # the per-component auxiliary losses.
+            if predictedGlobal is not None and targetGlobalFeatures is not None:
+                globalDiffusion = startMotionLoss(
+                    predictedGlobal, targetGlobalFeatures, motionMask,
+                )
+                loss = loss + self.diffusionWeight * globalDiffusion
+                result["loss_global_diffusion"] = globalDiffusion.detach()
 
             if self.clipGuidanceWeight > 0.0 and self._hasRotation6d:
                 clipMotionInput = self.clip.buildMotionInputFromMotion(
