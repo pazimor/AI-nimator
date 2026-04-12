@@ -497,14 +497,21 @@ class MotionGenerator(nn.Module):
         torch.Tensor
             Generated motion shaped (1, frames, bones, 4) as quaternions.
         """
-        return self.generateSample(
+        sample = self.generateSample(
             prompt=prompt,
             numFrames=numFrames,
             ddimSteps=ddimSteps,
             device=device,
             applyPostProcessing=applyPostProcessing,
             cfgScale=cfgScale,
-        )["motion_quat"]
+        )
+        motionQuat = sample.get("motion_quat")
+        if motionQuat is None:
+            raise RuntimeError(
+                "generate() requires rotation6d in the enabled bone-data "
+                "components. Use generateSample() for feature-only models."
+            )
+        return motionQuat
 
     def _ddimStep(
         self,

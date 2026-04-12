@@ -1002,7 +1002,12 @@ def buildSampleFromPrompt(
         device,
         applyPostProcessing=applyPostProcessing,
     )
-    motionQuat = generatedSample["motion_quat"]
+    motionQuat = generatedSample.get("motion_quat")
+    if motionQuat is None:
+        raise RuntimeError(
+            "The generation model did not produce motion quaternions. "
+            "Enable the rotation6d feature in bone-data to export animations."
+        )
     sampleExtras = dict(extras)
     rootTranslation = generatedSample.get("root_translation")
     if isinstance(rootTranslation, torch.Tensor):
