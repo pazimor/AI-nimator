@@ -6,7 +6,6 @@
 # CLIP, while generation.embed-dim can override the denoiser width.
 # ============================================
 
-
 # ============================================
 # Profile: Mac (32GB RAM, MPS GPU)
 # Default profile for local development
@@ -14,7 +13,7 @@
 default:
   # CLIP embedding dimension (must match the CLIP checkpoint output size)
   embed-dim: 768
-  
+
   # CLIP Motion Encoder Architecture
   clip:
     motion-num-heads: 4
@@ -33,7 +32,7 @@ default:
       joint-velocity: true
       end-effector-velocity: false
       pelvis-height: false
-  
+
   generation:
     embed-dim: 768
     num-heads: 4

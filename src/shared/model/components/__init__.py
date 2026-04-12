@@ -26,6 +26,7 @@ from .registry import (
     COMPONENT_TYPES,
     buildComponentRegistry,
     buildEnabledComponents,
+    computeFeatureLayout,
     getComponent,
 )
 from .root import (
@@ -59,6 +60,7 @@ __all__ = [
     "PelvisHeightComponent",
     "buildComponentRegistry",
     "buildEnabledComponents",
+    "computeFeatureLayout",
     "getComponent",
     "sixdToRotationMatrix",
     "temporalAngleDifference",

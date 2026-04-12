@@ -12,6 +12,7 @@ import torch
 
 from src.shared.config_loader import loadGenerationConfig
 from src.features.generation.train_generation import (
+    computeGlobalStatistics,
     computeMotionStatistics,
     disableDropoutModules,
     buildOptimizer,
@@ -228,11 +229,10 @@ def _runTraining(
         if clipMotionComponents
         else ["rotation6d"]
     )
-    if "rotation6d" not in enabledComponentKeys:
+    if not enabledComponentKeys:
         raise ValueError(
-            "The current generation model still requires `rotation6d` in "
-            "bone-data because `motion` is the only input consumed by the "
-            "denoiser."
+            "bone-data enables no motion features. "
+            "Enable at least one component."
         )
     LOGGER.info(
         "Enabled motion components: %s",
@@ -324,9 +324,9 @@ def _runTraining(
         )
     if config.training.accelerationWeight > 0.1:
         LOGGER.warning(
-            "Acceleration weight %.4f is high for rotation-only 6D "
-            "training and can dominate optimization. Start near 0.02 "
-            "unless you have a measured reason to increase it.",
+            "Acceleration weight %.4f is high and can dominate "
+            "optimization. Start near 0.02 unless you have a measured "
+            "reason to increase it.",
             config.training.accelerationWeight,
         )
 
@@ -461,6 +461,7 @@ def _runTraining(
             statsLoader,
             device=torch.device("cpu"),
             maxBatches=500,
+            model=model,
         )
         model.setMotionStatistics(motionMean.to(device), motionStd.to(device))
         LOGGER.info(
@@ -471,6 +472,26 @@ def _runTraining(
             float(motionStd.min()),
             float(motionStd.max()),
         )
+        if model.globalChannels > 0:
+            LOGGER.info("Computing global feature Z-normalization statistics ...")
+            globalStatsLoader, _, _ = datasetManager.getDataloadersForEpoch(0)
+            globalMean, globalStd = computeGlobalStatistics(
+                globalStatsLoader,
+                device=torch.device("cpu"),
+                model=model,
+                maxBatches=500,
+            )
+            model.setGlobalStatistics(
+                globalMean.to(device), globalStd.to(device),
+            )
+            LOGGER.info(
+                "Global statistics set: mean range [%.4f, %.4f], "
+                "std range [%.4f, %.4f]",
+                float(globalMean.min()),
+                float(globalMean.max()),
+                float(globalStd.min()),
+                float(globalStd.max()),
+            )
 
     bestValLoss: Optional[float] = None
     epochsWithoutImprovement = 0

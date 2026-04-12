@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from src.shared.model.components.base import MotionComponent
+from src.shared.model.components.base import MotionComponent, SCOPE_BONE, SCOPE_GLOBAL
 from src.shared.model.components.contacts import (
     FootContactComponent,
     HandContactComponent,
@@ -60,3 +60,21 @@ def getComponent(key: str) -> MotionComponent:
         if component.key == normalized:
             return component
     raise KeyError(f"Unknown motion component: {key!r}")
+
+
+def computeFeatureLayout(
+    components: tuple[MotionComponent, ...],
+) -> tuple[int, int, tuple[MotionComponent, ...], tuple[MotionComponent, ...]]:
+    """
+    Compute per-bone and global channel counts from enabled components.
+
+    Returns
+    -------
+    tuple[int, int, tuple[MotionComponent, ...], tuple[MotionComponent, ...]]
+        (boneChannels, globalChannels, boneComponents, globalComponents)
+    """
+    boneComponents = tuple(c for c in components if c.scope == SCOPE_BONE)
+    globalComponents = tuple(c for c in components if c.scope == SCOPE_GLOBAL)
+    boneChannels = sum(c.channels for c in boneComponents)
+    globalChannels = sum(c.channels for c in globalComponents)
+    return boneChannels, globalChannels, boneComponents, globalComponents

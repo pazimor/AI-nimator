@@ -357,25 +357,33 @@ def _runBatch(
         )
         textEmbedding = textEmbedding.clone()
         textEmbedding[cfgDropMask] = 0.0
-    motion = batch["motion"].to(device)
+    # Assemble combined bone and global feature tensors.
+    boneFeatures = model.assembleBoneFeatures(batch, device)
+    globalFeatures = model.assembleGlobalFeatures(batch, device)
     motionMask = batch.get("motion_mask")
     if motionMask is not None:
         motionMask = motionMask.to(device)
     clipMotionContext = model.clip.extractMotionContext(batch)
-    componentTargets = _extractComponentTargets(batch, model, device)
-    batchSize = motion.shape[0]
-    _ensureRotationOnlyInput(motion)
 
-    # Z-normalize motion for diffusion; raw motion stays as loss target.
-    normalizedMotion = model.normalizeMotion(motion)
+    # Z-normalize for diffusion; raw features stay as loss targets.
+    normalizedBone = model.normalizeMotion(boneFeatures)
+    normalizedGlobal = (
+        model.normalizeGlobalFeatures(globalFeatures)
+        if globalFeatures is not None
+        else None
+    )
 
     timesteps, noise, noisyMotion = _prepareDiffusionInputs(
         batch=batch,
-        motion=normalizedMotion,
+        motion=normalizedBone,
         ddim=ddim,
         device=device,
         deterministicCorruption=deterministicCorruption,
     )
+    noisyGlobal: torch.Tensor | None = None
+    if normalizedGlobal is not None:
+        globalNoise = torch.randn_like(normalizedGlobal)
+        noisyGlobal = ddim.q_sample(normalizedGlobal, timesteps, globalNoise)
 
     # Delete batch reference early
     del batch
@@ -385,21 +393,22 @@ def _runBatch(
         textEmbedding=textEmbedding,
         noisyMotion=noisyMotion,
         timesteps=timesteps,
-        targetNoise=noise,
-        targetMotion=motion,
+        targetMotion=boneFeatures,
         motionMask=motionMask,
         clipMotionContext=clipMotionContext,
-        componentTargets=componentTargets,
+        noisyGlobalFeatures=noisyGlobal,
+        targetGlobalFeatures=globalFeatures,
     )
     
     # Delete inputs early
     del (
         textEmbedding,
         noisyMotion,
-        motion,
+        boneFeatures,
         motionMask,
         clipMotionContext,
-        componentTargets,
+        globalFeatures,
+        noisyGlobal,
     )
 
     loss = outputs["loss"]
@@ -462,25 +471,33 @@ def _runBatchAccumulate(
         )
         textEmbedding = textEmbedding.clone()
         textEmbedding[cfgDropMask] = 0.0
-    motion = batch["motion"].to(device)
+    # Assemble combined bone and global feature tensors.
+    boneFeatures = model.assembleBoneFeatures(batch, device)
+    globalFeatures = model.assembleGlobalFeatures(batch, device)
     motionMask = batch.get("motion_mask")
     if motionMask is not None:
         motionMask = motionMask.to(device)
     clipMotionContext = model.clip.extractMotionContext(batch)
-    componentTargets = _extractComponentTargets(batch, model, device)
-    batchSize = motion.shape[0]
-    _ensureRotationOnlyInput(motion)
 
-    # Z-normalize motion for diffusion; raw motion stays as loss target.
-    normalizedMotion = model.normalizeMotion(motion)
+    # Z-normalize for diffusion; raw features stay as loss targets.
+    normalizedBone = model.normalizeMotion(boneFeatures)
+    normalizedGlobal = (
+        model.normalizeGlobalFeatures(globalFeatures)
+        if globalFeatures is not None
+        else None
+    )
 
     timesteps, noise, noisyMotion = _prepareDiffusionInputs(
         batch=batch,
-        motion=normalizedMotion,
+        motion=normalizedBone,
         ddim=ddim,
         device=device,
         deterministicCorruption=deterministicCorruption,
     )
+    noisyGlobal: torch.Tensor | None = None
+    if normalizedGlobal is not None:
+        globalNoise = torch.randn_like(normalizedGlobal)
+        noisyGlobal = ddim.q_sample(normalizedGlobal, timesteps, globalNoise)
 
     del batch
 
@@ -489,20 +506,21 @@ def _runBatchAccumulate(
         textEmbedding=textEmbedding,
         noisyMotion=noisyMotion,
         timesteps=timesteps,
-        targetNoise=noise,
-        targetMotion=motion,
+        targetMotion=boneFeatures,
         motionMask=motionMask,
         clipMotionContext=clipMotionContext,
-        componentTargets=componentTargets,
+        noisyGlobalFeatures=noisyGlobal,
+        targetGlobalFeatures=globalFeatures,
     )
     
     del (
         textEmbedding,
         noisyMotion,
-        motion,
+        boneFeatures,
         motionMask,
         clipMotionContext,
-        componentTargets,
+        globalFeatures,
+        noisyGlobal,
     )
 
     loss = outputs["loss"]
@@ -553,35 +571,41 @@ def evaluateValidation(
     with torch.no_grad():
         for batch in dataloader:
             textEmbedding = batch["generation_text_embedding"].to(device)
-            motion = batch["motion"].to(device)
+            boneFeatures = model.assembleBoneFeatures(batch, device)
+            globalFeatures = model.assembleGlobalFeatures(batch, device)
             motionMask = batch.get("motion_mask")
             if motionMask is not None:
                 motionMask = motionMask.to(device)
             clipMotionContext = model.clip.extractMotionContext(batch)
-            componentTargets = _extractComponentTargets(batch, model, device)
-            batchSize = motion.shape[0]
-            _ensureRotationOnlyInput(motion)
 
-            # Z-normalize for diffusion; raw motion stays as loss target.
-            normalizedMotion = model.normalizeMotion(motion)
+            normalizedBone = model.normalizeMotion(boneFeatures)
+            normalizedGlobal = (
+                model.normalizeGlobalFeatures(globalFeatures)
+                if globalFeatures is not None
+                else None
+            )
 
             timesteps, noise, noisyMotion = _prepareDiffusionInputs(
                 batch=batch,
-                motion=normalizedMotion,
+                motion=normalizedBone,
                 ddim=ddim,
                 device=device,
                 deterministicCorruption=deterministicCorruption,
             )
+            noisyGlobal: torch.Tensor | None = None
+            if normalizedGlobal is not None:
+                globalNoise = torch.randn_like(normalizedGlobal)
+                noisyGlobal = ddim.q_sample(normalizedGlobal, timesteps, globalNoise)
 
             outputs = model(
                 textEmbedding=textEmbedding,
                 noisyMotion=noisyMotion,
                 timesteps=timesteps,
-                targetNoise=noise,
-                targetMotion=motion,
+                targetMotion=boneFeatures,
                 motionMask=motionMask,
                 clipMotionContext=clipMotionContext,
-                componentTargets=componentTargets,
+                noisyGlobalFeatures=noisyGlobal,
+                targetGlobalFeatures=globalFeatures,
             )
 
             totalLoss += float(outputs["loss"].item())
@@ -594,14 +618,15 @@ def evaluateValidation(
             # Free memory in validation loop
             del (
                 textEmbedding,
-                motion,
+                boneFeatures,
                 noisyMotion,
                 noise,
                 timesteps,
                 outputs,
                 motionMask,
                 clipMotionContext,
-                componentTargets,
+                globalFeatures,
+                noisyGlobal,
             )
 
     gc.collect()
@@ -609,33 +634,6 @@ def evaluateValidation(
     avgLoss = totalLoss / max(numBatches, 1)
     avgComponents = _averageLossComponents(componentSums, numBatches)
     return avgLoss, avgComponents
-
-
-def _ensureRotationOnlyInput(motion: torch.Tensor) -> None:
-    """
-    Ensure model inputs only contain 6D rotations (no translation channels).
-    """
-    if motion.shape[-1] != MotionGenerator.MOTION_ROTATION_CHANNELS:
-        raise ValueError(
-            "Expected motion input with 6 channels (rotation-only), "
-            f"got {motion.shape[-1]}."
-        )
-
-
-def _extractComponentTargets(
-    batch: BatchDict,
-    model: MotionGenerator,
-    device: torch.device,
-) -> dict[str, torch.Tensor]:
-    """Collect auxiliary generation targets available in the batch."""
-    targets: dict[str, torch.Tensor] = {}
-    for component in model.generationMotionComponents:
-        if component.key == "rotation6d":
-            continue
-        value = batch.get(component.sampleKey)
-        if isinstance(value, torch.Tensor):
-            targets[component.sampleKey] = value.to(device)
-    return targets
 
 
 def disableDropoutModules(module: nn.Module) -> int:
@@ -734,10 +732,16 @@ def computeMotionStatistics(
     dataloader: Iterable[BatchDict],
     device: torch.device,
     maxBatches: int = 500,
+    model: Optional[MotionGenerator] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute per-channel mean/std of motion tensors for Z-normalization.
+    """Compute per-channel mean/std of bone feature tensors for Z-normalization.
 
-    Returns tensors shaped ``(1, 1, bones, 6)`` suitable for broadcasting.
+    When *model* is provided the statistics are computed over the full
+    assembled bone feature tensor (all enabled bone-scoped components).
+    Otherwise falls back to the legacy ``batch["motion"]`` key.
+
+    Returns tensors shaped ``(1, 1, bones, boneChannels)`` suitable for
+    broadcasting.
     """
     count = 0
     runningSum: Optional[torch.Tensor] = None
@@ -746,8 +750,11 @@ def computeMotionStatistics(
     for i, batch in enumerate(dataloader):
         if i >= maxBatches:
             break
-        motion = batch["motion"]  # (B, F, bones, 6)
-        # Flatten to (N, bones, 6)
+        if model is not None and model.generationMotionComponents:
+            motion = model.assembleBoneFeatures(batch, device)
+        else:
+            motion = batch["motion"]  # (B, F, bones, 6)
+        # Flatten to (N, bones, channels)
         flat = motion.reshape(-1, motion.shape[2], motion.shape[3]).float()
         if runningSum is None:
             runningSum = flat.sum(dim=0)
@@ -761,7 +768,43 @@ def computeMotionStatistics(
         raise RuntimeError("Cannot compute statistics on an empty dataset.")
     mean = runningSum / count
     std = torch.sqrt(runningSumSq / count - mean ** 2).clamp(min=1e-5)
-    # Reshape to (1, 1, bones, 6) for broadcasting
+    # Reshape to (1, 1, bones, channels) for broadcasting
+    return mean.unsqueeze(0).unsqueeze(0), std.unsqueeze(0).unsqueeze(0)
+
+
+def computeGlobalStatistics(
+    dataloader: Iterable[BatchDict],
+    device: torch.device,
+    model: MotionGenerator,
+    maxBatches: int = 500,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-channel mean/std of global feature tensors.
+
+    Returns tensors shaped ``(1, 1, globalChannels)``.
+    """
+    count = 0
+    runningSum: Optional[torch.Tensor] = None
+    runningSumSq: Optional[torch.Tensor] = None
+
+    for i, batch in enumerate(dataloader):
+        if i >= maxBatches:
+            break
+        globalFeatures = model.assembleGlobalFeatures(batch, device)
+        if globalFeatures is None:
+            break
+        flat = globalFeatures.reshape(-1, globalFeatures.shape[-1]).float()
+        if runningSum is None:
+            runningSum = flat.sum(dim=0)
+            runningSumSq = (flat ** 2).sum(dim=0)
+        else:
+            runningSum = runningSum + flat.sum(dim=0)
+            runningSumSq = runningSumSq + (flat ** 2).sum(dim=0)
+        count += flat.shape[0]
+
+    if count == 0 or runningSum is None or runningSumSq is None:
+        raise RuntimeError("Cannot compute global statistics on an empty dataset.")
+    mean = runningSum / count
+    std = torch.sqrt(runningSumSq / count - mean ** 2).clamp(min=1e-5)
     return mean.unsqueeze(0).unsqueeze(0), std.unsqueeze(0).unsqueeze(0)
 
 

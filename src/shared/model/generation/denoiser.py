@@ -198,7 +198,9 @@ class MotionDenoiser(nn.Module):
     """
     Main diffusion denoiser network for motion generation.
 
-    Takes noisy motion, text embedding, and timestep to predict noise.
+    Takes noisy motion features, text embedding, and timestep to predict
+    clean motion (x0). Supports bone-scoped features (per bone per frame)
+    and optional global-scoped features (per frame).
     """
 
     def __init__(
@@ -208,6 +210,7 @@ class MotionDenoiser(nn.Module):
         numLayers: int = 6,
         numBones: int = 65,
         motionChannels: int = 6,
+        globalChannels: int = 0,
         dropout: float = 0.1,
         numSpatialLayers: int = 1,
         numSpatioTemporalLayers: int = 1,
@@ -227,7 +230,9 @@ class MotionDenoiser(nn.Module):
         numBones : int, optional
             Number of skeleton bones, by default 65.
         motionChannels : int, optional
-            Channels per bone (6D rotation), by default 6.
+            Total channels per bone for all bone-scoped features, by default 6.
+        globalChannels : int, optional
+            Total channels for all global-scoped features, by default 0.
         dropout : float, optional
             Dropout rate, by default 0.1.
         numSpatialLayers : int, optional
@@ -250,10 +255,17 @@ class MotionDenoiser(nn.Module):
         )
         self.numBones = numBones
         self.motionChannels = motionChannels
+        self.globalChannels = globalChannels
 
         # Input projections
         self.boneProj = nn.Linear(motionChannels, embedDim)
-        self.frameProj = nn.Linear(numBones * embedDim, embedDim)
+        frameProjInputDim = numBones * embedDim
+        if globalChannels > 0:
+            self.globalProj: Optional[nn.Linear] = nn.Linear(globalChannels, embedDim)
+            frameProjInputDim += embedDim
+        else:
+            self.globalProj = None
+        self.frameProj = nn.Linear(frameProjInputDim, embedDim)
         self.textProj = nn.Linear(self.textEmbedDim, embedDim)
         self.textAdapter = nn.Sequential(
             nn.LayerNorm(embedDim),
@@ -298,9 +310,10 @@ class MotionDenoiser(nn.Module):
             for _ in range(numLayers)
         ])
 
-        # Output projection
+        # Output projection: bone features + global features
+        outputDim = numBones * motionChannels + globalChannels
         self.outputNorm = nn.LayerNorm(embedDim)
-        self.outputProj = nn.Linear(embedDim, numBones * motionChannels)
+        self.outputProj = nn.Linear(embedDim, outputDim)
 
     def forward(
         self,
@@ -308,25 +321,30 @@ class MotionDenoiser(nn.Module):
         textEmbedding: torch.Tensor,
         timesteps: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        noisyGlobalFeatures: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Predict noise from noisy motion.
+        Predict clean motion features from noisy input.
 
         Parameters
         ----------
         noisyMotion : torch.Tensor
-            Noisy motion shaped (batch, frames, bones, 6).
+            Noisy bone-scoped features shaped (batch, frames, bones, motionChannels).
         textEmbedding : torch.Tensor
             Text embedding shaped (batch, textEmbedDim).
         timesteps : torch.Tensor
             Diffusion timesteps shaped (batch,).
         mask : Optional[torch.Tensor], optional
             Temporal mask, by default None.
+        noisyGlobalFeatures : Optional[torch.Tensor], optional
+            Noisy global-scoped features shaped (batch, frames, globalChannels).
 
         Returns
         -------
-        torch.Tensor
-            Predicted noise shaped (batch, frames, bones, 6).
+        tuple[torch.Tensor, Optional[torch.Tensor]]
+            Predicted bone features shaped (batch, frames, bones, motionChannels)
+            and predicted global features shaped (batch, frames, globalChannels)
+            or None when globalChannels is 0.
         """
         batch, frames, bones, channels = noisyMotion.shape
 
@@ -339,6 +357,12 @@ class MotionDenoiser(nn.Module):
 
         # Flatten per-frame features after spatial mixing.
         motionH = boneH.reshape(batch, frames, bones * self.embedDim)
+
+        # Incorporate global features when present.
+        if self.globalProj is not None and noisyGlobalFeatures is not None:
+            globalH = self.globalProj(noisyGlobalFeatures)
+            motionH = torch.cat([motionH, globalH], dim=-1)
+
         motionH = self.frameProj(motionH)
         textH = self.textProj(textEmbedding)
         textH = textH + self.textAdapter(textH)
@@ -373,5 +397,11 @@ class MotionDenoiser(nn.Module):
         h = self.outputNorm(h)
         output = self.outputProj(h)
 
-        # Reshape to (batch, frames, bones, channels)
-        return output.view(batch, frames, bones, channels)
+        # Split into bone and global predictions.
+        boneFlatDim = bones * self.motionChannels
+        boneOutput = output[..., :boneFlatDim].view(batch, frames, bones, self.motionChannels)
+        globalOutput: Optional[torch.Tensor] = None
+        if self.globalChannels > 0:
+            globalOutput = output[..., boneFlatDim:]
+
+        return boneOutput, globalOutput

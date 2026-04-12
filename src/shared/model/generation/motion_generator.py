@@ -9,8 +9,8 @@ import torch
 import torch.nn as nn
 
 from src.shared.model.clip.core import ClipModel
-from src.shared.model.components import buildMotionFeatureTensors
-from src.shared.model.components.base import MotionComponent
+from src.shared.model.components.base import MotionComponent, SCOPE_BONE, SCOPE_GLOBAL
+from src.shared.model.components.registry import computeFeatureLayout
 from src.shared.model.generation.ddim import DDIM
 from src.shared.model.generation.denoiser import MotionDenoiser
 from src.shared.model.generation.losses import (
@@ -63,62 +63,6 @@ class MotionGenerator(nn.Module):
         clipMotionComponents: Optional[tuple[MotionComponent, ...]] = None,
         generationMotionComponents: Optional[tuple[MotionComponent, ...]] = None,
     ) -> None:
-        """
-        Initialize MotionGenerator.
-
-        Parameters
-        ----------
-        embedDim : int, optional
-            CLIP embedding dimension, by default 64.
-        numHeads : int, optional
-            Number of attention heads, by default 4.
-        numLayers : int, optional
-            Number of denoising layers, by default 6.
-        numBones : int, optional
-            Number of skeleton bones, by default 65.
-        diffusionSteps : int, optional
-            Number of diffusion timesteps, by default 1000.
-        modelName : str, optional
-            XLM-Roberta model name, by default "xlm-roberta-base".
-        clipCheckpoint : Optional[Path], optional
-            Path to pre-trained CLIP checkpoint, by default None.
-        smoothingKernel : int, optional
-            Kernel size for temporal smoothing, by default 3.
-        maxVelocity : Optional[float], optional
-            Maximum velocity for regularization, by default None.
-        xyzWeight : float, optional
-            Base XYZ loss weight, by default 0.1.
-        xyzWeightSchedule : str, optional
-            Schedule for XYZ weighting, by default "none".
-        velXyzWeight : float, optional
-            Weight for velocity matching in XYZ space, by default 0.01.
-        diffusionWeight : float, optional
-            Weight for diffusion loss, by default 1.0.
-        accelerationWeight : float, optional
-            Weight for acceleration loss, by default 0.0.
-        clipGuidanceWeight : float, optional
-            Weight for the auxiliary CLIP text-motion guidance loss.
-        numSpatialLayers : int, optional
-            Number of spatial GCN blocks.
-        numSpatioTemporalLayers : int, optional
-            Number of local spatio-temporal mixing blocks.
-        maxPromptLength : int, optional
-            Tokenizer max length used during inference tokenization.
-        generationEmbedDim : Optional[int], optional
-            Internal denoiser width. When omitted, defaults to ``embedDim``
-            for backward compatibility.
-        clipMotionNumHeads : int, optional
-            Number of attention heads in the frozen CLIP motion encoder.
-        clipMotionNumLayers : int, optional
-            Number of transformer layers in the frozen CLIP motion encoder.
-        clipMotionComponents : Optional[tuple[MotionComponent, ...]], optional
-            Optional CLIP motion feature layout. When omitted, CLIP uses the
-            legacy rotation-only motion tensor.
-        generationMotionComponents : Optional[tuple[MotionComponent, ...]], optional
-            Motion features supervised during generation training. The denoiser
-            still predicts the base 6D rotation tensor, while auxiliary heads
-            and losses can supervise extra motion signals such as root motion.
-        """
         super().__init__()
         self.embedDim = embedDim
         self.generationEmbedDim = (
@@ -138,11 +82,36 @@ class MotionGenerator(nn.Module):
         self.condMaskProb = condMaskProb
         self.maxPromptLength = max(1, int(maxPromptLength))
         self.generationMotionComponents = tuple(generationMotionComponents or ())
+
+        # Compute feature layout from enabled components.
+        if self.generationMotionComponents:
+            boneChannels, globalChannels, boneComponents, globalComponents = (
+                computeFeatureLayout(self.generationMotionComponents)
+            )
+        else:
+            boneChannels = self.MOTION_ROTATION_CHANNELS
+            globalChannels = 0
+            boneComponents = ()
+            globalComponents = ()
+
+        self.boneChannels = boneChannels
+        self.globalChannels = globalChannels
+        self._boneComponents = boneComponents
+        self._globalComponents = globalComponents
         self._generationComponentsBySampleKey = {
             component.sampleKey: component
             for component in self.generationMotionComponents
             if component.key != "rotation6d"
         }
+
+        # Determine if rotation6d is present (needed for FK-based losses).
+        self._hasRotation6d = any(
+            c.key == "rotation6d" for c in self.generationMotionComponents
+        ) or not self.generationMotionComponents
+        # Channel offset of rotation6d within bone features (always first
+        # when present due to stable component ordering).
+        self._rotation6dOffset = 0
+        self._rotation6dChannels = self.MOTION_ROTATION_CHANNELS
 
         # CLIP text encoder (frozen)
         self.clip = ClipModel(
@@ -165,35 +134,32 @@ class MotionGenerator(nn.Module):
             numHeads=numHeads,
             numLayers=numLayers,
             numBones=numBones,
+            motionChannels=boneChannels,
+            globalChannels=globalChannels,
             numSpatialLayers=numSpatialLayers,
             numSpatioTemporalLayers=numSpatioTemporalLayers,
             textEmbedDim=embedDim,
         )
-        self.rootTranslationHead: Optional[nn.Module]
-        if self._requiresRootTranslationHead():
-            flatMotionDim = self.numBones * self.MOTION_ROTATION_CHANNELS
-            self.rootTranslationHead = nn.Sequential(
-                nn.LayerNorm(flatMotionDim),
-                nn.Linear(flatMotionDim, self.generationEmbedDim),
-                nn.SiLU(),
-                nn.Linear(
-                    self.generationEmbedDim,
-                    self.ROOT_TRANSLATION_CHANNELS,
-                ),
-            )
-        else:
-            self.rootTranslationHead = None
 
-        # Z-normalization buffers (computed from training data).
-        # Until set via setMotionStatistics(), these act as identity.
+        # Z-normalization buffers for bone features.
         self.register_buffer(
             "motion_mean",
-            torch.zeros(1, 1, numBones, self.MOTION_ROTATION_CHANNELS),
+            torch.zeros(1, 1, numBones, boneChannels),
         )
         self.register_buffer(
             "motion_std",
-            torch.ones(1, 1, numBones, self.MOTION_ROTATION_CHANNELS),
+            torch.ones(1, 1, numBones, boneChannels),
         )
+        # Z-normalization buffers for global features.
+        if globalChannels > 0:
+            self.register_buffer(
+                "global_mean",
+                torch.zeros(1, 1, globalChannels),
+            )
+            self.register_buffer(
+                "global_std",
+                torch.ones(1, 1, globalChannels),
+            )
 
         # Post-processing (inference only)
         self.renorm = Renormalization()
@@ -212,39 +178,30 @@ class MotionGenerator(nn.Module):
         clipMotionContext: Optional[Mapping[str, object]] = None,
         textEmbedding: Optional[torch.Tensor] = None,
         componentTargets: Optional[Mapping[str, torch.Tensor]] = None,
+        noisyGlobalFeatures: Optional[torch.Tensor] = None,
+        targetGlobalFeatures: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass for training.
 
         Parameters
         ----------
-        textInputIds : Optional[torch.Tensor]
-            Tokenized text input IDs.
-        textAttentionMask : Optional[torch.Tensor]
-            Text attention mask.
         noisyMotion : Optional[torch.Tensor]
-            Noisy motion shaped (batch, frames, bones, 6).
+            Noisy bone-scoped features shaped (batch, frames, bones, boneChannels).
         timesteps : Optional[torch.Tensor]
             Diffusion timesteps shaped (batch,).
-        targetNoise : Optional[torch.Tensor], optional
-            Unused legacy argument kept for backward compatibility.
         targetMotion : Optional[torch.Tensor], optional
-            Ground truth clean motion for x0-based losses.
+            Ground truth clean bone features for losses.
         motionMask : Optional[torch.Tensor], optional
             Boolean mask indicating valid (non-padded) frames.
-        clipMotionContext : Optional[Mapping[str, object]], optional
-            Auxiliary tensors used to rebuild the CLIP motion input for
-            guidance when some CLIP components are not directly predicted.
         textEmbedding : Optional[torch.Tensor], optional
             Precomputed CLIP text embedding used during training.
         componentTargets : Optional[Mapping[str, torch.Tensor]], optional
-            Auxiliary generation targets keyed by sample tensor name
-            (for example ``root_translation`` or ``joint_xyz``).
-
-        Returns
-        -------
-        dict[str, torch.Tensor]
-            Dictionary with predicted noise and optional loss.
+            Auxiliary generation targets keyed by sample tensor name.
+        noisyGlobalFeatures : Optional[torch.Tensor], optional
+            Noisy global-scoped features shaped (batch, frames, globalChannels).
+        targetGlobalFeatures : Optional[torch.Tensor], optional
+            Clean global features for losses.
         """
         if noisyMotion is None or timesteps is None:
             raise ValueError("noisyMotion and timesteps are required.")
@@ -265,78 +222,91 @@ class MotionGenerator(nn.Module):
                     attentionMask=textAttentionMask,
                 )
 
-        # Predict denoiser output
-        if noisyMotion.shape[-1] != self.MOTION_ROTATION_CHANNELS:
-            raise ValueError(
-                "Expected rotation-only motion with 6 channels "
-                "(no translation), got "
-                f"{noisyMotion.shape[-1]}."
-            )
         padMask = None
         if motionMask is not None:
             padMask = ~motionMask.bool()
 
-        denoiserOutput = self.denoiser(
+        boneOutput, globalOutput = self.denoiser(
             noisyMotion=noisyMotion,
             textEmbedding=textEmbeds,
             timesteps=timesteps,
             mask=padMask,
+            noisyGlobalFeatures=noisyGlobalFeatures,
         )
-        predictedNoise, predictedMotion = self._resolveModelPredictions(
+
+        # Resolve x0 predictions for bone features.
+        predictedBoneNoise, predictedBoneMotion = self._resolveModelPredictions(
             noisyMotion=noisyMotion,
             timesteps=timesteps,
-            modelOutput=denoiserOutput,
+            modelOutput=boneOutput,
         )
+        predictedBoneMotion = self.denormalizeMotion(predictedBoneMotion)
 
-        # Denormalize predicted x0 from diffusion z-space back to raw 6D
-        # rotation space.  targetMotion arrives in raw space from the
-        # training loop, so all losses (including FK-based XYZ, velocity,
-        # foot-skating) receive geometrically valid rotations.  Gradients
-        # flow through the linear denormalization into the denoiser.
-        predictedMotion = self.denormalizeMotion(predictedMotion)
+        # Resolve x0 predictions for global features.
+        predictedGlobal: Optional[torch.Tensor] = None
+        if globalOutput is not None and noisyGlobalFeatures is not None:
+            _, predictedGlobal = self._resolveModelPredictions(
+                noisyMotion=noisyGlobalFeatures,
+                timesteps=timesteps,
+                modelOutput=globalOutput,
+            )
+            predictedGlobal = self.denormalizeGlobalFeatures(predictedGlobal)
 
-        predictedRootTranslation = self._predictRootTranslation(predictedMotion)
-
-        result = {
-            "predicted_noise": predictedNoise,
-            "predicted_motion": predictedMotion,
+        result: dict[str, torch.Tensor] = {
+            "predicted_noise": predictedBoneNoise,
+            "predicted_motion": predictedBoneMotion,
         }
-        if predictedRootTranslation is not None:
-            result["predicted_root_translation"] = predictedRootTranslation
+        if predictedGlobal is not None:
+            result["predicted_global"] = predictedGlobal
 
         if targetMotion is not None:
             from src.shared.model.generation.losses import combinedGenerationLoss
+
+            # Extract rotation6d for FK-based losses if available.
+            rot6dPredicted = self._extractRotation6d(predictedBoneMotion)
+            rot6dTarget = self._extractRotation6d(targetMotion)
 
             footContact = (
                 componentTargets.get("foot_contact")
                 if componentTargets
                 else None
             )
+            # Fall back to predicted global split if foot_contact is in global output.
+            if footContact is None and predictedGlobal is not None:
+                footContact = self._extractGlobalComponent(
+                    predictedGlobal, "foot_contact",
+                )
+
             loss, components = combinedGenerationLoss(
-                predictedMotion=predictedMotion,
-                targetMotion=targetMotion,
+                predictedMotion=rot6dPredicted,
+                targetMotion=rot6dTarget,
                 diffusionWeight=self.diffusionWeight,
-                xyzWeight=self.xyzWeight,
+                xyzWeight=self.xyzWeight if self._hasRotation6d else 0.0,
                 xyzWeightSchedule=self.xyzWeightSchedule,
-                velocityXyzWeight=self.velXyzWeight,
+                velocityXyzWeight=self.velXyzWeight if self._hasRotation6d else 0.0,
                 accelerationWeight=self.accelerationWeight,
                 timesteps=timesteps,
                 numTimesteps=self.ddim.num_timesteps,
                 motionMask=motionMask,
                 footContact=footContact,
             )
-            componentLoss, componentLosses = self._generationComponentLoss(
-                predictedMotion=predictedMotion,
-                predictedRootTranslation=predictedRootTranslation,
-                componentTargets=componentTargets,
-                motionMask=motionMask,
+
+            # Component losses on bone features (excluding rotation6d
+            # which is already covered by the diffusion loss above).
+            boneSplits = self._splitBonePredictions(predictedBoneMotion)
+            boneTargetSplits = self._splitBonePredictions(targetMotion)
+            componentLoss, componentLosses = self._multiFeatureLoss(
+                boneSplits, boneTargetSplits,
+                predictedGlobal, targetGlobalFeatures,
+                motionMask,
             )
             if componentLoss is not None:
                 loss = loss + componentLoss
                 result.update(componentLosses)
-            if self.clipGuidanceWeight > 0.0:
+
+            if self.clipGuidanceWeight > 0.0 and self._hasRotation6d:
                 clipMotionInput = self.clip.buildMotionInputFromMotion(
-                    motion=predictedMotion,
+                    motion=rot6dPredicted,
                     context=clipMotionContext,
                 )
                 clipMotionEmbeds = self.clip.encodeMotion(
@@ -396,7 +366,16 @@ class MotionGenerator(nn.Module):
 
         textEmbeds, _ = self.clip.encodeText(inputIds, attentionMask)
 
-        x = torch.randn(1, numFrames, self.numBones, 6, device=device)
+        # Initialize noise for bone and global features.
+        xBone = torch.randn(
+            1, numFrames, self.numBones, self.boneChannels, device=device,
+        )
+        xGlobal: Optional[torch.Tensor] = None
+        if self.globalChannels > 0:
+            xGlobal = torch.randn(
+                1, numFrames, self.globalChannels, device=device,
+            )
+
         resolvedSteps = max(1, min(int(ddimSteps), self.diffusionSteps))
         timestepSequence = torch.linspace(
             self.diffusionSteps - 1, 0, resolvedSteps,
@@ -410,57 +389,83 @@ class MotionGenerator(nn.Module):
         for i, t in enumerate(timestepSequence):
             tBatch = torch.full((1,), t, device=device, dtype=torch.long)
             # Conditional pass
-            condOutput = self.denoiser(
-                noisyMotion=x,
+            condBone, condGlobal = self.denoiser(
+                noisyMotion=xBone,
                 textEmbedding=textEmbeds,
                 timesteps=tBatch,
+                noisyGlobalFeatures=xGlobal,
             )
-            _, condX0 = self._resolveModelPredictions(
-                noisyMotion=x,
-                timesteps=tBatch,
-                modelOutput=condOutput,
+            _, condBoneX0 = self._resolveModelPredictions(
+                noisyMotion=xBone, timesteps=tBatch, modelOutput=condBone,
             )
+            condGlobalX0: Optional[torch.Tensor] = None
+            if condGlobal is not None and xGlobal is not None:
+                _, condGlobalX0 = self._resolveModelPredictions(
+                    noisyMotion=xGlobal, timesteps=tBatch, modelOutput=condGlobal,
+                )
+
             if nullTextEmbeds is not None:
                 # Unconditional pass
-                uncondOutput = self.denoiser(
-                    noisyMotion=x,
+                uncondBone, uncondGlobal = self.denoiser(
+                    noisyMotion=xBone,
                     textEmbedding=nullTextEmbeds,
                     timesteps=tBatch,
+                    noisyGlobalFeatures=xGlobal,
                 )
-                _, uncondX0 = self._resolveModelPredictions(
-                    noisyMotion=x,
-                    timesteps=tBatch,
-                    modelOutput=uncondOutput,
+                _, uncondBoneX0 = self._resolveModelPredictions(
+                    noisyMotion=xBone, timesteps=tBatch, modelOutput=uncondBone,
                 )
-                # CFG in x0 space (correct for x0-prediction models)
-                guidedX0 = uncondX0 + cfgScale * (condX0 - uncondX0)
+                guidedBoneX0 = uncondBoneX0 + cfgScale * (condBoneX0 - uncondBoneX0)
+                if condGlobalX0 is not None and xGlobal is not None:
+                    _, uncondGlobalX0 = self._resolveModelPredictions(
+                        noisyMotion=xGlobal, timesteps=tBatch, modelOutput=uncondGlobal,
+                    )
+                    guidedGlobalX0 = uncondGlobalX0 + cfgScale * (condGlobalX0 - uncondGlobalX0)
+                else:
+                    guidedGlobalX0 = condGlobalX0
             else:
-                guidedX0 = condX0
-            # Derive noise from guided x0 for DDIM stepping
-            guidedNoise = self.ddim.predict_noise_from_start(
-                x, tBatch, guidedX0,
+                guidedBoneX0 = condBoneX0
+                guidedGlobalX0 = condGlobalX0
+
+            # DDIM step for bone features.
+            guidedBoneNoise = self.ddim.predict_noise_from_start(
+                xBone, tBatch, guidedBoneX0,
             )
-            x = self._ddimStep(x, guidedNoise, t, timestepSequence, i)
+            xBone = self._ddimStep(xBone, guidedBoneNoise, t, timestepSequence, i)
 
-        # Denormalize from z-space back to raw 6D rotations
-        x = self.denormalizeMotion(x)
+            # DDIM step for global features.
+            if xGlobal is not None and guidedGlobalX0 is not None:
+                guidedGlobalNoise = self.ddim.predict_noise_from_start(
+                    xGlobal, tBatch, guidedGlobalX0,
+                )
+                xGlobal = self._ddimStep(xGlobal, guidedGlobalNoise, t, timestepSequence, i)
 
-        rawMotion6d = x
-        predictedRootTranslation = self._predictRootTranslation(rawMotion6d)
-        motion6d = rawMotion6d
-        if applyPostProcessing:
+        # Denormalize from z-space.
+        xBone = self.denormalizeMotion(xBone)
+        if xGlobal is not None:
+            xGlobal = self.denormalizeGlobalFeatures(xGlobal)
+
+        # Extract rotation6d for quaternion conversion.
+        rot6d = self._extractRotation6d(xBone)
+        motion6d = rot6d
+        if applyPostProcessing and rot6d is not None:
             batch, frames, bones, channels = motion6d.shape
             motionFlat = motion6d.view(batch, frames, bones * channels)
             smoothed = self.smoothing(motionFlat)
             motion6d = smoothed.view(batch, frames, bones, channels)
 
-        motionQuat = self._sixdToQuaternion(motion6d)
-        if applyPostProcessing:
-            motionQuat = self.velocityReg(motionQuat)
-        sample = {"motion_quat": motionQuat}
+        sample: dict[str, torch.Tensor] = {}
+        if motion6d is not None:
+            motionQuat = self._sixdToQuaternion(motion6d)
+            if applyPostProcessing:
+                motionQuat = self.velocityReg(motionQuat)
+            sample["motion_quat"] = motionQuat
 
-        if predictedRootTranslation is not None:
-            sample["root_translation"] = predictedRootTranslation
+        # Export root translation from global predictions if available.
+        rootTranslation = self._extractGlobalComponent(xGlobal, "root_translation")
+        if rootTranslation is not None:
+            sample["root_translation"] = rootTranslation
+
         return sample
 
     @torch.no_grad()
@@ -589,110 +594,206 @@ class MotionGenerator(nn.Module):
         mean: torch.Tensor,
         std: torch.Tensor,
     ) -> None:
-        """Store dataset mean/std for motion Z-normalization."""
+        """Store dataset mean/std for bone feature Z-normalization."""
         self.motion_mean.copy_(mean.view(self.motion_mean.shape))
         self.motion_std.copy_(std.view(self.motion_std.shape))
 
+    def setGlobalStatistics(
+        self,
+        mean: torch.Tensor,
+        std: torch.Tensor,
+    ) -> None:
+        """Store dataset mean/std for global feature Z-normalization."""
+        if self.globalChannels == 0:
+            return
+        self.global_mean.copy_(mean.view(self.global_mean.shape))
+        self.global_std.copy_(std.view(self.global_std.shape))
+
     def normalizeMotion(self, motion: torch.Tensor) -> torch.Tensor:
-        """Normalize raw motion to zero-mean unit-variance."""
+        """Normalize raw bone features to zero-mean unit-variance."""
         return (motion - self.motion_mean) / self.motion_std.clamp(min=1e-5)
 
     def denormalizeMotion(self, motion: torch.Tensor) -> torch.Tensor:
-        """Inverse of normalizeMotion — map back to raw motion space."""
+        """Inverse of normalizeMotion — map back to raw bone feature space."""
         return motion * self.motion_std + self.motion_mean
+
+    def normalizeGlobalFeatures(self, features: torch.Tensor) -> torch.Tensor:
+        """Normalize raw global features to zero-mean unit-variance."""
+        if self.globalChannels == 0:
+            return features
+        return (features - self.global_mean) / self.global_std.clamp(min=1e-5)
+
+    def denormalizeGlobalFeatures(self, features: torch.Tensor) -> torch.Tensor:
+        """Inverse of normalizeGlobalFeatures."""
+        if self.globalChannels == 0:
+            return features
+        return features * self.global_std + self.global_mean
 
     def trainableParameters(self) -> tuple[nn.Parameter, ...]:
         """Return every parameter optimized during generation training."""
-        parameters = list(self.denoiser.parameters())
-        if self.rootTranslationHead is not None:
-            parameters.extend(self.rootTranslationHead.parameters())
-        return tuple(parameters)
+        return tuple(self.denoiser.parameters())
 
-    def _requiresRootTranslationHead(self) -> bool:
-        """Return True when generation supervision needs explicit root motion."""
-        requiredKeys = {"root_translation", "root_velocity"}
-        return any(
-            component.key in requiredKeys
-            for component in self.generationMotionComponents
-        )
+    # ------------------------------------------------------------------
+    # Feature assembly and splitting
+    # ------------------------------------------------------------------
 
-    def _predictRootTranslation(
+    def assembleBoneFeatures(
         self,
-        motion: torch.Tensor,
+        batch: Mapping[str, object],
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Concatenate all bone-scoped features from a batch.
+
+        Returns a tensor shaped (batch, frames, bones, boneChannels).
+        """
+        parts: list[torch.Tensor] = []
+        for component in self._boneComponents:
+            tensor = batch.get(component.sampleKey)
+            if not isinstance(tensor, torch.Tensor):
+                raise KeyError(
+                    f"Batch missing required bone feature {component.sampleKey!r}."
+                )
+            parts.append(tensor.to(device))
+        if not parts:
+            # Legacy fallback: rotation6d only.
+            motion = batch.get("motion")
+            if not isinstance(motion, torch.Tensor):
+                raise KeyError("Batch missing 'motion' tensor.")
+            return motion.to(device)
+        return torch.cat(parts, dim=-1)
+
+    def assembleGlobalFeatures(
+        self,
+        batch: Mapping[str, object],
+        device: torch.device,
     ) -> Optional[torch.Tensor]:
-        """Predict root translation from the generated 6D motion sequence."""
-        if self.rootTranslationHead is None:
-            return None
-        flatMotion = motion.reshape(motion.shape[0], motion.shape[1], -1)
-        return self.rootTranslationHead(flatMotion)
+        """Concatenate all global-scoped features from a batch.
 
-    def _generationComponentLoss(
+        Returns a tensor shaped (batch, frames, globalChannels) or None.
+        """
+        if not self._globalComponents:
+            return None
+        parts: list[torch.Tensor] = []
+        for component in self._globalComponents:
+            tensor = batch.get(component.sampleKey)
+            if not isinstance(tensor, torch.Tensor):
+                raise KeyError(
+                    f"Batch missing required global feature {component.sampleKey!r}."
+                )
+            parts.append(tensor.to(device))
+        return torch.cat(parts, dim=-1)
+
+    def _extractRotation6d(self, boneFeatures: torch.Tensor) -> torch.Tensor:
+        """Extract the rotation6d slice from concatenated bone features."""
+        if not self._hasRotation6d:
+            return boneFeatures
+        return boneFeatures[
+            ...,
+            self._rotation6dOffset:self._rotation6dOffset + self._rotation6dChannels,
+        ]
+
+    def _splitBonePredictions(
         self,
-        predictedMotion: torch.Tensor,
-        predictedRootTranslation: Optional[torch.Tensor],
-        componentTargets: Optional[Mapping[str, torch.Tensor]],
+        boneFeatures: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Split concatenated bone features into per-component tensors."""
+        result: dict[str, torch.Tensor] = {}
+        offset = 0
+        for component in self._boneComponents:
+            result[component.sampleKey] = boneFeatures[
+                ..., offset:offset + component.channels
+            ]
+            offset += component.channels
+        return result
+
+    def _splitGlobalPredictions(
+        self,
+        globalFeatures: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Split concatenated global features into per-component tensors."""
+        result: dict[str, torch.Tensor] = {}
+        offset = 0
+        for component in self._globalComponents:
+            result[component.sampleKey] = globalFeatures[
+                ..., offset:offset + component.channels
+            ]
+            offset += component.channels
+        return result
+
+    def _extractGlobalComponent(
+        self,
+        globalFeatures: Optional[torch.Tensor],
+        sampleKey: str,
+    ) -> Optional[torch.Tensor]:
+        """Extract one component from concatenated global features."""
+        if globalFeatures is None:
+            return None
+        offset = 0
+        for component in self._globalComponents:
+            if component.sampleKey == sampleKey:
+                return globalFeatures[..., offset:offset + component.channels]
+            offset += component.channels
+        return None
+
+    # ------------------------------------------------------------------
+    # Multi-feature loss
+    # ------------------------------------------------------------------
+
+    def _multiFeatureLoss(
+        self,
+        boneSplits: dict[str, torch.Tensor],
+        boneTargetSplits: dict[str, torch.Tensor],
+        predictedGlobal: Optional[torch.Tensor],
+        targetGlobal: Optional[torch.Tensor],
         motionMask: Optional[torch.Tensor],
     ) -> tuple[Optional[torch.Tensor], dict[str, torch.Tensor]]:
-        """Compute auxiliary losses for enabled generation components."""
-        if not componentTargets or not self._generationComponentsBySampleKey:
-            return None, {}
-
-        predictedTargets = self._buildPredictedComponentTargets(
-            predictedMotion=predictedMotion,
-            predictedRootTranslation=predictedRootTranslation,
-        )
-        totalLoss = torch.tensor(0.0, device=predictedMotion.device)
+        """Compute per-component losses for all non-rotation6d features."""
+        totalLoss: Optional[torch.Tensor] = None
         lossCount = 0
         losses: dict[str, torch.Tensor] = {}
 
-        for sampleKey, target in componentTargets.items():
-            component = self._generationComponentsBySampleKey.get(sampleKey)
-            if component is None:
+        # Bone-scoped component losses (skip rotation6d, handled by diffusion loss).
+        for component in self._boneComponents:
+            if component.key == "rotation6d":
                 continue
-            predicted = predictedTargets.get(sampleKey)
-            if predicted is None:
+            predicted = boneSplits.get(component.sampleKey)
+            target = boneTargetSplits.get(component.sampleKey)
+            if predicted is None or target is None:
                 continue
-            componentLoss = component.loss(
-                predicted=predicted,
-                target=target,
-                motionMask=motionMask,
-            )
-            weightedLoss = self._componentLossWeight(component.key) * componentLoss
-            totalLoss = totalLoss + weightedLoss
+            componentLoss = component.loss(predicted, target, motionMask)
+            weight = self._componentLossWeight(component.key)
+            weighted = weight * componentLoss
+            if totalLoss is None:
+                totalLoss = weighted
+            else:
+                totalLoss = totalLoss + weighted
             losses[f"loss_{component.key}"] = componentLoss.detach()
             lossCount += 1
 
-        if lossCount == 0:
+        # Global-scoped component losses.
+        if predictedGlobal is not None and targetGlobal is not None:
+            predictedGlobalSplits = self._splitGlobalPredictions(predictedGlobal)
+            targetGlobalSplits = self._splitGlobalPredictions(targetGlobal)
+            for component in self._globalComponents:
+                predicted = predictedGlobalSplits.get(component.sampleKey)
+                target = targetGlobalSplits.get(component.sampleKey)
+                if predicted is None or target is None:
+                    continue
+                componentLoss = component.loss(predicted, target, motionMask)
+                weight = self._componentLossWeight(component.key)
+                weighted = weight * componentLoss
+                if totalLoss is None:
+                    totalLoss = weighted
+                else:
+                    totalLoss = totalLoss + weighted
+                losses[f"loss_{component.key}"] = componentLoss.detach()
+                lossCount += 1
+
+        if totalLoss is None or lossCount == 0:
             return None, {}
         totalLoss = totalLoss / float(lossCount)
         losses["loss_components"] = totalLoss.detach()
         return totalLoss, losses
-
-    def _buildPredictedComponentTargets(
-        self,
-        predictedMotion: torch.Tensor,
-        predictedRootTranslation: Optional[torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
-        """Build auxiliary targets from the predicted clean motion."""
-        if not self.generationMotionComponents:
-            return {}
-
-        stacked: dict[str, list[torch.Tensor]] = {}
-        for batchIndex in range(predictedMotion.shape[0]):
-            extras: dict[str, object] = {}
-            if predictedRootTranslation is not None:
-                extras["trans"] = predictedRootTranslation[batchIndex]
-            sampleFeatures = buildMotionFeatureTensors(
-                motion=predictedMotion[batchIndex],
-                extras=extras,
-                enabledComponents=self.generationMotionComponents,
-            )
-            for sampleKey, value in sampleFeatures.items():
-                stacked.setdefault(sampleKey, []).append(value)
-        return {
-            sampleKey: torch.stack(values, dim=0)
-            for sampleKey, values in stacked.items()
-        }
 
     def _componentLossWeight(self, componentKey: str) -> float:
         """Resolve the default weight for one auxiliary motion component."""
