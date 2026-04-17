@@ -269,6 +269,11 @@ def trainOneEpoch(
         chunkInfo=chunkInfo,
     ) as pbar:
         for batch in pbar:
+            # Combine epoch + batch index into a unique step counter used by
+            # deterministic corruption.  Same (epoch, batch) → same (t, noise)
+            # pair, but successive batches and epochs cover every timestep,
+            # which is required for DDIM inference to work after overfit.
+            globalStep = (max(int(epoch) - 1, 0) * 10_000_000) + numBatches
             lossValue, lossComponents = _runBatchAccumulate(
                 batch,
                 model,
@@ -276,6 +281,7 @@ def trainOneEpoch(
                 device,
                 gradientAccumulation,
                 deterministicCorruption=deterministicCorruption,
+                stepCounter=globalStep,
             )
             pbar.updateLoss(lossValue)
             _updateLossComponents(componentSums, lossComponents)
@@ -439,6 +445,7 @@ def _runBatchAccumulate(
     device: torch.device,
     gradientAccumulation: int = 1,
     deterministicCorruption: bool = False,
+    stepCounter: int = 0,
 ) -> tuple[float, LossComponents]:
     """
     Run forward/backward pass for gradient accumulation (no optimizer step).
@@ -493,10 +500,29 @@ def _runBatchAccumulate(
         ddim=ddim,
         device=device,
         deterministicCorruption=deterministicCorruption,
+        stepCounter=stepCounter,
     )
     noisyGlobal: torch.Tensor | None = None
     if normalizedGlobal is not None:
-        globalNoise = torch.randn_like(normalizedGlobal)
+        # Keep global noise in sync with bone noise: deterministic when
+        # requested, independent Gaussian otherwise.  Using the same (t,
+        # stepCounter) reproducibility rule ensures all feature scopes
+        # travel the same corruption trajectory during an overfit run.
+        if deterministicCorruption:
+            _, globalNoise = _seededTimestepsAndNoise(
+                sampleIds=_resolveDeterministicSampleIds(
+                    batch, normalizedGlobal.shape[0],
+                ),
+                numTimesteps=ddim.num_timesteps,
+                motionShape=normalizedGlobal.shape,
+                dtype=normalizedGlobal.dtype,
+                device=device,
+                # Shift the step counter so bone and global seeds differ
+                # and the two scopes do not share identical noise patterns.
+                stepCounter=stepCounter + 1,
+            )
+        else:
+            globalNoise = torch.randn_like(normalizedGlobal)
         noisyGlobal = ddim.q_sample(normalizedGlobal, timesteps, globalNoise)
 
     del batch
@@ -652,8 +678,19 @@ def _prepareDiffusionInputs(
     ddim: DDIM,
     device: torch.device,
     deterministicCorruption: bool,
+    stepCounter: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build timesteps/noise pairs for one batch."""
+    """Build timesteps/noise pairs for one batch.
+
+    When ``deterministicCorruption`` is True, corruption is reproducible
+    for a given ``(sampleId, stepCounter)`` pair but **varies across
+    training steps**.  This is critical: the previous implementation hashed
+    ``sampleId`` only, which meant overfit runs on a fixed sample saw the
+    exact same timestep and noise forever -- the denoiser never learned to
+    predict x0 at other timesteps, so DDIM inference collapsed to a noisy
+    "mean pose".  Mixing in ``stepCounter`` preserves reproducibility while
+    guaranteeing full timestep coverage over time.
+    """
     batchSize = motion.shape[0]
     if not deterministicCorruption:
         timesteps = torch.randint(
@@ -667,16 +704,13 @@ def _prepareDiffusionInputs(
         return timesteps, noise, ddim.q_sample(motion, timesteps, noise)
 
     sampleIds = _resolveDeterministicSampleIds(batch, batchSize)
-    timesteps = _deterministicTimesteps(
+    timesteps, noise = _seededTimestepsAndNoise(
         sampleIds=sampleIds,
         numTimesteps=ddim.num_timesteps,
-        device=device,
-    )
-    noise = _deterministicNoise(
-        sampleIds=sampleIds,
         motionShape=motion.shape,
         dtype=motion.dtype,
         device=device,
+        stepCounter=stepCounter,
     )
     return timesteps, noise, ddim.q_sample(motion, timesteps, noise)
 
@@ -692,40 +726,48 @@ def _resolveDeterministicSampleIds(
     return list(range(batchSize))
 
 
-def _deterministicTimesteps(
+def _seededTimestepsAndNoise(
     sampleIds: list[int],
     numTimesteps: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Map sample ids to stable diffusion timesteps."""
-    values = [
-        ((int(sampleId) * 1103515245 + 12345) & 0x7FFFFFFF) % numTimesteps
-        for sampleId in sampleIds
-    ]
-    return torch.tensor(values, device=device, dtype=torch.long)
-
-
-def _deterministicNoise(
-    sampleIds: list[int],
     motionShape: torch.Size,
     dtype: torch.dtype,
     device: torch.device,
-) -> torch.Tensor:
-    """Build stable Gaussian noise per sample on CPU and move it to device."""
+    stepCounter: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample (timestep, noise) reproducibly from (sampleId, stepCounter).
+
+    Each ``(sampleId, stepCounter)`` pair seeds a dedicated CPU generator so
+    the same ``stepCounter`` twice produces identical corruption (useful for
+    stable loss curves) while successive steps cycle through different
+    timesteps and noises (required for DDIM inference to work).
+    """
     sampleShape = tuple(motionShape[1:])
-    noiseSamples: list[torch.Tensor] = []
+    timestepsList: list[int] = []
+    noiseList: list[torch.Tensor] = []
     for sampleId in sampleIds:
+        seed = (
+            int(sampleId) * 2654435761
+            + int(stepCounter) * 1103515245
+            + 12345
+        ) & 0x7FFFFFFF
         generator = torch.Generator(device="cpu")
-        generator.manual_seed(17_171 + int(sampleId))
+        generator.manual_seed(seed)
+        timestep = int(
+            torch.randint(
+                0, numTimesteps, (1,), generator=generator,
+            ).item()
+        )
         sampleNoise = torch.randn(
             sampleShape,
             generator=generator,
             dtype=torch.float32,
             device="cpu",
         )
-        noiseSamples.append(sampleNoise)
-    noise = torch.stack(noiseSamples, dim=0)
-    return noise.to(device=device, dtype=dtype)
+        timestepsList.append(timestep)
+        noiseList.append(sampleNoise)
+    timesteps = torch.tensor(timestepsList, device=device, dtype=torch.long)
+    noise = torch.stack(noiseList, dim=0).to(device=device, dtype=dtype)
+    return timesteps, noise
 
 
 def computeMotionStatistics(

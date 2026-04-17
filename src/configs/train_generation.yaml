@@ -50,6 +50,11 @@ overfit:
   # overfit: fixed count ("16") or 1-based inclusive range ("3:6")
   overfit-samples: "10:10"
   clear-mps-cache: false
+  # Deterministic corruption now mixes in a per-step counter, so each batch
+  # cycles through every diffusion timestep while staying reproducible.
+  # Previous versions hashed the sample id only, which locked the denoiser
+  # to a single timestep -- DDIM inference then collapsed to a noisy "mean
+  # pose" even on a one-sample overfit run.
   deterministic-corruption: true
   disable-dropout: true
 
