@@ -602,8 +602,12 @@ def _runTraining(
                 )
 
         else:
-            # No validation, save periodically
-            if (epochIndex + 1) % 10 == 0:
+            # No validation: save best checkpoint based on train loss so the
+            # exported model always matches the lowest training loss seen so
+            # far (required for overfit replay / deterministic inference).
+            if bestValLoss is None or trainLoss < bestValLoss:
+                bestValLoss = trainLoss
+                epochsWithoutImprovement = 0
                 checkpointPath = saveCheckpoint(
                     model=model,
                     optimizer=optimizer,
@@ -612,10 +616,12 @@ def _runTraining(
                     checkpointDir=config.paths.checkpointDir,
                 )
                 LOGGER.info(
-                    "Saved periodic checkpoint to %s "
-                    "(validation disabled; not a best model)",
+                    "Saved best-train-loss checkpoint to %s (train_loss=%.4f)",
                     checkpointPath,
+                    trainLoss,
                 )
+            else:
+                epochsWithoutImprovement += 1
 
         _logEpochSummary(
             epoch=epochIndex + 1,

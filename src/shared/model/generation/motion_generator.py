@@ -861,7 +861,12 @@ class MotionGenerator(nn.Module):
 
         if totalLoss is None or lossCount == 0:
             return None, {}
-        totalLoss = totalLoss / float(lossCount)
+        # Do NOT average by lossCount: each component already has a
+        # calibrated weight from _componentLossWeight.  Dividing by the
+        # number of active auxiliary losses silently shrinks every signal
+        # as more features are enabled, which was one of the causes of the
+        # model collapsing towards a mean pose (the rotation6d diffusion
+        # loss would dwarf the diluted auxiliary signals).
         losses["loss_components"] = totalLoss.detach()
         return totalLoss, losses
 

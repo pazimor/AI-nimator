@@ -86,8 +86,13 @@ overfit:
     num-layers: 4
     num-bones: 22
     diffusion-steps: 1000
-    num-spatial-layers: 4
-    num-spatio-temporal-layers: 4
+    # Overfit: skip the spatial/spatio-temporal pre-blocks that process
+    # pure noise *before* the conditioning token is prepended (pure MDM
+    # design has none). Keeping them active on a single-sample regime was
+    # drowning the text/timestep signal and collapsing the sampled motion
+    # toward the mean pose.
+    num-spatial-layers: 0
+    num-spatio-temporal-layers: 0
 
     bone-data:
       rotation6d: true
