@@ -263,6 +263,7 @@ def _runTraining(
         diffusionWeight=config.training.diffusionWeight,
         accelerationWeight=config.training.accelerationWeight,
         clipGuidanceWeight=config.training.clipGuidanceWeight,
+        footSkatingWeight=config.training.footSkatingWeight,
         numSpatialLayers=networkConfig.generation.numSpatialLayers,
         numSpatioTemporalLayers=networkConfig.generation.numSpatioTemporalLayers,
         maxPromptLength=config.training.maxPromptLength,
@@ -307,11 +308,12 @@ def _runTraining(
         effectiveXyzWeight,
     )
     LOGGER.info(
-        "Loss weights: diffusion=%.4f, xyz=%.4f, vel_xyz=%.4f, acc=%.4f",
+        "Loss weights: diffusion=%.4f, xyz=%.4f, vel_xyz=%.4f, acc=%.4f, skate=%.4f",
         config.training.diffusionWeight,
         config.training.xyzWeight,
         config.training.velXyzWeight,
         config.training.accelerationWeight,
+        config.training.footSkatingWeight,
     )
     if config.training.clipGuidanceWeight > 0.0:
         LOGGER.info(

@@ -53,6 +53,7 @@ class MotionGenerator(nn.Module):
         diffusionWeight: float = 1.0,
         accelerationWeight: float = 0.0,
         clipGuidanceWeight: float = 0.0,
+        footSkatingWeight: float = 0.0,
         condMaskProb: float = 0.1,
         numSpatialLayers: int = 1,
         numSpatioTemporalLayers: int = 1,
@@ -79,6 +80,11 @@ class MotionGenerator(nn.Module):
         self.diffusionWeight = diffusionWeight
         self.accelerationWeight = accelerationWeight
         self.clipGuidanceWeight = clipGuidanceWeight
+        # Foot-skating penalty is OFF by default -- it applies FK on noisy
+        # rot6d predictions at every diffusion timestep, which produces huge,
+        # chaotic gradients early in training.  Enable it only once the base
+        # diffusion loss has converged to reasonable motion.
+        self.footSkatingWeight = float(footSkatingWeight)
         self.condMaskProb = condMaskProb
         self.maxPromptLength = max(1, int(maxPromptLength))
         self.generationMotionComponents = tuple(generationMotionComponents or ())
@@ -234,6 +240,16 @@ class MotionGenerator(nn.Module):
             noisyGlobalFeatures=noisyGlobalFeatures,
         )
 
+        # The denoiser's direct output is the predicted x0 in **normalized**
+        # space (same space as its input).  Keep a reference before
+        # denormalizing so the base diffusion MSE stays scale-invariant
+        # across channels -- denormalizing before the MSE would implicitly
+        # weight each channel by std^2, drowning low-variance channels like
+        # rotation6d under high-variance ones (joint xyz in meters, root
+        # translation, etc.) and collapsing the model towards a mean pose.
+        normalizedBonePred = boneOutput
+        normalizedGlobalPred = globalOutput
+
         # Resolve x0 predictions for bone features.
         predictedBoneNoise, predictedBoneMotion = self._resolveModelPredictions(
             noisyMotion=noisyMotion,
@@ -293,6 +309,7 @@ class MotionGenerator(nn.Module):
                 numTimesteps=self.ddim.num_timesteps,
                 motionMask=motionMask,
                 footContact=footContact,
+                footSkatingWeight=self.footSkatingWeight,
             )
 
             # Component losses on bone features (excluding rotation6d
@@ -315,22 +332,37 @@ class MotionGenerator(nn.Module):
             # proper denoising signal — noisy auxiliary channels would
             # otherwise contaminate rotation6d predictions through the shared
             # transformer during DDIM sampling.
+            #
+            # Critical: compute this MSE in **normalized** space so every
+            # channel contributes with unit variance.  Before this change the
+            # loss was computed on denormalized predictions, which scaled each
+            # channel's gradient by std^2 and let meter-scale features
+            # (joint_xyz, root translation) dominate rotation channels,
+            # biasing the model toward a mean pose.
             if (
                 self._hasRotation6d
                 and self.boneChannels > self._rotation6dChannels
             ):
+                normalizedBoneTarget = self.normalizeMotion(targetMotion)
                 fullBoneDiffusion = startMotionLoss(
-                    predictedBoneMotion, targetMotion, motionMask,
+                    normalizedBonePred, normalizedBoneTarget, motionMask,
                 )
                 loss = loss + self.diffusionWeight * fullBoneDiffusion
                 result["loss_bone_diffusion"] = fullBoneDiffusion.detach()
 
             # Same for global features: the denoiser predicts them as a
             # diffusion target, so they need a proper denoising MSE beyond
-            # the per-component auxiliary losses.
-            if predictedGlobal is not None and targetGlobalFeatures is not None:
+            # the per-component auxiliary losses.  Computed in normalized
+            # space for the same scale-invariance reason as bone features.
+            if (
+                normalizedGlobalPred is not None
+                and targetGlobalFeatures is not None
+            ):
+                normalizedGlobalTarget = self.normalizeGlobalFeatures(
+                    targetGlobalFeatures,
+                )
                 globalDiffusion = startMotionLoss(
-                    predictedGlobal, targetGlobalFeatures, motionMask,
+                    normalizedGlobalPred, normalizedGlobalTarget, motionMask,
                 )
                 loss = loss + self.diffusionWeight * globalDiffusion
                 result["loss_global_diffusion"] = globalDiffusion.detach()
@@ -481,9 +513,9 @@ class MotionGenerator(nn.Module):
         motion6d = rot6d
         if applyPostProcessing and rot6d is not None:
             batch, frames, bones, channels = motion6d.shape
-            motionFlat = motion6d.view(batch, frames, bones * channels)
+            motionFlat = motion6d.reshape(batch, frames, bones * channels)
             smoothed = self.smoothing(motionFlat)
-            motion6d = smoothed.view(batch, frames, bones, channels)
+            motion6d = smoothed.reshape(batch, frames, bones, channels)
 
         sample: dict[str, torch.Tensor] = {}
         if motion6d is not None:

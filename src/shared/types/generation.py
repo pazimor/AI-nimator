@@ -119,6 +119,7 @@ class GenerationTrainingHyperparameters:
     diffusionWeight: float = 1.0
     accelerationWeight: float = 0.0
     clipGuidanceWeight: float = 0.0
+    footSkatingWeight: float = 0.0
 
 
 @dataclass(frozen=True)

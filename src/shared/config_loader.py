@@ -441,6 +441,17 @@ def loadGenerationConfig(
         "clip-guidance-weight",
         GENERATION_DEFAULT_CLIP_GUIDANCE_WEIGHT,
     )
+    # Foot-skating penalty is disabled by default: when active it evaluates
+    # FK on every noisy rot6d prediction and multiplies the resulting foot
+    # velocity by the ground-truth contact mask.  At high diffusion timesteps
+    # this is pure FK-of-noise, producing wild gradients that push the
+    # denoiser toward a degenerate mean pose.  Enable it (e.g. 1.0) only
+    # once the base diffusion loss has settled.
+    footSkatingWeight = _float(
+        trainingSection,
+        "foot-skating-weight",
+        0.0,
+    )
     
     hyperparameters = GenerationTrainingHyperparameters(
         batchSize=_int(
@@ -516,6 +527,7 @@ def loadGenerationConfig(
         diffusionWeight=diffusionWeight,
         accelerationWeight=accelerationWeight,
         clipGuidanceWeight=clipGuidanceWeight,
+        footSkatingWeight=footSkatingWeight,
     )
 
     return GenerationTrainingConfig(

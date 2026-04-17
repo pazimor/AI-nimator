@@ -2,9 +2,9 @@ paths:
   dataset-root: "/Users/pazimor/dataset_preprocessed"
   # dataset-folders: ["ACCAD", "BioMotionLab_NTroje", "BMLHandball", "BMLmovi", "CMU", "DFaust_67", "EKUT", "Eyes_Japan_Dataset", "HumanEva", "KIT", "MPI_HDM05", "MPI_Limits", "MPI_mosh", "SFU", "SSM_synced", "TotalCapture", "Transitions_mocap"]
   dataset-folders: ["ACCAD"] # for quick preview
-  clip-checkpoint: "../../output/clip/best_model-4-4-768-ACCAD.pt"
+  clip-checkpoint: "../../output/clip/best_model.pt"
   checkpoint-dir: "../../output/generation"
-  
+
   # Network architecture is loaded from network.yaml
   network-config: "network.yaml"
   validation-indices: "../../output/generation/validation_indices.json"
@@ -24,14 +24,21 @@ training:
   max-samples-per-epoch: 10000
   MM-memory-limit-gb: 20.0
   resume-checkpoint: output/generation/best_model.pt
-  
+
   learning-rate: 0.00001
-  xyz-weight: 10.0
+  xyz-weight: 2.0
   xyz-weight-schedule: timestep
   vel-xyz-weight: 1.0
   diffusion-weight: 1.0
   acceleration-weight: 0.02
   clip-guidance-weight: 0.1
+  # Foot-skating penalty evaluates FK on rot6d predictions at every
+  # diffusion timestep.  At high t (near pure noise) FK-of-noise is
+  # chaotic and multiplied by the foot-contact mask it produces wild
+  # gradients that collapse the model toward a mean pose.  Keep it at 0.0
+  # until the base diffusion loss has converged, then raise to ~1.0 for
+  # the last fine-tuning epochs if you want plant-on-ground refinement.
+  foot-skating-weight: 0.0
 
 # ============================================
 # Profile: Overfit 16
@@ -46,7 +53,7 @@ overfit:
   batch-size: 4
   gradient-accumulation: 1
   max-samples-per-epoch: 10000
-  
+
   # overfit: fixed count ("16") or 1-based inclusive range ("3:6")
   overfit-samples: "10:10"
   clear-mps-cache: false
@@ -62,7 +69,7 @@ overfit:
   # Overfit debugging should start from scratch to keep the loss curve
   # interpretable when the objective or enabled features change.
   resume-checkpoint: output/generation/best_model.pt
-  
+
   learning-rate: 0.00001
   xyz-weight: 1.0
   xyz-weight-schedule: timestep
@@ -70,3 +77,7 @@ overfit:
   diffusion-weight: 1.0
   acceleration-weight: 0.0
   clip-guidance-weight: 0.0
+  # Keep foot-skating OFF when overfitting a single sample: the FK-of-noise
+  # gradients at high timesteps swamp the pure diffusion MSE and actively
+  # prevent the model from memorizing the sample.
+  foot-skating-weight: 0.0

@@ -782,10 +782,16 @@ def computeMotionStatistics(
     assembled bone feature tensor (all enabled bone-scoped components).
     Otherwise falls back to the legacy ``batch["motion"]`` key.
 
+    Padded frames are excluded via ``batch["motion_mask"]`` when available so
+    the statistics are not biased toward zero.  Including padding used to
+    under-estimate ``motion_std`` and shrink every feature toward the mean,
+    which made the normalized diffusion target a tiny fraction of a unit and
+    starved the denoiser of learning signal at high timesteps.
+
     Returns tensors shaped ``(1, 1, bones, boneChannels)`` suitable for
     broadcasting.
     """
-    count = 0
+    count = 0.0
     runningSum: Optional[torch.Tensor] = None
     runningSumSq: Optional[torch.Tensor] = None
 
@@ -796,20 +802,35 @@ def computeMotionStatistics(
             motion = model.assembleBoneFeatures(batch, device)
         else:
             motion = batch["motion"]  # (B, F, bones, 6)
-        # Flatten to (N, bones, channels)
-        flat = motion.reshape(-1, motion.shape[2], motion.shape[3]).float()
-        if runningSum is None:
-            runningSum = flat.sum(dim=0)
-            runningSumSq = (flat ** 2).sum(dim=0)
+        motionFloat = motion.float()
+        mask = batch.get("motion_mask")
+        if isinstance(mask, torch.Tensor):
+            # (B, F) → (B, F, 1, 1) for broadcasting over bones/channels.
+            frameMask = mask.to(device=motionFloat.device).float()
+            frameMask = frameMask.unsqueeze(-1).unsqueeze(-1)
+            weighted = motionFloat * frameMask
+            weightedSq = (motionFloat ** 2) * frameMask
+            batchSum = weighted.sum(dim=(0, 1))
+            batchSumSq = weightedSq.sum(dim=(0, 1))
+            batchCount = frameMask.sum().item()
         else:
-            runningSum = runningSum + flat.sum(dim=0)
-            runningSumSq = runningSumSq + (flat ** 2).sum(dim=0)
-        count += flat.shape[0]
+            flat = motionFloat.reshape(-1, motion.shape[2], motion.shape[3])
+            batchSum = flat.sum(dim=0)
+            batchSumSq = (flat ** 2).sum(dim=0)
+            batchCount = float(flat.shape[0])
+        if runningSum is None:
+            runningSum = batchSum
+            runningSumSq = batchSumSq
+        else:
+            runningSum = runningSum + batchSum
+            runningSumSq = runningSumSq + batchSumSq
+        count += batchCount
 
     if count == 0 or runningSum is None or runningSumSq is None:
         raise RuntimeError("Cannot compute statistics on an empty dataset.")
     mean = runningSum / count
-    std = torch.sqrt(runningSumSq / count - mean ** 2).clamp(min=1e-5)
+    variance = (runningSumSq / count - mean ** 2).clamp(min=0.0)
+    std = torch.sqrt(variance).clamp(min=1e-5)
     # Reshape to (1, 1, bones, channels) for broadcasting
     return mean.unsqueeze(0).unsqueeze(0), std.unsqueeze(0).unsqueeze(0)
 
@@ -822,9 +843,11 @@ def computeGlobalStatistics(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute per-channel mean/std of global feature tensors.
 
+    Padded frames are excluded via ``batch["motion_mask"]`` when available.
+
     Returns tensors shaped ``(1, 1, globalChannels)``.
     """
-    count = 0
+    count = 0.0
     runningSum: Optional[torch.Tensor] = None
     runningSumSq: Optional[torch.Tensor] = None
 
@@ -834,19 +857,34 @@ def computeGlobalStatistics(
         globalFeatures = model.assembleGlobalFeatures(batch, device)
         if globalFeatures is None:
             break
-        flat = globalFeatures.reshape(-1, globalFeatures.shape[-1]).float()
-        if runningSum is None:
-            runningSum = flat.sum(dim=0)
-            runningSumSq = (flat ** 2).sum(dim=0)
+        globalFloat = globalFeatures.float()
+        mask = batch.get("motion_mask")
+        if isinstance(mask, torch.Tensor):
+            frameMask = mask.to(device=globalFloat.device).float()
+            frameMask = frameMask.unsqueeze(-1)
+            weighted = globalFloat * frameMask
+            weightedSq = (globalFloat ** 2) * frameMask
+            batchSum = weighted.sum(dim=(0, 1))
+            batchSumSq = weightedSq.sum(dim=(0, 1))
+            batchCount = frameMask.sum().item()
         else:
-            runningSum = runningSum + flat.sum(dim=0)
-            runningSumSq = runningSumSq + (flat ** 2).sum(dim=0)
-        count += flat.shape[0]
+            flat = globalFloat.reshape(-1, globalFeatures.shape[-1])
+            batchSum = flat.sum(dim=0)
+            batchSumSq = (flat ** 2).sum(dim=0)
+            batchCount = float(flat.shape[0])
+        if runningSum is None:
+            runningSum = batchSum
+            runningSumSq = batchSumSq
+        else:
+            runningSum = runningSum + batchSum
+            runningSumSq = runningSumSq + batchSumSq
+        count += batchCount
 
     if count == 0 or runningSum is None or runningSumSq is None:
         raise RuntimeError("Cannot compute global statistics on an empty dataset.")
     mean = runningSum / count
-    std = torch.sqrt(runningSumSq / count - mean ** 2).clamp(min=1e-5)
+    variance = (runningSumSq / count - mean ** 2).clamp(min=0.0)
+    std = torch.sqrt(variance).clamp(min=1e-5)
     return mean.unsqueeze(0).unsqueeze(0), std.unsqueeze(0).unsqueeze(0)
 
 
