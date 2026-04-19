@@ -10,6 +10,7 @@ from typing import Mapping, Optional
 
 import torch
 
+from src.shared import diagnostics as diag
 from src.shared.config_loader import loadGenerationConfig
 from src.features.generation.train_generation import (
     computeGlobalStatistics,
@@ -122,6 +123,15 @@ def buildArgumentParser() -> argparse.ArgumentParser:
             "for architecture and motion feature toggles."
         ),
     )
+    parser.add_argument(
+        "--diag-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory where a JSONL diagnostics file will be written. "
+            "Falls back to AI_NIMATOR_DIAG_DIR env var when omitted."
+        ),
+    )
     return parser
 
 
@@ -136,6 +146,10 @@ def main() -> None:
         config = loadGenerationConfig(configPath, profile=arguments.profile)
         selectedProfile = arguments.profile or "training"
         LOGGER.info("Using profile: %s", selectedProfile)
+        if arguments.diag_dir is not None:
+            diag.init(arguments.diag_dir, tag=f"train_{selectedProfile}")
+        else:
+            diag.init_from_env(tag=f"train_{selectedProfile}")
         result = _runTraining(
             config,
             profile=arguments.profile,
@@ -260,10 +274,12 @@ def _runTraining(
         xyzWeight=config.training.xyzWeight,
         xyzWeightSchedule=config.training.xyzWeightSchedule,
         velXyzWeight=config.training.velXyzWeight,
+        velXyzWeightSchedule=config.training.velXyzWeightSchedule,
         diffusionWeight=config.training.diffusionWeight,
         accelerationWeight=config.training.accelerationWeight,
         clipGuidanceWeight=config.training.clipGuidanceWeight,
         footSkatingWeight=config.training.footSkatingWeight,
+        minSnrGamma=config.training.minSnrGamma,
         numSpatialLayers=networkConfig.generation.numSpatialLayers,
         numSpatioTemporalLayers=networkConfig.generation.numSpatioTemporalLayers,
         maxPromptLength=config.training.maxPromptLength,
@@ -307,11 +323,18 @@ def _runTraining(
         config.training.xyzWeightSchedule,
         effectiveXyzWeight,
     )
+    velXyzSchedule = config.training.velXyzWeightSchedule.lower()
+    effectiveVelXyzWeight = config.training.velXyzWeight
+    if velXyzSchedule == "timestep":
+        effectiveVelXyzWeight *= 0.5
     LOGGER.info(
-        "Loss weights: diffusion=%.4f, xyz=%.4f, vel_xyz=%.4f, acc=%.4f, skate=%.4f",
+        "Loss weights: diffusion=%.4f, xyz=%.4f, "
+        "vel_xyz=%.4f (schedule=%s, approx_eff=%.4f), acc=%.4f, skate=%.4f",
         config.training.diffusionWeight,
         config.training.xyzWeight,
         config.training.velXyzWeight,
+        velXyzSchedule,
+        effectiveVelXyzWeight,
         config.training.accelerationWeight,
         config.training.footSkatingWeight,
     )

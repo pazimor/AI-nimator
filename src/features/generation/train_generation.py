@@ -13,6 +13,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from src.shared.checkpoint_io import saveTorchObjectAtomically
+from src.shared import diagnostics as diag
 from src.shared.types.generation import PREDICTION_TARGET_X0
 
 # Limit CPU threads to reduce memory usage
@@ -40,21 +42,35 @@ LossComponents = dict[str, float]
 LOGGER = logging.getLogger("generation.train")
 LOSS_COMPONENT_KEYS = (
     "loss_diffusion",
+    "loss_bone_diffusion",
+    "loss_global_diffusion",
     "loss_xyz",
     "loss_vel_xyz",
     "loss_acceleration",
     "loss_clip_guidance",
     "loss_root_translation",
     "loss_root_velocity",
+    "loss_joint_xyz",
+    "loss_joint_velocity",
+    "loss_foot_contact",
+    "loss_end_effector_velocity",
     "loss_components",
     "loss_foot_skating",
 )
 LOSS_COMPONENT_LABELS = {
+    "loss_diffusion": "diff",
+    "loss_bone_diffusion": "bone_d",
+    "loss_global_diffusion": "glob_d",
     "loss_xyz": "xyz",
     "loss_vel_xyz": "vel_xyz",
+    "loss_acceleration": "acc",
     "loss_clip_guidance": "clip",
     "loss_root_translation": "rtrans",
     "loss_root_velocity": "rvel",
+    "loss_joint_xyz": "jxyz",
+    "loss_joint_velocity": "jvel",
+    "loss_foot_contact": "fcont",
+    "loss_end_effector_velocity": "eevel",
     "loss_components": "aux",
     "loss_foot_skating": "skate",
 }
@@ -248,6 +264,10 @@ def trainOneEpoch(
     model.train()
     numBatches = 0
     componentSums = _initLossComponents()
+    # Per-bucket loss accumulators (10 buckets of diffusion timesteps).
+    bucketSums: dict[int, float] = {}
+    bucketCounts: dict[int, int] = {}
+    numBuckets = 10
     
     # Setup memory manager
     memoryConfig = MemoryManagerConfig(
@@ -274,7 +294,7 @@ def trainOneEpoch(
             # pair, but successive batches and epochs cover every timestep,
             # which is required for DDIM inference to work after overfit.
             globalStep = (max(int(epoch) - 1, 0) * 10_000_000) + numBatches
-            lossValue, lossComponents = _runBatchAccumulate(
+            lossValue, lossComponents, batchTimesteps = _runBatchAccumulate(
                 batch,
                 model,
                 ddim,
@@ -282,9 +302,18 @@ def trainOneEpoch(
                 gradientAccumulation,
                 deterministicCorruption=deterministicCorruption,
                 stepCounter=globalStep,
+                epoch=epoch,
+                batchIdx=numBatches,
             )
             pbar.updateLoss(lossValue)
             _updateLossComponents(componentSums, lossComponents)
+            # Aggregate per-timestep-bucket loss (bucket = t // (T/numBuckets)).
+            if batchTimesteps:
+                bucketWidth = max(ddim.num_timesteps // numBuckets, 1)
+                for t in batchTimesteps:
+                    bucket = min(int(t) // bucketWidth, numBuckets - 1)
+                    bucketSums[bucket] = bucketSums.get(bucket, 0.0) + lossValue
+                    bucketCounts[bucket] = bucketCounts.get(bucket, 0) + 1
             numBatches += 1
             accumSteps += 1
             avgComponents = _averageLossComponents(componentSums, numBatches)
@@ -317,6 +346,26 @@ def trainOneEpoch(
         if clearMpsCache and device.type == "mps":
             torch.mps.empty_cache()
         avgComponents = _averageLossComponents(componentSums, numBatches)
+        if diag.get_logger() is not None:
+            bucketAverages = {
+                bucket: {
+                    "avg_loss": bucketSums[bucket] / max(bucketCounts[bucket], 1),
+                    "count": bucketCounts[bucket],
+                }
+                for bucket in sorted(bucketSums.keys())
+            }
+            diag.logEpochSummary(
+                epoch=epoch,
+                trainLoss=pbar.metrics.avgLoss,
+                valLoss=None,
+                components=avgComponents,
+                timestepBuckets=bucketAverages,
+                learningRate=float(
+                    optimizer.param_groups[0]["lr"]
+                    if optimizer.param_groups
+                    else 0.0
+                ),
+            )
         return pbar.metrics.avgLoss, avgComponents
 
 
@@ -446,7 +495,9 @@ def _runBatchAccumulate(
     gradientAccumulation: int = 1,
     deterministicCorruption: bool = False,
     stepCounter: int = 0,
-) -> tuple[float, LossComponents]:
+    epoch: int = 1,
+    batchIdx: int = 0,
+) -> tuple[float, LossComponents, list[int]]:
     """
     Run forward/backward pass for gradient accumulation (no optimizer step).
 
@@ -538,7 +589,18 @@ def _runBatchAccumulate(
         noisyGlobalFeatures=noisyGlobal,
         targetGlobalFeatures=globalFeatures,
     )
-    
+
+    diagActive = diag.get_logger() is not None
+    predictedMotionForDiag = (
+        outputs.get("predicted_motion").detach()
+        if diagActive and outputs.get("predicted_motion") is not None
+        else None
+    )
+    normalizedBoneForDiag = normalizedBone.detach() if diagActive else None
+    targetMotionForDiag = boneFeatures.detach() if diagActive else None
+    noisyMotionForDiag = noisyMotion.detach() if diagActive else None
+    noiseForDiag = noise.detach() if diagActive else None
+
     del (
         textEmbedding,
         noisyMotion,
@@ -558,9 +620,28 @@ def _runBatchAccumulate(
     scaledLoss.backward()
 
     lossValue = float(loss.detach().item())
+    timestepsList = [int(v) for v in timesteps.detach().cpu().view(-1).tolist()]
+
+    if diagActive:
+        gradNorm = diag.computeGradientNorm(model.trainableParameters())
+        diag.logTrainBatch(
+            epoch=epoch,
+            batchIdx=batchIdx,
+            globalStep=stepCounter,
+            timesteps=timesteps.detach(),
+            loss=lossValue,
+            components=lossComponents,
+            normalizedTarget=normalizedBoneForDiag,
+            noisyInput=noisyMotionForDiag,
+            noise=noiseForDiag,
+            predictedMotion=predictedMotionForDiag,
+            targetMotion=targetMotionForDiag,
+            gradNorm=gradNorm,
+        )
+
     del noise, timesteps, loss, scaledLoss
 
-    return lossValue, lossComponents
+    return lossValue, lossComponents, timestepsList
 
 
 def evaluateValidation(
@@ -919,10 +1000,8 @@ def saveCheckpoint(
     Path
         Path to saved checkpoint.
     """
-    checkpointDir.mkdir(parents=True, exist_ok=True)
     checkpointPath = checkpointDir / filename
-
-    torch.save(
+    saveTorchObjectAtomically(
         {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
@@ -981,19 +1060,31 @@ def loadCheckpoint(
             "Only x0 checkpoints can be loaded."
         )
 
-    # Try to load full model state first, fallback to denoiser only
+    # Try to load full model state first, fallback to denoiser only.
+    # ``strict=False`` on both branches lets older checkpoints resume after
+    # architecture upgrades (e.g. the motionSkipProj / min-SNR fixes) that
+    # introduce new parameters absent from the saved state_dict.
     if "model_state_dict" in checkpoint:
         model.load_state_dict(checkpoint["model_state_dict"], strict=False)
     elif "denoiser_state_dict" in checkpoint:
-        model.denoiser.load_state_dict(checkpoint["denoiser_state_dict"])
+        model.denoiser.load_state_dict(
+            checkpoint["denoiser_state_dict"], strict=False,
+        )
 
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
         try:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         except ValueError as error:
-            raise RuntimeError(
-                "Optimizer state is incompatible with the current generation "
-                "parameter set."
-            ) from error
+            # A ValueError here typically means the model has gained or
+            # lost parameters since the checkpoint (e.g. after an
+            # architecture fix).  Restart the optimizer from scratch
+            # rather than aborting -- re-initialising Adam moments is
+            # preferable to losing the trained weights.
+            LOGGER.warning(
+                "Optimizer state incompatible with current parameters "
+                "(%s); resuming model weights but reinitialising the "
+                "optimizer state.",
+                error,
+            )
 
     return checkpoint.get("epoch", 0), checkpoint.get("loss", float("inf"))

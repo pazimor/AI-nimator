@@ -49,6 +49,7 @@ GENERATION_DEFAULT_MODEL_NAME = "xlm-roberta-base"
 GENERATION_DEFAULT_XYZ_WEIGHT = 0.1
 GENERATION_DEFAULT_XYZ_SCHEDULE = "none"
 GENERATION_DEFAULT_VEL_XYZ_WEIGHT = 0.01
+GENERATION_DEFAULT_VEL_XYZ_SCHEDULE = "none"
 GENERATION_DEFAULT_DIFFUSION_WEIGHT = 1.0
 GENERATION_DEFAULT_ACCELERATION_WEIGHT = 0.0
 GENERATION_DEFAULT_CLIP_GUIDANCE_WEIGHT = 0.0
@@ -426,6 +427,12 @@ def loadGenerationConfig(
         "vel-xyz-weight",
         GENERATION_DEFAULT_VEL_XYZ_WEIGHT,
     )
+    velXyzSchedule = str(
+        trainingSection.get(
+            "vel-xyz-weight-schedule",
+            GENERATION_DEFAULT_VEL_XYZ_SCHEDULE,
+        ),
+    )
     diffusionWeight = _float(
         trainingSection,
         "diffusion-weight",
@@ -524,10 +531,12 @@ def loadGenerationConfig(
         xyzWeight=xyzWeight,
         xyzWeightSchedule=xyzSchedule,
         velXyzWeight=velXyzWeight,
+        velXyzWeightSchedule=velXyzSchedule,
         diffusionWeight=diffusionWeight,
         accelerationWeight=accelerationWeight,
         clipGuidanceWeight=clipGuidanceWeight,
         footSkatingWeight=footSkatingWeight,
+        minSnrGamma=_float(trainingSection, "min-snr-gamma", 5.0),
     )
 
     return GenerationTrainingConfig(

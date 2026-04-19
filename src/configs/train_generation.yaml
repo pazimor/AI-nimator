@@ -25,10 +25,17 @@ training:
   MM-memory-limit-gb: 20.0
   resume-checkpoint: output/generation/best_model.pt
 
-  learning-rate: 0.00001
+  learning-rate: 0.0001
+  # Min-SNR gamma: reweights high-t diffusion steps to give more gradient
+  # signal to low-t steps where x0 predictions are reliable.  5.0 is the
+  # standard value from the Min-SNR paper.  Disabled (0.0) for overfit only.
+  min-snr-gamma: 5.0
   xyz-weight: 2.0
   xyz-weight-schedule: timestep
   vel-xyz-weight: 1.0
+  # Timestep schedule: decays vel-xyz weight to ~0 at high-t to prevent
+  # FK-of-noise gradients from destabilising the diffusion backbone.
+  vel-xyz-weight-schedule: timestep
   diffusion-weight: 1.0
   acceleration-weight: 0.02
   clip-guidance-weight: 0.1
@@ -50,8 +57,8 @@ overfit:
   model-name: xlm-roberta-base
   validation-split: 0.0
   early-stopping-patience: 30
-  batch-size: 4
-  gradient-accumulation: 1
+  batch-size: 16
+  gradient-accumulation: 2
   max-samples-per-epoch: 10000
 
   # overfit: fixed count ("16") or 1-based inclusive range ("3:6")
@@ -64,16 +71,40 @@ overfit:
   # pose" even on a one-sample overfit run.
   deterministic-corruption: true
   disable-dropout: true
+  # juste avant ou après learning-rate:
+  min-snr-gamma: 0.0
 
   MM-memory-limit-gb: 20.0
   # Overfit debugging should start from scratch to keep the loss curve
   # interpretable when the objective or enabled features change.
-  resume-checkpoint: output/generation/best_model.pt
+  # Commented out for fresh start after the DenoiserBlock structural fix
+  # (removal of destructive post-block AdaLN) — the previous checkpoint was
+  # trained with the broken architecture, and resuming would make the loss
+  # curve uninterpretable.  Re-enable once the new topology has converged.
+  # resume-checkpoint: output/generation/best_model.pt
 
-  learning-rate: 0.00001
+  # Min-SNR weighting: set to 0.0 to disable for overfit (no benefit when
+  # training on a single sample — all timestep gradients should be equal).
+  min-snr-gamma: 0.0
+
+  # 1e-4 is standard MDM overfitting LR.  1e-5 was too slow — the model
+  # needs ~125k steps to memorise 1 sample across 1000 timesteps, and a
+  # low LR can't fit that many steps in a reasonable wall-clock.
+  learning-rate: 0.0001
   xyz-weight: 1.0
   xyz-weight-schedule: timestep
-  vel-xyz-weight: 1.0
+  # vel-xyz loss: penalizes ||Δpred_xyz - Δtarget_xyz||² in joint space.
+  # This breaks the temporal-variance floor (~0.4) where the model outputs a
+  # constant-frame temporal mean — the velocity loss is non-zero even at the
+  # MSE floor because target frames are not constant.
+  # MUST use "timestep" schedule: at high-t the model can't recover x0 from
+  # noise, so FK(x0_pred) produces random joints and random velocity gradients
+  # that destabilize training. The schedule decays vel-xyz weight to ~0 at
+  # high-t and applies full weight only at low-t where x0 predictions are
+  # reliable. Base diffusion loss is already converged at ~0.4, so enabling
+  # vel-xyz now will push the model to reproduce per-frame variation.
+  vel-xyz-weight: 0.5
+  vel-xyz-weight-schedule: timestep
   diffusion-weight: 1.0
   acceleration-weight: 0.0
   clip-guidance-weight: 0.0

@@ -11,6 +11,7 @@ from src.features.generation.generate_animation import (
     createAnimationFromCheckpoint,
     loadInferenceSettings,
 )
+from src.shared import diagnostics as diag
 from src.shared.types import (
     GenerationInferenceConfig,
     GenerationModelSettings,
@@ -275,6 +276,16 @@ def addSamplingArguments(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_DDIM_STEPS,
         help="Number of DDIM steps used for sampling.",
     )
+    parser.add_argument(
+        "--diag-dir",
+        dest="diagDir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory where a JSONL diagnostics file will be written. "
+            "Falls back to AI_NIMATOR_DIAG_DIR env var when omitted."
+        ),
+    )
 
 
 def resolveOutputPaths(outputPath: Path) -> tuple[Path, Path]:
@@ -531,6 +542,10 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
     parser = buildArgumentParser()
     arguments = parser.parse_args()
+    if arguments.diagDir is not None:
+        diag.init(arguments.diagDir, tag="generate")
+    else:
+        diag.init_from_env(tag="generate")
     try:
         runGeneration(arguments, parser)
     except Exception as error:  # noqa: BLE001

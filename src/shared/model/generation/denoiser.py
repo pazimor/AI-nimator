@@ -144,7 +144,10 @@ class DenoiserBlock(nn.Module):
         torch.Tensor
             Output tensor shaped (batch_size, seq_len, embedDim).
         """
-        # Self-attention with residual + FiLM conditioning
+        # Self-attention with residual + FiLM conditioning.
+        # FiLM applies ``x * (1 + gamma) + beta`` which is residual-safe at
+        # zero-init (gamma=0, beta=0 -> identity), so the attention residual
+        # keeps its magnitude.
         h = self.norm1(x)
         h, _ = self.attention(
             h, h, h, key_padding_mask=mask, need_weights=False,
@@ -152,9 +155,23 @@ class DenoiserBlock(nn.Module):
         h = x + self.dropout(h)
         h = self.filmCondition(h, cond)
 
-        # Feed-forward with residual + AdaLN conditioning
+        # Feed-forward residual with pre-LayerNorm.
         h = h + self.dropout(self.ffn(self.norm2(h)))
-        h = self.adalnCondition(h, cond)
+
+        # IMPORTANT: the AdaLN module is intentionally NOT applied here.
+        # AdaLN returns ``layernorm(h) * (1 + gamma) + beta`` which, applied
+        # as the final op of the block, *replaces* h with its normalised
+        # version and **breaks the residual chain** — the per-frame magnitude
+        # carried by ``x`` is erased at every block, stacking to a total
+        # collapse over ``numLayers`` blocks.  The zero-init of DiT's
+        # AdaLN-Zero is meant to be *inside* a residual (``x + scale * f(x)``
+        # with ``scale`` zero-init), not to replace the block output.
+        # Removing this line restores gradient flow from output all the way
+        # back to ``noisyMotion`` and lets the transformer produce per-frame
+        # variation.  The AdaLN module is kept in ``__init__`` for checkpoint
+        # compatibility; its weights remain at zero when loaded fresh and are
+        # ignored when resuming from checkpoints trained before this fix.
+        # h = self.adalnCondition(h, cond)  # structural bug — see comment
 
         return h
 class SpatioTemporalMixBlock(nn.Module):
@@ -315,6 +332,24 @@ class MotionDenoiser(nn.Module):
         self.outputNorm = nn.LayerNorm(embedDim)
         self.outputProj = nn.Linear(embedDim, outputDim)
 
+        # Per-frame residual skip from the pre-transformer motion embedding
+        # straight to the output.  When self-attention collapses to a
+        # mean-pose representation, this path preserves the per-frame
+        # structure that was present in ``motionH`` before the blocks.
+        #
+        # Previously zero-initialised so a resumed checkpoint kept its old
+        # behaviour — but that means a FRESH run has *no* live path from
+        # ``noisyMotion`` to ``output`` until the zero-init weights pick up
+        # a gradient, which for an overfit run delays learning by thousands
+        # of steps and lets the transformer collapse to a mean pose before
+        # the skip ever becomes useful.  A small Xavier init gives a
+        # non-trivial (but still small enough to not dominate) per-frame
+        # path from step 0.  Resumed checkpoints override this init via
+        # ``load_state_dict``, so production runs keep their trained skip.
+        self.motionSkipProj = nn.Linear(embedDim, outputDim)
+        nn.init.xavier_uniform_(self.motionSkipProj.weight, gain=1e-2)
+        nn.init.zeros_(self.motionSkipProj.bias)
+
     def forward(
         self,
         noisyMotion: torch.Tensor,
@@ -374,7 +409,20 @@ class MotionDenoiser(nn.Module):
 
         # Build conditioning token: timestep + text (MDM-style prepend).
         condToken = self.timestepEmbed(timesteps) + textH  # (batch, embedDim)
-        cond = condToken  # per-layer FiLM/AdaLN conditioning
+
+        # Build PER-FRAME conditioning for FiLM/AdaLN.  Previously the same
+        # ``cond`` vector was broadcast to every token, so every frame
+        # received identical gamma/beta and the only way to produce
+        # per-frame variation was via self-attention on PE.  On a
+        # pure-transformer overfit run (no spatial/spatio-temporal
+        # blocks) that collapses to a mean-pose output.  By adding the
+        # sinusoidal PE to the conditioning path itself we give each
+        # frame its own modulation; FiLM/AdaLN already broadcast over
+        # any leading dims, so a (B, 1+F, embedDim) cond works as-is and
+        # stays backward-compatible with resumed checkpoints.
+        framePE = self.sequencePosEncoder.pe[:, :frames, :].to(h.dtype)
+        condFrames = condToken.unsqueeze(1) + framePE  # (batch, frames, embedDim)
+        condSeq = torch.cat([condToken.unsqueeze(1), condFrames], dim=1)  # (B, 1+F, embedDim)
 
         # Prepend conditioning token to the sequence (MDM-style).
         xseq = torch.cat([condToken.unsqueeze(1), h], dim=1)  # (batch, 1+frames, embedDim)
@@ -388,14 +436,17 @@ class MotionDenoiser(nn.Module):
 
         # Apply denoising blocks
         for block in self.blocks:
-            xseq = block(xseq, cond, mask)
+            xseq = block(xseq, condSeq, mask)
 
         # Remove the conditioning token from the output.
         h = xseq[:, 1:]
 
-        # Output projection
+        # Output projection.  The motionSkip path is zero-initialised and
+        # feeds the pre-transformer motion embedding directly into the
+        # output so per-frame structure is preserved even when the
+        # attention output is temporally flat.
         h = self.outputNorm(h)
-        output = self.outputProj(h)
+        output = self.outputProj(h) + self.motionSkipProj(motionH)
 
         # Split into bone and global predictions.
         boneFlatDim = bones * self.motionChannels

@@ -8,12 +8,14 @@ from typing import Mapping, Optional
 import torch
 import torch.nn as nn
 
+from src.shared import diagnostics as diag
 from src.shared.model.clip.core import ClipModel
 from src.shared.model.components.base import MotionComponent, SCOPE_BONE, SCOPE_GLOBAL
 from src.shared.model.components.registry import computeFeatureLayout
 from src.shared.model.generation.ddim import DDIM
 from src.shared.model.generation.denoiser import MotionDenoiser
 from src.shared.model.generation.losses import (
+    DEFAULT_VEL_XYZ_SCHEDULE,
     DEFAULT_VELOCITY_XYZ_WEIGHT,
     DEFAULT_XYZ_WEIGHT,
     XYZ_SCHEDULE_NONE,
@@ -50,11 +52,13 @@ class MotionGenerator(nn.Module):
         xyzWeight: float = DEFAULT_XYZ_WEIGHT,
         xyzWeightSchedule: str = XYZ_SCHEDULE_NONE,
         velXyzWeight: float = DEFAULT_VELOCITY_XYZ_WEIGHT,
+        velXyzWeightSchedule: str = DEFAULT_VEL_XYZ_SCHEDULE,
         diffusionWeight: float = 1.0,
         accelerationWeight: float = 0.0,
         clipGuidanceWeight: float = 0.0,
         footSkatingWeight: float = 0.0,
         condMaskProb: float = 0.1,
+        minSnrGamma: float = 5.0,
         numSpatialLayers: int = 1,
         numSpatioTemporalLayers: int = 1,
         maxPromptLength: int = 64,
@@ -77,6 +81,7 @@ class MotionGenerator(nn.Module):
         self.xyzWeight = xyzWeight
         self.xyzWeightSchedule = xyzWeightSchedule
         self.velXyzWeight = velXyzWeight
+        self.velXyzWeightSchedule = velXyzWeightSchedule
         self.diffusionWeight = diffusionWeight
         self.accelerationWeight = accelerationWeight
         self.clipGuidanceWeight = clipGuidanceWeight
@@ -86,6 +91,10 @@ class MotionGenerator(nn.Module):
         # diffusion loss has converged to reasonable motion.
         self.footSkatingWeight = float(footSkatingWeight)
         self.condMaskProb = condMaskProb
+        # Min-SNR gamma down-weights high-t x0-MSE samples that otherwise
+        # dominate the gradient and pull predictions toward a temporally
+        # flat mean pose.  See Hang et al. 2023.  Set to 0 to disable.
+        self.minSnrGamma = float(minSnrGamma)
         self.maxPromptLength = max(1, int(maxPromptLength))
         self.generationMotionComponents = tuple(generationMotionComponents or ())
 
@@ -278,8 +287,20 @@ class MotionGenerator(nn.Module):
         if targetMotion is not None:
             from src.shared.model.generation.losses import (
                 combinedGenerationLoss,
+                minSnrLossWeights,
                 startMotionLoss,
             )
+
+            # Compute per-sample Min-SNR weights once; they apply to every
+            # x0-MSE term below so all diffusion objectives share the same
+            # timestep reweighting.
+            perSampleWeights: Optional[torch.Tensor] = None
+            if self.minSnrGamma > 0.0 and timesteps is not None:
+                perSampleWeights = minSnrLossWeights(
+                    timesteps=timesteps,
+                    alphasCumprod=self.ddim.alphas_cumprod,
+                    gamma=self.minSnrGamma,
+                )
 
             # Extract rotation6d for FK-based losses if available.
             rot6dPredicted = self._extractRotation6d(predictedBoneMotion)
@@ -304,12 +325,14 @@ class MotionGenerator(nn.Module):
                 xyzWeight=self.xyzWeight if self._hasRotation6d else 0.0,
                 xyzWeightSchedule=self.xyzWeightSchedule,
                 velocityXyzWeight=self.velXyzWeight if self._hasRotation6d else 0.0,
+                velXyzWeightSchedule=self.velXyzWeightSchedule,
                 accelerationWeight=self.accelerationWeight,
                 timesteps=timesteps,
                 numTimesteps=self.ddim.num_timesteps,
                 motionMask=motionMask,
                 footContact=footContact,
                 footSkatingWeight=self.footSkatingWeight,
+                perSampleWeights=perSampleWeights,
             )
 
             # Component losses on bone features (excluding rotation6d
@@ -346,6 +369,7 @@ class MotionGenerator(nn.Module):
                 normalizedBoneTarget = self.normalizeMotion(targetMotion)
                 fullBoneDiffusion = startMotionLoss(
                     normalizedBonePred, normalizedBoneTarget, motionMask,
+                    perSampleWeights=perSampleWeights,
                 )
                 loss = loss + self.diffusionWeight * fullBoneDiffusion
                 result["loss_bone_diffusion"] = fullBoneDiffusion.detach()
@@ -363,6 +387,7 @@ class MotionGenerator(nn.Module):
                 )
                 globalDiffusion = startMotionLoss(
                     normalizedGlobalPred, normalizedGlobalTarget, motionMask,
+                    perSampleWeights=perSampleWeights,
                 )
                 loss = loss + self.diffusionWeight * globalDiffusion
                 result["loss_global_diffusion"] = globalDiffusion.detach()
@@ -449,6 +474,9 @@ class MotionGenerator(nn.Module):
             torch.zeros_like(textEmbeds) if cfgScale > 1.0 else None
         )
 
+        diagActive = diag.get_logger() is not None
+        generationId = f"gen_{int(torch.randint(0, 1_000_000, (1,)).item())}"
+
         for i, t in enumerate(timestepSequence):
             tBatch = torch.full((1,), t, device=device, dtype=torch.long)
             # Conditional pass
@@ -490,6 +518,21 @@ class MotionGenerator(nn.Module):
                 guidedBoneX0 = condBoneX0
                 guidedGlobalX0 = condGlobalX0
 
+            if diagActive:
+                uncondForLog = (
+                    condBoneX0 if nullTextEmbeds is None else uncondBoneX0
+                )
+                diag.logDdimStep(
+                    generationId=generationId,
+                    stepIdx=i,
+                    timestep=int(t),
+                    xBone=xBone,
+                    condX0=condBoneX0,
+                    uncondX0=uncondForLog,
+                    guidedX0=guidedBoneX0,
+                    cfgScale=cfgScale,
+                )
+
             # DDIM step for bone features.
             guidedBoneNoise = self.ddim.predict_noise_from_start(
                 xBone, tBatch, guidedBoneX0,
@@ -528,6 +571,16 @@ class MotionGenerator(nn.Module):
         rootTranslation = self._extractGlobalComponent(xGlobal, "root_translation")
         if rootTranslation is not None:
             sample["root_translation"] = rootTranslation
+
+        if diagActive:
+            diag.logGenerationSummary(
+                generationId=generationId,
+                prompt=prompt,
+                numFrames=numFrames,
+                ddimSteps=resolvedSteps,
+                cfgScale=cfgScale,
+                motionQuat=sample.get("motion_quat"),
+            )
 
         return sample
 

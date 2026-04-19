@@ -484,9 +484,25 @@ class DatasetManager:
                 f"{startPos}:{endPos} exceeds active dataset size "
                 f"({totalSize} samples)."
             )
-        self._fixedSampleIndices = activeIndices[startPos - 1:endPos]
+        selected = activeIndices[startPos - 1:endPos]
+        uniqueCount = len(selected)
+
+        # When only a handful of samples are selected (typical overfit use-case
+        # with a single sample), the DataLoader would produce at most
+        # ``uniqueCount`` batches per epoch -- far too few gradient steps to
+        # memorise the target.  Repeat the selected indices so the epoch fills
+        # up to ``_getMaxSamples()`` entries.  Each repeated copy still
+        # receives different noise/timestep because deterministic corruption
+        # is seeded by (sampleId × stepCounter), so this is NOT redundant.
+        targetN = max(self._getMaxSamples(), self.batchSize or 1)
+        if uniqueCount > 0 and targetN > uniqueCount:
+            repeats = math.ceil(targetN / uniqueCount)
+            selected = (selected * repeats)[:targetN]
+
+        self._fixedSampleIndices = selected
         self._fixedSampleChunkInfo = (
-            f"samples {startPos}-{endPos}/{totalSize}"
+            f"samples {startPos}-{endPos}/{totalSize} "
+            f"(repeated {len(selected)}×)"
         )
         return self._fixedSampleIndices, self._fixedSampleChunkInfo
 

@@ -17,7 +17,74 @@ DEFAULT_VELOCITY_XYZ_WEIGHT = 0.01
 DEFAULT_ACCELERATION_WEIGHT = 0.001
 XYZ_SCHEDULE_NONE = "none"
 XYZ_SCHEDULE_TIMESTEP = "timestep"
+DEFAULT_VEL_XYZ_SCHEDULE = XYZ_SCHEDULE_NONE
 MIN_DIFFUSION_STEPS = 1
+# Default Min-SNR gamma from Hang et al. 2023 ("Efficient Diffusion Training
+# via Min-SNR Weighting Strategy").  gamma=5 gives high-t samples a weight
+# of ~5*SNR(t) instead of 1.0, so they no longer dominate the gradient and
+# pull the x0 predictor toward a mean-pose output.  Set to 0 to disable.
+DEFAULT_MIN_SNR_GAMMA = 5.0
+
+
+def minSnrLossWeights(
+    timesteps: torch.Tensor,
+    alphasCumprod: torch.Tensor,
+    gamma: float = DEFAULT_MIN_SNR_GAMMA,
+) -> torch.Tensor:
+    """Compute per-sample Min-SNR loss weights for x0-prediction training.
+
+    For x0 parametrisation the appropriate weight is ``min(SNR(t), gamma) /
+    SNR(t)``.  At low t (high SNR) the weight is ~gamma/SNR (down-weighted)
+    and at high t (low SNR) the weight saturates at 1.0 -- the opposite of
+    vanilla MSE, which over-weights the easy-to-reconstruct low-t samples
+    and at the same time lets the impossible-to-recover high-t samples
+    collapse the model toward the dataset mean.
+
+    Parameters
+    ----------
+    timesteps : torch.Tensor
+        Diffusion timesteps shaped (batch,).
+    alphasCumprod : torch.Tensor
+        Cumulative product of alphas from the DDIM scheduler.
+    gamma : float, optional
+        SNR clipping threshold, by default :data:`DEFAULT_MIN_SNR_GAMMA`.
+
+    Returns
+    -------
+    torch.Tensor
+        Per-sample loss weights shaped (batch,).
+    """
+    if gamma <= 0.0:
+        return torch.ones_like(timesteps, dtype=torch.float32)
+
+    alphasCumprod = alphasCumprod.to(device=timesteps.device)
+    alphaT = alphasCumprod.gather(0, timesteps.long())
+    snr = alphaT / torch.clamp(1.0 - alphaT, min=1e-8)
+    gammaTensor = torch.full_like(snr, float(gamma))
+    return torch.minimum(snr, gammaTensor) / torch.clamp(snr, min=1e-8)
+
+
+def _perSampleMse(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    motionMask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Mean-squared error reduced to one scalar per batch item.
+
+    Leaves a shape-(batch,) tensor that can be multiplied by Min-SNR
+    weights before the final batch average.
+    """
+    squaredError = (predicted - target) ** 2
+    if motionMask is not None:
+        # motionMask shape: (batch, frames) -> broadcast over trailing dims.
+        expandMask = motionMask
+        while expandMask.dim() < squaredError.dim():
+            expandMask = expandMask.unsqueeze(-1)
+        expandMask = expandMask.float()
+        numerator = (squaredError * expandMask).flatten(1).sum(dim=1)
+        denom = expandMask.expand_as(squaredError).flatten(1).sum(dim=1)
+        return numerator / torch.clamp(denom, min=1.0)
+    return squaredError.flatten(1).mean(dim=1)
 
 
 def diffusionLoss(
@@ -50,6 +117,7 @@ def startMotionLoss(
     predictedMotion: torch.Tensor,
     targetMotion: torch.Tensor,
     motionMask: torch.Tensor | None = None,
+    perSampleWeights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Direct MSE on predicted clean motion x0 (MDM-style target).
@@ -62,14 +130,23 @@ def startMotionLoss(
         Ground truth clean motion shaped (batch, frames, bones, 6).
     motionMask : torch.Tensor | None, optional
         Boolean mask indicating valid (non-padded) frames.
+    perSampleWeights : torch.Tensor | None, optional
+        Shape-(batch,) per-sample multiplier applied before averaging --
+        used by Min-SNR weighting to de-emphasise high-t samples that
+        otherwise collapse x0 predictions to a mean pose.
 
     Returns
     -------
     torch.Tensor
         Scalar masked MSE in raw motion space.
     """
-    squaredError = (predictedMotion - targetMotion) ** 2
-    return maskedMean(squaredError, motionMask)
+    if perSampleWeights is None:
+        squaredError = (predictedMotion - targetMotion) ** 2
+        return maskedMean(squaredError, motionMask)
+
+    perSampleLoss = _perSampleMse(predictedMotion, targetMotion, motionMask)
+    weights = perSampleWeights.to(perSampleLoss.dtype).to(perSampleLoss.device)
+    return (perSampleLoss * weights).mean()
 
 
 def xyzLoss(
@@ -270,11 +347,13 @@ def combinedGenerationLoss(
     velocityXyzWeight: float | None = None,
     accelerationWeight: float = DEFAULT_ACCELERATION_WEIGHT,
     xyzWeightSchedule: str = XYZ_SCHEDULE_NONE,
+    velXyzWeightSchedule: str = DEFAULT_VEL_XYZ_SCHEDULE,
     timesteps: torch.Tensor | None = None,
     numTimesteps: int | None = None,
     motionMask: torch.Tensor | None = None,
     footContact: torch.Tensor | None = None,
     footSkatingWeight: float = DEFAULT_FOOT_SKATING_WEIGHT,
+    perSampleWeights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
     Combined loss for motion generation training.
@@ -298,6 +377,12 @@ def combinedGenerationLoss(
         Weight for acceleration loss, by default 0.001.
     xyzWeightSchedule : str, optional
         Schedule mode for XYZ weight, by default "none".
+    velXyzWeightSchedule : str, optional
+        Schedule mode for velocity XYZ weight, by default "none".
+        Using "timestep" gates the velocity loss to low-t where x0
+        predictions are reliable — critical to avoid noisy FK-of-noise
+        gradients at high diffusion timesteps pulling the model toward a
+        temporally flat mean pose.
     timesteps : torch.Tensor | None, optional
         Diffusion timesteps for schedule-aware weighting.
     numTimesteps : int | None, optional
@@ -314,6 +399,7 @@ def combinedGenerationLoss(
         predictedMotion,
         targetMotion,
         motionMask=motionMask,
+        perSampleWeights=perSampleWeights,
     )
     lossXyz = xyzLoss(
         predictedMotion,
@@ -332,12 +418,26 @@ def combinedGenerationLoss(
         if velocityXyzWeight is None
         else velocityXyzWeight
     )
-    lossVel = velocityXyzLoss(
+    # Apply timestep schedule to velocity XYZ weight.  When velXyzWeightSchedule
+    # is "timestep" the weight scales as (1 - t/T), decaying to ~0 at high
+    # diffusion timesteps.  This prevents FK-of-noise from generating chaotic
+    # velocity gradients at high-t that would otherwise compete with the
+    # diffusion MSE and push the denoiser toward a temporally flat mean pose.
+    resolvedVelXyzWeightTensor = _resolveXyzWeight(
+        resolvedVelocityXyzWeight,
+        velXyzWeightSchedule,
+        timesteps,
+        numTimesteps,
+        predictedMotion.device,
+    )
+    # Compute base velocity loss (unit-weighted) then scale by resolved tensor.
+    lossVelBase = velocityXyzLoss(
         predictedMotion,
         targetMotion,
-        resolvedVelocityXyzWeight,
+        weight=1.0,
         motionMask=motionMask,
     )
+    lossVel = resolvedVelXyzWeightTensor * lossVelBase
     lossAcc = accelerationLoss(
         predictedMotion,
         accelerationWeight,

@@ -116,10 +116,12 @@ class GenerationTrainingHyperparameters:
     xyzWeight: float = 0.1
     xyzWeightSchedule: str = "none"
     velXyzWeight: float = 0.01
+    velXyzWeightSchedule: str = "none"
     diffusionWeight: float = 1.0
     accelerationWeight: float = 0.0
     clipGuidanceWeight: float = 0.0
     footSkatingWeight: float = 0.0
+    minSnrGamma: float = 5.0
 
 
 @dataclass(frozen=True)

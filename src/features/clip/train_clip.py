@@ -11,6 +11,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from src.shared.constants.clip import DEFAULT_LEARNING_RATE
+from src.shared.checkpoint_io import saveTorchObjectAtomically
 from src.shared.model.clip.core import ClipModel
 from src.shared.progress import TrainingProgressBar
 
@@ -621,9 +622,8 @@ def saveCheckpoint(
     Path
         Path to the saved checkpoint.
     """
-    checkpointDir.mkdir(parents=True, exist_ok=True)
     checkpointPath = checkpointDir / filename
-    torch.save(
+    saveTorchObjectAtomically(
         {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),

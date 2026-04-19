@@ -233,12 +233,22 @@ class AnimationRebuilder:
             version="1.4.1",
         )
         
-        # Asset metadata
+        # Asset metadata.  We embed the source frame rate in a Blender
+        # "extra" block so the importer can set the scene fps to match the
+        # keyframe cadence.  Collada has no global fps field -- timestamps
+        # are absolute seconds -- but without this hint Blender falls back
+        # to the default scene fps (24) and plays the animation at
+        # scene_fps / source_fps of real-time speed.
         asset = ET.SubElement(root, "asset")
         ET.SubElement(asset, "created").text = "2023-01-01T00:00:00"
         ET.SubElement(asset, "modified").text = "2023-01-01T00:00:00"
         unit = ET.SubElement(asset, "unit", name="meter", meter="1")
         ET.SubElement(asset, "up_axis").text = "Z_UP"
+        assetExtra = ET.SubElement(asset, "extra")
+        assetTechnique = ET.SubElement(
+            assetExtra, "technique", profile="blender",
+        )
+        ET.SubElement(assetTechnique, "frame_rate").text = str(int(sample.fps))
 
         # Library Visual Scenes
         lib_scenes = ET.SubElement(root, "library_visual_scenes")
