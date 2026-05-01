@@ -21,7 +21,6 @@ training:
   early-stopping-patience: 100
   batch-size: 32
   gradient-accumulation: 1
-  MM-memory-limit-gb: 20.0
   weight-decay: 0.01
   resume-checkpoint: ../../output/clip/best_model.pt
   
@@ -40,7 +39,6 @@ overfit:
   early-stopping-patience: 100
   batch-size: 4
   gradient-accumulation: 1
-  MM-memory-limit-gb: 20.0
   weight-decay: 0.0
   max-samples-per-epoch: 10000
   fixed-train-chunk: true

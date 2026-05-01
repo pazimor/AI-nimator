@@ -34,12 +34,18 @@ default:
       pelvis-height: false
 
   generation:
-    embed-dim: 768
-    num-heads: 4
-    num-layers: 4
+    # Shrink to reduce params/sample ratio (~196M / 1482 samples was
+    # ~132k params/sample, encouraging per-sample memorisation).  Going
+    # 768→512 + 6→4 layers drops params roughly to ~60-70M (~45k/sample),
+    # which lets the denoiser commit capacity to the rot6d signal rather
+    # than the trajectory.  Top-level embed-dim stays 768 so the existing
+    # CLIP checkpoint still loads unchanged.
+    embed-dim: 512
+    num-heads: 8
+    num-layers: 6
     num-bones: 22
     diffusion-steps: 1000
-    num-spatial-layers: 4
+    num-spatial-layers: 2
     num-spatio-temporal-layers: 4
 
     bone-data:
@@ -47,13 +53,30 @@ default:
       foot-contact: true
       hand-contact: false
       root-translation: true
-      root-velocity: true
+      # root-velocity DISABLED (Option B fresh-start).  We previously
+      # enabled it to add a Δrtrans signal but the pytorch-auditor on the
+      # 144-epoch best_model.pt revealed that the rvel channels have
+      # std ≈ 2 mm/frame in raw space (ch7=0.006, ch8=0.006, ch9=0.002).
+      # After Z-normalization the diffusion noise N(0,1) added to the
+      # forward process completely overwhelms the actual rvel signal
+      # (post-norm SNR ≈ 1) — the denoiser learns to predict ≈ 0 in
+      # normalized space, so dequantization × 0.002 ≈ 0 in raw space.
+      # The aux loss `loss_root_velocity` is dead (rvel=0.0000 in logs),
+      # AND 30% of `loss_global_diffusion` becomes pure noise,
+      # contaminating the 7 useful channels.  Keep disabled until we
+      # implement per-component normalization (e.g. amplitude-scale rvel
+      # by 100× before z-norm so post-norm std ≈ 0.5 — out of scope here).
+      root-velocity: false
       root-yaw: false
       root-yaw-velocity: false
       joint-xyz: true
-      joint-velocity: true
-      end-effector-velocity: true
+      joint-velocity: false
+      end-effector-velocity: false
       pelvis-height: false
+      # foot_contact uses BCE loss on raw (non-normalized) values.
+      # FootContactComponent has skipNormalization=True, so global stats
+      # are forced to mean=0/std=1 and the denoiser predicts logits.
+      # Sigmoid is applied at inference time.
 
 # ============================================
 # Profile: Overfit

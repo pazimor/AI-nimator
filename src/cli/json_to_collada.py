@@ -67,10 +67,22 @@ def buildArgumentParser() -> argparse.ArgumentParser:
         action="store_true",
         help="Force pelvis translation to zero for all frames.",
     )
-    parser.add_argument(
+    # Default to anchoring: training targets are anchored, so generated
+    # JSON already encodes motion relative to origin.  Pass
+    # --no_anchor_root_translation to opt out for legacy inputs.
+    anchorGroup = parser.add_mutually_exclusive_group()
+    anchorGroup.add_argument(
         "--anchor_root_translation",
+        dest="anchor_root_translation",
         action="store_true",
-        help="Recenter pelvis translation by subtracting the first frame.",
+        default=True,
+        help="Recenter pelvis translation by subtracting the first frame (default).",
+    )
+    anchorGroup.add_argument(
+        "--no_anchor_root_translation",
+        dest="anchor_root_translation",
+        action="store_false",
+        help="Disable anchoring (legacy behaviour).",
     )
     return parser
 

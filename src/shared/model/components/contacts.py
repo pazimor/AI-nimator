@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 from src.shared.model.components.base import (
     MotionComponent,
@@ -16,18 +17,19 @@ class FootContactComponent(MotionComponent):
     """
     MDM-style foot contact labels (4 channels: 2 left-foot + 2 right-foot).
 
-    Loss is MSE, not BCE-with-logits.  Foot-contact channels travel through
-    the shared z-normalization / diffusion pipeline alongside every other
-    global feature: targets are scaled by (x - mean) / std before the
-    denoiser sees them, and predictions are denormalized on the way out.
-    BCE-with-logits would interpret the denormalized prediction as a
-    *logit*, but the denoiser outputs are bounded by the learned
-    distribution of normalized targets and cannot reach the ±∞ needed for
-    sigmoid(logit) to hit 0 or 1 -- even on a single-sample overfit.  The
-    result was a hard floor around 0.31 on ``loss_foot_contact`` that
-    pinned aux and masked convergence of the rest of the auxiliary
-    components.  MSE keeps the loss in the same space as every other
-    global component and converges to 0 cleanly in overfit.
+    Loss is **BCE-with-logits** on raw (non-z-normalized) predictions.
+    Foot-contact channels are **excluded from z-normalization** in
+    ``computeGlobalStatistics`` so the denoiser predicts logits directly
+    and the target remains binary {0, 1}.
+
+    History: the original implementation used MSE on z-normalized values,
+    but with mean=0.997 and std=0.05-0.07 the z-norm produced a bimodal
+    distribution {+0.14, -14} that caused gradient spikes at lift-off and
+    contaminated ``glob_d``.  BCE treats the signal as what it is — a
+    binary indicator — and avoids the pathological z-norm distribution.
+
+    At inference, the 4 foot-contact channels are passed through sigmoid
+    to recover probabilities.
     """
 
     descriptor = MotionComponentDescriptor(
@@ -40,14 +42,20 @@ class FootContactComponent(MotionComponent):
         description="MDM-style foot contact labels (4 channels).",
     )
 
+    # Mark this component as requiring raw (non-normalized) targets.
+    skipNormalization: bool = True
+
     def loss(
         self,
         predicted: torch.Tensor,
         target: torch.Tensor,
         motionMask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """MSE loss on denormalized predictions vs binary 0/1 targets."""
-        return maskedMean((predicted - target).pow(2), motionMask)
+        """BCE-with-logits loss: predicted=logits, target=binary {0,1}."""
+        bce = F.binary_cross_entropy_with_logits(
+            predicted, target, reduction="none",
+        )
+        return maskedMean(bce, motionMask)
 
 
 class HandContactComponent(MotionComponent):

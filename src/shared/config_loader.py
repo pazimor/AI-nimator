@@ -315,7 +315,6 @@ def loadTrainingConfig(
             label="resume-checkpoint",
         ),
         gradientAccumulation=_int(trainingSection, "gradient-accumulation", 1),
-        MM_memoryLimitGB=_float(trainingSection, "MM-memory-limit-gb", 0.0),
         weightDecay=_float(trainingSection, "weight-decay", 0.0),
         maxSamplesPerEpoch=_optionalInt(
             trainingSection,
@@ -422,6 +421,46 @@ def loadGenerationConfig(
             GENERATION_DEFAULT_XYZ_SCHEDULE,
         ),
     )
+    rootTranslationWeight = _float(
+        trainingSection,
+        "root-translation-weight",
+        1.0,
+    )
+    jointXyzWeight = _float(
+        trainingSection,
+        "joint-xyz-weight",
+        1.0,
+    )
+    pelvisHeightWeight = _float(
+        trainingSection,
+        "pelvis-height-weight",
+        1.0,
+    )
+    condMaskProb = _float(
+        trainingSection,
+        "cond-mask-prob",
+        0.1,
+    )
+    weightDecay = _float(
+        trainingSection,
+        "weight-decay",
+        0.0,
+    )
+    emaEnabled = _bool(
+        trainingSection,
+        "ema-enabled",
+        False,
+    )
+    emaDecay = _float(
+        trainingSection,
+        "ema-decay",
+        0.9999,
+    )
+    emaWarmup = _bool(
+        trainingSection,
+        "ema-warmup",
+        True,
+    )
     velXyzWeight = _float(
         trainingSection,
         "vel-xyz-weight",
@@ -492,7 +531,6 @@ def loadGenerationConfig(
             strict=False,
             label="resume-checkpoint",
         ),
-        MM_memoryLimitGB=_float(trainingSection, "MM-memory-limit-gb", 0.0),
         gradientAccumulation=_int(trainingSection, "gradient-accumulation", 1),
         maxSamplesPerEpoch=_optionalInt(
             trainingSection,
@@ -528,8 +566,20 @@ def loadGenerationConfig(
             "learning-rate",
             GENERATION_DEFAULT_LEARNING_RATE,
         ),
+        lrSchedule=str(trainingSection.get("lr-schedule", "constant")),
+        lrMin=_float(trainingSection, "lr-min", 1e-7),
+        lrWarmupEpochs=_int(trainingSection, "lr-warmup-epochs", 0),
+        lrDecayEpochs=_optionalInt(trainingSection, "lr-decay-epochs"),
         xyzWeight=xyzWeight,
         xyzWeightSchedule=xyzSchedule,
+        rootTranslationWeight=rootTranslationWeight,
+        jointXyzWeight=jointXyzWeight,
+        pelvisHeightWeight=pelvisHeightWeight,
+        condMaskProb=condMaskProb,
+        weightDecay=weightDecay,
+        emaEnabled=emaEnabled,
+        emaDecay=emaDecay,
+        emaWarmup=emaWarmup,
         velXyzWeight=velXyzWeight,
         velXyzWeightSchedule=velXyzSchedule,
         diffusionWeight=diffusionWeight,
@@ -537,6 +587,7 @@ def loadGenerationConfig(
         clipGuidanceWeight=clipGuidanceWeight,
         footSkatingWeight=footSkatingWeight,
         minSnrGamma=_float(trainingSection, "min-snr-gamma", 5.0),
+        mirrorProbability=_float(trainingSection, "mirror-probability", 0.0),
     )
 
     return GenerationTrainingConfig(

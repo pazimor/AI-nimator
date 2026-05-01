@@ -175,11 +175,22 @@ def addTranslationArguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Zero root translation during Collada export.",
     )
-    parser.add_argument(
+    # Anchoring is the default because training targets are anchored.
+    # Expose a pair of flags so the value can still be forced either way
+    # from the CLI (e.g. for debugging raw trajectory output).
+    anchorGroup = parser.add_mutually_exclusive_group()
+    anchorGroup.add_argument(
         "--anchor-root-translation",
         dest="anchorRootTranslation",
         action="store_true",
-        help="Anchor root translation during Collada export.",
+        default=True,
+        help="Anchor root translation during Collada export (default).",
+    )
+    anchorGroup.add_argument(
+        "--no-anchor-root-translation",
+        dest="anchorRootTranslation",
+        action="store_false",
+        help="Disable root-translation anchoring (legacy behaviour).",
     )
 
 
@@ -275,6 +286,17 @@ def addSamplingArguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=DEFAULT_DDIM_STEPS,
         help="Number of DDIM steps used for sampling.",
+    )
+    parser.add_argument(
+        "--cfg-scale",
+        dest="cfgScale",
+        type=float,
+        default=3.5,
+        help=(
+            "Classifier-free guidance scale. Higher values produce "
+            "stronger text conditioning. MDM default is 2.5, "
+            "MotionDiffuse uses 3-5. (default: 3.5)"
+        ),
     )
     parser.add_argument(
         "--diag-dir",
@@ -389,6 +411,7 @@ def buildInferenceConfig(
         output=jsonPath,
         device=arguments.device,
         ddimSteps=arguments.ddimSteps,
+        cfgScale=arguments.cfgScale,
     )
 
 

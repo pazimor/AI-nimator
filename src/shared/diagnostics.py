@@ -225,6 +225,33 @@ def logEpochSummary(
     _write(record)
 
 
+def logValSummary(
+    *,
+    epoch: int,
+    valLoss: float,
+    components: Mapping[str, float],
+) -> None:
+    """
+    Log a validation-phase summary as a separate structured event.
+
+    The training-side ``epoch_summary`` is emitted inside ``trainOneEpoch``
+    (before validation runs) and therefore cannot carry validation metrics.
+    This helper is called from the CLI after ``evaluateValidation`` so the
+    jsonl stream contains a structured val record — otherwise the only
+    trace of validation was an ad-hoc console line.  Downstream analysis
+    joins ``val_summary`` and ``epoch_summary`` by ``epoch``.
+    """
+    if _CURRENT is None:
+        return
+    record = {
+        "phase": "val_summary",
+        "epoch": int(epoch),
+        "val_loss": float(valLoss),
+        "components": {str(k): float(v) for k, v in components.items()},
+    }
+    _write(record)
+
+
 def logDdimStep(
     *,
     generationId: str,

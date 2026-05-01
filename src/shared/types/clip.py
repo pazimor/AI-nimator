@@ -170,8 +170,6 @@ class ClipTrainingHyperparameters:
         Path to a checkpoint file to resume training from.
     gradientAccumulation : int
         Number of batches to accumulate before optimizer step.
-    MM_memoryLimitGB : float
-        Maximum memory usage in GB before triggering cleanup (0 to disable).
     weightDecay : float
         Weight decay for regularization.
     maxSamplesPerEpoch : Optional[int]
@@ -201,7 +199,6 @@ class ClipTrainingHyperparameters:
     validationIndicesPath: Optional[Path] = None
     resumeCheckpoint: Optional[Path] = None
     gradientAccumulation: int = 1
-    MM_memoryLimitGB: float = 0.0
     weightDecay: float = 0.0
     maxSamplesPerEpoch: Optional[int] = None
     fixedTrainChunk: bool = False

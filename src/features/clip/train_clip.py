@@ -224,7 +224,6 @@ def trainOneEpochWithAccumulation(
     epoch: int = 1,
     totalEpochs: int = 1,
     chunkInfo: Optional[str] = None,
-    memoryLimitGB: float = 0.0,
 ) -> tuple[float, LossComponents]:
     """
     Run a single training epoch with gradient accumulation.
@@ -247,8 +246,6 @@ def trainOneEpochWithAccumulation(
         Total number of epochs.
     chunkInfo : Optional[str]
         Optional description of current dataset chunk.
-    memoryLimitGB : float
-        Maximum memory usage in GB before triggering cleanup (0 = disabled).
 
     Returns
     -------
@@ -258,11 +255,6 @@ def trainOneEpochWithAccumulation(
     model.train()
     optimizer.zero_grad(set_to_none=True)
     
-    # Setup memory manager
-    from src.shared.dataset_manager import MemoryManager, MemoryManagerConfig
-    memoryConfig = MemoryManagerConfig(MM_memoryLimitGB=memoryLimitGB)
-    memoryManager = MemoryManager(memoryConfig, device)
-
     componentSums = _initLossComponents()
     numBatches = 0
 
@@ -293,9 +285,6 @@ def trainOneEpochWithAccumulation(
                 )
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            
-            # Check memory and cleanup if needed
-            memoryManager.checkAndCleanup(batchIndex)
 
         # Handle remaining gradients
         if len(dataloader) % accumulationSteps != 0:

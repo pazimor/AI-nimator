@@ -175,6 +175,21 @@ def _extractRootTranslation(
     frameCount: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
+    """
+    Extract root translation anchored at the first frame (origin).
+
+    Training targets in absolute world coordinates forced the model to
+    memorise per-sample trajectories that do not transfer across prompts:
+    on a 1482-sample ACCAD run, rtrans loss generalised 3–4× worse than
+    diff / xyz / vel_xyz and dominated the aux gradient, blocking bone_d
+    convergence.  Anchoring subtracts ``trans[0]`` so every sample starts
+    at the origin — the model only has to learn relative displacement,
+    which is directly shared across samples.  The transformation
+    preserves all motion information (frame-to-frame velocity is
+    invariant to constant subtraction), so ``root_velocity`` and any
+    downstream FK-derived features remain unchanged.  Inference export
+    re-anchors by default (see GenerationOutputOptions.anchorRootTranslation).
+    """
     rawTranslation = extras.get(ROOT_TRANSLATION_KEY)
     if rawTranslation is None:
         raise KeyError(
@@ -192,6 +207,8 @@ def _extractRootTranslation(
             "Root translation frame count mismatch: "
             f"{translation.shape[0]} vs motion {frameCount}."
         )
+    # Anchor to origin: every training sample starts at (0, 0, 0).
+    translation = translation - translation[0:1]
     return translation
 
 

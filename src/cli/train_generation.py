@@ -12,6 +12,7 @@ import torch
 
 from src.shared import diagnostics as diag
 from src.shared.config_loader import loadGenerationConfig
+from src.shared.learning_rate import buildLearningRateScheduler
 from src.features.generation.train_generation import (
     computeGlobalStatistics,
     computeMotionStatistics,
@@ -31,6 +32,7 @@ from src.shared.preprocessed_dataset import computeClipCheckpointFingerprint
 from src.shared.config_loader import loadNetworkConfig
 from src.shared.model.components import buildEnabledComponents
 from src.shared.model.generation.ddim import DDIM
+from src.shared.model.generation.ema import ExponentialMovingAverage
 from src.shared.model.generation.motion_generator import MotionGenerator
 from src.shared.types import GenerationTrainingConfig, GenerationTrainingResult
 
@@ -273,6 +275,10 @@ def _runTraining(
         clipMotionNumLayers=networkConfig.clip.motionNumLayers,
         xyzWeight=config.training.xyzWeight,
         xyzWeightSchedule=config.training.xyzWeightSchedule,
+        rootTranslationWeight=config.training.rootTranslationWeight,
+        jointXyzWeight=config.training.jointXyzWeight,
+        pelvisHeightWeight=config.training.pelvisHeightWeight,
+        condMaskProb=config.training.condMaskProb,
         velXyzWeight=config.training.velXyzWeight,
         velXyzWeightSchedule=config.training.velXyzWeightSchedule,
         diffusionWeight=config.training.diffusionWeight,
@@ -328,16 +334,35 @@ def _runTraining(
     if velXyzSchedule == "timestep":
         effectiveVelXyzWeight *= 0.5
     LOGGER.info(
-        "Loss weights: diffusion=%.4f, xyz=%.4f, "
+        "Loss weights: diffusion=%.4f, xyz=%.4f, root_translation=%.4f, "
+        "joint_xyz=%.4f, pelvis_height=%.4f, "
         "vel_xyz=%.4f (schedule=%s, approx_eff=%.4f), acc=%.4f, skate=%.4f",
         config.training.diffusionWeight,
         config.training.xyzWeight,
+        config.training.rootTranslationWeight,
+        config.training.jointXyzWeight,
+        config.training.pelvisHeightWeight,
         config.training.velXyzWeight,
         velXyzSchedule,
         effectiveVelXyzWeight,
         config.training.accelerationWeight,
         config.training.footSkatingWeight,
     )
+    LOGGER.info(
+        "Regularization: cond_mask_prob=%.3f, weight_decay=%.2e",
+        config.training.condMaskProb,
+        config.training.weightDecay,
+    )
+    if config.training.emaEnabled:
+        LOGGER.info(
+            "EMA enabled: decay=%.4f, warmup=%s — validation and saved "
+            "model_state_dict use the shadow; online_state_dict tracks "
+            "the exact training trajectory for resume.",
+            config.training.emaDecay,
+            config.training.emaWarmup,
+        )
+    else:
+        LOGGER.info("EMA disabled.")
     if config.training.clipGuidanceWeight > 0.0:
         LOGGER.info(
             "CLIP guidance enabled with weight %.4f",
@@ -357,7 +382,6 @@ def _runTraining(
 
     modelMemoryBytes = estimateModelBytes(model)
     memoryConfig = MemoryManagerConfig(
-        MM_memoryLimitGB=config.training.MM_memoryLimitGB,
         clearMpsCache=config.training.clearMpsCache,
     )
     if not config.training.clearMpsCache:
@@ -429,6 +453,7 @@ def _runTraining(
         generationCacheCheckpoint=config.paths.clipCheckpoint,
         includeTokenizedText=True,
         preloadEpochChunks=True,
+        mirrorProbability=config.training.mirrorProbability,
     )
     datasetManager.dataset.validateCompatibility(
         modelName=config.training.modelName,
@@ -460,7 +485,19 @@ def _runTraining(
     optimizer = buildOptimizer(
         model=model,
         learningRate=selectedLearningRate,
+        weightDecay=config.training.weightDecay,
     )
+
+    # EMA manager for weight smoothing (see plan — stabilise val_loss).
+    # Instantiated from the freshly-built model parameters; the shadow is
+    # re-seeded by loadCheckpoint below if we are resuming.
+    ema: Optional[ExponentialMovingAverage] = None
+    if config.training.emaEnabled:
+        ema = ExponentialMovingAverage(
+            parameters=model.trainableParameters(),
+            decay=config.training.emaDecay,
+            useWarmup=config.training.emaWarmup,
+        )
     learningRateSource = (
         "cli override"
         if learningRateOverride is not None
@@ -470,6 +507,20 @@ def _runTraining(
         "Learning rate (%s): %.6f",
         learningRateSource,
         selectedLearningRate,
+    )
+
+    # Build LR scheduler.  "constant" keeps LR unchanged for backward
+    # compatibility; "cosine" decays LR from initialLR to lrMin over
+    # totalEpochs after an optional warmup phase, which is the standard fix
+    # when the validation loss plateaus on small-data regimes.
+    lrScheduler = buildLearningRateScheduler(
+        optimizer=optimizer,
+        totalEpochs=config.training.epochs,
+        initialLR=selectedLearningRate,
+        minLR=float(config.training.lrMin),
+        warmupEpochs=int(config.training.lrWarmupEpochs),
+        scheduleType=str(config.training.lrSchedule),
+        decayEpochs=config.training.lrDecayEpochs,
     )
 
     # Build DDIM scheduler and move to device
@@ -537,6 +588,7 @@ def _runTraining(
                 checkpointPath=selectedResumeCheckpoint,
                 model=model,
                 optimizer=optimizer,
+                ema=ema,
             )
             startEpoch = resumedEpoch
             bestValLoss = resumedLoss
@@ -568,6 +620,14 @@ def _runTraining(
             startEpoch = 0
             bestValLoss = None
 
+    # Fast-forward the LR scheduler to startEpoch when resuming.  The
+    # optimizer state was restored from the checkpoint but the scheduler
+    # tracks epoch counts internally, so it must be advanced to stay in
+    # sync with the current training position (cosine decay at epoch 30
+    # gives a different LR than at epoch 0).
+    for _ in range(startEpoch):
+        lrScheduler.step()
+
     # Training loop
     for epochIndex in range(startEpoch, config.training.epochs):
         epochsRun = epochIndex + 1 - startEpoch
@@ -589,9 +649,9 @@ def _runTraining(
             epoch=epochIndex + 1,
             totalEpochs=config.training.epochs,
             chunkInfo=chunkInfo,
-            memoryLimitGB=config.training.MM_memoryLimitGB,
             clearMpsCache=config.training.clearMpsCache,
             deterministicCorruption=config.training.deterministicCorruption,
+            ema=ema,
         )
         valLoss: Optional[float] = None
         valComponents = _nanLossComponents()
@@ -604,6 +664,16 @@ def _runTraining(
                 ddim,
                 device,
                 deterministicCorruption=config.training.deterministicCorruption,
+                ema=ema,
+            )
+            # Emit a structured val_summary event so the jsonl diag stream
+            # carries validation metrics.  trainOneEpoch() logs epoch_summary
+            # *before* validation runs and therefore cannot report val_loss;
+            # offline analysis joins the two events by `epoch`.
+            diag.logValSummary(
+                epoch=epochIndex + 1,
+                valLoss=valLoss,
+                components=valComponents,
             )
             # Checkpointing - save best model
             if bestValLoss is None or valLoss < bestValLoss:
@@ -615,6 +685,7 @@ def _runTraining(
                     epoch=epochIndex + 1,
                     loss=valLoss,
                     checkpointDir=config.paths.checkpointDir,
+                    ema=ema,
                 )
                 LOGGER.info("Saved best model to %s", checkpointPath)
             else:
@@ -637,6 +708,7 @@ def _runTraining(
                     epoch=epochIndex + 1,
                     loss=trainLoss,
                     checkpointDir=config.paths.checkpointDir,
+                    ema=ema,
                 )
                 LOGGER.info(
                     "Saved best-train-loss checkpoint to %s (train_loss=%.4f)",
@@ -655,6 +727,11 @@ def _runTraining(
             trainComponents=trainComponents,
             valComponents=valComponents,
         )
+
+        # Advance LR scheduler after the epoch is logged so the printed
+        # learningRate matches the rate actually used for this epoch's
+        # optimizer steps, not the next one.
+        lrScheduler.step()
 
         if (
             valLoader is not None

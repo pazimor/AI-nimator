@@ -1,7 +1,25 @@
 paths:
   dataset-root: "/Users/pazimor/dataset_preprocessed"
-  # dataset-folders: ["ACCAD", "BioMotionLab_NTroje", "BMLHandball", "BMLmovi", "CMU", "DFaust_67", "EKUT", "Eyes_Japan_Dataset", "HumanEva", "KIT", "MPI_HDM05", "MPI_Limits", "MPI_mosh", "SFU", "SSM_synced", "TotalCapture", "Transitions_mocap"]
-  dataset-folders: ["ACCAD"] # for quick preview
+  # All 17 AMASS folders available:
+  # ["ACCAD", "BioMotionLab_NTroje", "BMLHandball", "BMLmovi", "CMU", "DFaust_67", "EKUT", "Eyes_Japan_Dataset", "HumanEva", "KIT", "MPI_HDM05", "MPI_Limits", "MPI_mosh", "SFU", "SSM_synced", "TotalCapture", "Transitions_mocap"]
+  #
+  # Étape 1 — Light triage by ROI for "natural locomotion" goal.
+  # Selected the 4 datasets with highest density of walking/everyday motion;
+  # ACCAD alone biased the model toward stylized/dance moves ("ballerina
+  # jumping" output at the previous best_model.pt val=0.397).
+  #
+  #   ACCAD              ~1500 mtn — keep for stylistic diversity (diluted by the others)
+  #   BioMotionLab_NTroje ~3000 mtn — THE locomotion dataset (age/gender/speed walking variants)
+  #   CMU                ~2500 mtn — gold standard, very diverse, lots of walking/running
+  #   BMLmovi            ~1800 mtn — natural daily activities, ~90 subjects
+  #
+  # Excluded (reasoning in plan: domain mismatch or volume too small to matter):
+  #   BMLHandball (sport-specific), DFaust_67 (body deformation, no locomotion),
+  #   MPI_Limits (static poses), MPI_mosh (test data), Transitions_mocap (niche),
+  #   EKUT/HumanEva/SFU/SSM_synced/TotalCapture/Eyes_Japan_Dataset (small volumes,
+  #   marginal gain vs noise).  KIT and MPI_HDM05 reserved for Heavy option if
+  #   Light fails to break val_loss < 0.32.
+  dataset-folders: ["ACCAD", "BioMotionLab_NTroje", "CMU", "BMLmovi"]
   clip-checkpoint: "../../output/clip/best_model.pt"
   checkpoint-dir: "../../output/generation"
 
@@ -17,12 +35,29 @@ training:
   device: mps
   max-length: 256
   model-name: xlm-roberta-base
-  validation-split: 0.01
-  early-stopping-patience: 30
-  batch-size: 4
-  gradient-accumulation: 2
-  max-samples-per-epoch: 10000
-  MM-memory-limit-gb: 20.0
+  validation-split: 0.1
+  # Patience bumped 50 → 80 for Option B resume: with stronger
+  # regularization (weight-decay 3e-4 + cond-mask-prob 0.35 + mirror 0.7)
+  # the loss surface gets smoother but slower to escape local minima,
+  # so the val curve needs more room before triggering early-stopping.
+  early-stopping-patience: 80
+  batch-size: 2
+  gradient-accumulation: 8
+  # max-samples-per-epoch caps the random sub-sample drawn each epoch so the
+  # ~9000-sample multi-folder set (ACCAD + BioMotionLab + CMU + BMLmovi)
+  # doesn't make every epoch take 25+ minutes on MPS.  Lowered 10000 → 5000
+  # for Étape 1: still 3.4× the old ACCAD-only set in coverage, keeps epoch
+  # time around ~13 min, and over ~150 epochs the model sees ~750k
+  # sample-presentations (plenty for generalization).
+  max-samples-per-epoch: 5000
+  # Chunk sizing is automatic: available RAM - 1 GB headroom - model memory.
+  # Resume from Étape 1 best checkpoint (epoch 238, val_loss 0.4381).
+  # foot_contact channels now have skipNormalization=True → their
+  # global_mean/std are forced to 0/1 at stats-compute time, so the
+  # stale ACCAD-only stats concern does not apply to these channels.
+  # The other channels (root_translation) keep their learned stats.
+  # IMPORTANT: the trainer must recompute global stats on resume
+  # because the foot_contact z-norm identity is new.
   resume-checkpoint: output/generation/best_model.pt
 
   learning-rate: 0.0001
@@ -32,13 +67,97 @@ training:
   min-snr-gamma: 5.0
   xyz-weight: 2.0
   xyz-weight-schedule: timestep
-  vel-xyz-weight: 1.0
-  # Timestep schedule: decays vel-xyz weight to ~0 at high-t to prevent
-  # FK-of-noise gradients from destabilising the diffusion backbone.
-  vel-xyz-weight-schedule: timestep
+  # Dedicated weight for root_translation (anchored on X/Y, raw vertical
+  # Z preserved per audit_globals.log).  History: dropped from default
+  # max(1.0, xyz-weight)=2.0 to 0.1 because rtrans MSE on raw metres was
+  # dominating bone_d.  After z-normalization landed (mean≈0, std≈1 per
+  # axis — confirmed by SECTION 4 of the global audit), 0.1 became the
+  # opposite problem: rtrans (3 ch) was starved against joint_xyz (66 ch)
+  # and bone_d (132 ch), and the rtrans loss plateaued at ~0.24 ≈ the
+  # variance floor of "predict the temporal mean".  0.5 puts rtrans on
+  # par with joint_xyz so the trajectory signal can actually drive
+  # gradient instead of being averaged away.
+  root-translation-weight: 0.5
+  # Per-component aux weights. Previous default (max(1.0, xyz-weight)=2.0)
+  # made joint_xyz and pelvis_height dominate the aux sum and drive the
+  # aux train/val gap.  0.5 rebalances so they're comparable to diff
+  # (weight 1.0) without drowning the primary diffusion signal.
+  joint-xyz-weight: 0.5
+  pelvis-height-weight: 0.5
+  # CFG dropout: probability of zeroing the text embedding during training.
+  # History: 0.1 → 0.25 → 0.35 (Option B, fight overfit trajectory).
+  # Lowered 0.35 → 0.15: with 9k samples + cross-attention, overfit is
+  # less critical and the model needs to see text 85% of the time (vs 65%)
+  # to learn robust prompt conditioning.  0.15 still gives CFG a credible
+  # unconditional distribution.  MDM paper uses 0.10.
+  cond-mask-prob: 0.15
+  # AdamW weight decay: free L2 regularization.  Bumped 1e-4 → 3e-4 in
+  # Option B to fight the rtrans/aux overfit gap that emerged after 144
+  # epochs.  3e-4 is the upper end of conservative diffusion values — go
+  # higher only if val keeps drifting after the next 80 epochs.
+  weight-decay: 0.0003
+
+  # Exponential Moving Average on denoiser weights.  Standard diffusion
+  # stabiliser: shadow = decay * shadow + (1 - decay) * online after every
+  # real optimizer step; validation evaluates the shadow, so the val_loss
+  # series ignores high-frequency oscillations of the online weights.  The
+  # checkpoint saved when we beat best val_loss contains the EMA weights as
+  # model_state_dict (so generate_animation.py loads them by default) and
+  # the online weights under online_state_dict (for exact resume).
+  # ema-decay 0.9999 is the canonical diffusion value.  Warmup ramps the
+  # effective decay from 0 → target as (1+step)/(10+step) to avoid the
+  # shadow being stuck at random init early in training (critical here with
+  # ~63 real steps / epoch).
+  ema-enabled: true
+  ema-decay: 0.9999
+  ema-warmup: true
+
+  # SMPL-22 mirror augmentation: bumped 0.5 → 0.7 in Option B.  At 0.5
+  # ~half the trajectories were memorised verbatim (rtrans val gap +55%
+  # at epoch 144).  At 0.7 the denoiser sees mirrored variants 70% of
+  # the time, breaking trajectory memorisation while preserving CLIP
+  # text-motion coupling (text is left untouched per the augmentation
+  # docstring).  Push to 0.8 only if val rtrans gap stays > 30% after
+  # ~80 more epochs.
+  mirror-probability: 0.7
+  # vel-xyz supervision is applied at *all* timesteps (schedule=none) so
+  # the denoiser receives a temporal-ordering signal at high-t, where the
+  # coarse frame structure is decided.  The previous "timestep" schedule
+  # zeroed vel-xyz at high-t, letting the model memorise per-frame poses
+  # without learning frame ordering — output animations looked like
+  # shuffled frames of a valid motion.
+  vel-xyz-weight: 2.0
+  vel-xyz-weight-schedule: none
   diffusion-weight: 1.0
-  acceleration-weight: 0.02
-  clip-guidance-weight: 0.1
+  # Acceleration regularisation bumped 0.02 → 0.2 to penalise
+  # frame-to-frame jerk and reinforce the ordering signal added above.
+  acceleration-weight: 0.2
+  # CLIP-guidance loss: forces cos_sim(CLIP_text_embed, CLIP_motion_embed)
+  # ≈ 1 on each (prompt, generated_motion) pair.  Was OFF (0.0) historically
+  # because FiLM-only conditioning provided no real channel for the gradient
+  # to act on — the pressure dissipated as noise.  Re-enabled at 0.3 in the
+  # cross-attention iteration, bumped to 0.5: at 0.3 the CLIP guidance
+  # contributed only ~0.15 to the total loss (0.5 × 0.3) when converged,
+  # easily drowned by bone_d + vel_xyz.  At 0.5 the guidance is strong
+  # enough to drive text→motion alignment as a first-class objective.
+  clip-guidance-weight: 0.5
+  # Cosine LR decay: classical remedy for plateaus on small datasets.
+  # lr-decay-epochs is decoupled from `epochs` (max cap) so the decay can
+  # complete before early-stopping triggers.  With decay-epochs=150 and
+  # warmup=5, LR follows: 1e-6 -> 1e-4 (epochs 0-5) -> 1e-6 (epochs 5-155)
+  # then stays at lr-min.  Early-stopping-patience=50 covers the tail.
+  lr-schedule: cosine
+  lr-warmup-epochs: 5
+  # Decoupled from total epochs so cosine decay finishes well before the
+  # early-stopping patience window triggers.  Extended 300 → 500 for the
+  # resume run: the previous 300-epoch schedule had LR at 13% of initial
+  # by epoch 238 (best), leaving 80 epochs of near-zero learning before
+  # early stopping.  500 epochs gives the resumed model enough LR budget
+  # to benefit from the new patches (BCE foot_contact, stronger CLIP
+  # guidance, lower CFG dropout).
+  lr-decay-epochs: 500
+  lr-min: 0.000001
+
   # Foot-skating penalty evaluates FK on rot6d predictions at every
   # diffusion timestep.  At high t (near pure noise) FK-of-noise is
   # chaotic and multiplied by the foot-contact mask it produces wild
@@ -74,7 +193,6 @@ overfit:
   # juste avant ou après learning-rate:
   min-snr-gamma: 0.0
 
-  MM-memory-limit-gb: 20.0
   # Overfit debugging should start from scratch to keep the loss curve
   # interpretable when the objective or enabled features change.
   # Commented out for fresh start after the DenoiserBlock structural fix
@@ -93,6 +211,23 @@ overfit:
   learning-rate: 0.0001
   xyz-weight: 1.0
   xyz-weight-schedule: timestep
+  # Kept at 1.0 in overfit so a single sample still gets a meaningful
+  # root-translation gradient; there is no train/val gap to worry about
+  # when memorising one motion.
+  root-translation-weight: 1.0
+  # Overfit: keep aux components at full weight (single-sample memorisation).
+  joint-xyz-weight: 1.0
+  pelvis-height-weight: 1.0
+  # Overfit must see text on every sample: zero CFG dropout and zero L2.
+  cond-mask-prob: 0.0
+  weight-decay: 0.0
+
+  # Overfit wants to memorise a single sample fast, not smooth weights.
+  # EMA disabled: no shadow update, no validation swap, no extra checkpoint keys.
+  ema-enabled: false
+
+  # Overfit must NOT mirror — the goal is to memorise a specific motion.
+  mirror-probability: 0.0
   # vel-xyz loss: penalizes ||Δpred_xyz - Δtarget_xyz||² in joint space.
   # This breaks the temporal-variance floor (~0.4) where the model outputs a
   # constant-frame temporal mean — the velocity loss is non-zero even at the

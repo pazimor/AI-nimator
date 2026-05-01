@@ -195,9 +195,7 @@ def _runTraining(
     )
 
     modelMemoryBytes = estimateModelBytes(model)
-    memoryConfig = MemoryManagerConfig(
-        MM_memoryLimitGB=config.training.MM_memoryLimitGB,
-    )
+    memoryConfig = MemoryManagerConfig()
     selectedFolders = (
         datasetFolders
         if datasetFolders is not None
@@ -314,7 +312,6 @@ def _runTraining(
                 epoch=epochsRun,
                 totalEpochs=config.training.epochs,
                 chunkInfo=chunkInfo,
-                memoryLimitGB=config.training.MM_memoryLimitGB,
             )
         else:
             trainLoss, trainComponents = trainOneEpoch(

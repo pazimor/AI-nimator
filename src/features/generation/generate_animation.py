@@ -471,6 +471,7 @@ def generateMotionQuat(
         ddimSteps=inferenceConfig.ddimSteps,
         device=device,
         applyPostProcessing=applyPostProcessing,
+        cfgScale=inferenceConfig.cfgScale,
     )
 
 

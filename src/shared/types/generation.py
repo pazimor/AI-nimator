@@ -102,7 +102,6 @@ class GenerationTrainingHyperparameters:
     maxPromptLength: int = 64
     modelName: str = "xlm-roberta-base"
     resumeCheckpoint: Optional[Path] = None
-    MM_memoryLimitGB: float = 0.0  # Memory limit in GB (0 = disabled)
     gradientAccumulation: int = 1  # Accumulate gradients over N batches
     maxSamplesPerEpoch: Optional[int] = None
     fixedTrainChunk: bool = False
@@ -113,8 +112,13 @@ class GenerationTrainingHyperparameters:
     
     # Learning Rate
     learningRate: float = 0.001
+    lrSchedule: str = "constant"
+    lrMin: float = 1e-7
+    lrWarmupEpochs: int = 0
+    lrDecayEpochs: Optional[int] = None
     xyzWeight: float = 0.1
     xyzWeightSchedule: str = "none"
+    rootTranslationWeight: float = 1.0
     velXyzWeight: float = 0.01
     velXyzWeightSchedule: str = "none"
     diffusionWeight: float = 1.0
@@ -122,6 +126,31 @@ class GenerationTrainingHyperparameters:
     clipGuidanceWeight: float = 0.0
     footSkatingWeight: float = 0.0
     minSnrGamma: float = 5.0
+    # Per-sample probability of applying SMPL left/right mirror augmentation
+    # to the training data.  0.0 disables it (keep for overfit debugging).
+    mirrorProbability: float = 0.0
+    # Probability of zeroing the text embedding during training (CFG dropout).
+    # Must be non-trivial (~0.25) so the denoiser learns an unconditional
+    # distribution — otherwise inference CFG amplifies an ill-defined uncond
+    # pass and produces noise.  Set to 0.0 in overfit to disable.
+    condMaskProb: float = 0.1
+    # Per-component auxiliary loss weights for joint_xyz and pelvis_height.
+    # Defaults preserve the legacy behaviour (max(1.0, xyzWeight)) when unset
+    # in YAML; lower them (e.g. 0.5) to reduce pressure from aux components
+    # that otherwise dominate and drive a train/val gap.
+    jointXyzWeight: float = 1.0
+    pelvisHeightWeight: float = 1.0
+    # L2 weight decay applied to the AdamW optimizer.  0.0 = no regularization
+    # (historical default).  1e-4 is a conservative value that helps narrow
+    # the train/val gap on small datasets.
+    weightDecay: float = 0.0
+    # Exponential Moving Average on the denoiser parameters.  Stabilises
+    # val_loss on small / noisy datasets and yields a checkpoint that
+    # generalises better at inference time.  Disable in overfit (we want to
+    # memorise, not smooth).
+    emaEnabled: bool = False
+    emaDecay: float = 0.9999
+    emaWarmup: bool = True
 
 
 @dataclass(frozen=True)
@@ -171,6 +200,7 @@ class GenerationInferenceConfig:
     output: Path
     device: str = "auto"
     ddimSteps: int = 50
+    cfgScale: float = 3.5
 
 
 @dataclass(frozen=True)
@@ -225,7 +255,11 @@ class GenerationOutputOptions:
     fps: Optional[int] = None
     colladaInterpolation: str = "linear"
     zeroRootTranslation: bool = False
-    anchorRootTranslation: bool = False
+    # Training now anchors root translation to the first frame (see
+    # _extractRootTranslation).  The denoiser therefore learns motion
+    # relative to origin, so inference export must mirror that convention
+    # or the generated animation will be offset by the learned residual.
+    anchorRootTranslation: bool = True
 
 
 @dataclass(frozen=True)

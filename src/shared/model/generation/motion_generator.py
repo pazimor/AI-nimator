@@ -51,6 +51,9 @@ class MotionGenerator(nn.Module):
         maxVelocity: Optional[float] = None,
         xyzWeight: float = DEFAULT_XYZ_WEIGHT,
         xyzWeightSchedule: str = XYZ_SCHEDULE_NONE,
+        rootTranslationWeight: float = 1.0,
+        jointXyzWeight: float = 1.0,
+        pelvisHeightWeight: float = 1.0,
         velXyzWeight: float = DEFAULT_VELOCITY_XYZ_WEIGHT,
         velXyzWeightSchedule: str = DEFAULT_VEL_XYZ_SCHEDULE,
         diffusionWeight: float = 1.0,
@@ -80,6 +83,17 @@ class MotionGenerator(nn.Module):
         self.diffusionSteps = diffusionSteps
         self.xyzWeight = xyzWeight
         self.xyzWeightSchedule = xyzWeightSchedule
+        # Dedicated weight for the root_translation aux component.  With
+        # anchored translation the raw MSE is small but still dominates the
+        # aux sum at max(1.0, xyzWeight); a per-component knob lets us
+        # damp it without touching the joint_xyz weight.
+        self.rootTranslationWeight = float(rootTranslationWeight)
+        # Dedicated weights for the two aux components that otherwise get a
+        # flat max(1.0, xyzWeight) weight.  With a high xyzWeight (e.g. 2.0),
+        # joint_xyz and pelvis_height dominate the aux sum and drive a
+        # train/val gap; a per-component knob lets us damp them independently.
+        self.jointXyzWeight = float(jointXyzWeight)
+        self.pelvisHeightWeight = float(pelvisHeightWeight)
         self.velXyzWeight = velXyzWeight
         self.velXyzWeightSchedule = velXyzWeightSchedule
         self.diffusionWeight = diffusionWeight
@@ -195,6 +209,7 @@ class MotionGenerator(nn.Module):
         componentTargets: Optional[Mapping[str, torch.Tensor]] = None,
         noisyGlobalFeatures: Optional[torch.Tensor] = None,
         targetGlobalFeatures: Optional[torch.Tensor] = None,
+        condDropoutMask: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass for training.
@@ -220,22 +235,55 @@ class MotionGenerator(nn.Module):
         """
         if noisyMotion is None or timesteps is None:
             raise ValueError("noisyMotion and timesteps are required.")
-        if textEmbedding is not None:
-            if textInputIds is not None or textAttentionMask is not None:
-                raise ValueError(
-                    "Provide either textEmbedding or tokenized inputs, not both."
-                )
-            textEmbeds = textEmbedding
-        else:
-            if textInputIds is None or textAttentionMask is None:
-                raise ValueError(
-                    "textEmbedding or tokenized text inputs are required."
-                )
+        # Cross-attention requires the per-token text representation
+        # (last_hidden_state from XLM-Roberta), which the precomputed
+        # ``textEmbedding`` cache does NOT contain (the cache holds only the
+        # pooled/normalized vector).  When tokenised inputs are available we
+        # always run a fresh ``encodeText`` so we get both the pooled vector
+        # AND the per-token sequence in a single forward.  When only the
+        # cached ``textEmbedding`` is provided (legacy / inference-from-text-
+        # embed path), cross-attention is skipped — the denoiser falls back
+        # to FiLM-only conditioning, which is the pre-refactor behaviour.
+        textTokens: Optional[torch.Tensor] = None
+        textTokenMask: Optional[torch.Tensor] = None
+        if textInputIds is not None and textAttentionMask is not None:
             with torch.no_grad():
-                textEmbeds, _ = self.clip.encodeText(
+                textEmbeds, textTokens = self.clip.encodeText(
                     inputIds=textInputIds,
                     attentionMask=textAttentionMask,
                 )
+            textTokenMask = textAttentionMask
+            if textEmbedding is not None:
+                # Both provided: prefer the freshly-computed pair so the
+                # pooled vector and the tokens come from the same forward.
+                # The pre-cached ``textEmbedding`` is silently ignored.
+                pass
+        elif textEmbedding is not None:
+            textEmbeds = textEmbedding
+        else:
+            raise ValueError(
+                "textEmbedding or tokenized text inputs are required."
+            )
+
+        # CFG (Classifier-Free Guidance) dropout: zero text condition for a
+        # random subset of samples so the denoiser learns an unconditional
+        # distribution alongside the conditional one.  Applied AFTER the
+        # CLIP encode so both the pooled vector and the per-token sequence
+        # are zeroed in lockstep — otherwise cross-attention would still
+        # see the real prompt for "dropped" samples and the CFG signal at
+        # inference would be diluted.  The textTokenMask is also zeroed for
+        # those samples so cross-attn key-padding masks them entirely.
+        if condDropoutMask is not None:
+            if condDropoutMask.dtype != torch.bool:
+                condDropoutMask = condDropoutMask.bool()
+            textEmbeds = textEmbeds.clone()
+            textEmbeds[condDropoutMask] = 0.0
+            if textTokens is not None:
+                textTokens = textTokens.clone()
+                textTokens[condDropoutMask] = 0.0
+            if textTokenMask is not None:
+                textTokenMask = textTokenMask.clone()
+                textTokenMask[condDropoutMask] = 0
 
         padMask = None
         if motionMask is not None:
@@ -247,6 +295,8 @@ class MotionGenerator(nn.Module):
             timesteps=timesteps,
             mask=padMask,
             noisyGlobalFeatures=noisyGlobalFeatures,
+            textTokens=textTokens,
+            textTokenMask=textTokenMask,
         )
 
         # The denoiser's direct output is the predicted x0 in **normalized**
@@ -432,7 +482,7 @@ class MotionGenerator(nn.Module):
         ddimSteps: int = 50,
         device: Optional[torch.device] = None,
         applyPostProcessing: bool = True,
-        cfgScale: float = 2.5,
+        cfgScale: float = 3.5,
     ) -> dict[str, torch.Tensor]:
         """
         Generate a motion sample and any exported auxiliary features.
@@ -452,7 +502,7 @@ class MotionGenerator(nn.Module):
         inputIds = encoded["input_ids"].to(device)
         attentionMask = encoded["attention_mask"].to(device)
 
-        textEmbeds, _ = self.clip.encodeText(inputIds, attentionMask)
+        textEmbeds, textTokens = self.clip.encodeText(inputIds, attentionMask)
 
         # Initialize noise for bone and global features.
         xBone = torch.randn(
@@ -469,9 +519,16 @@ class MotionGenerator(nn.Module):
             self.diffusionSteps - 1, 0, resolvedSteps,
         ).long().tolist()
 
-        # Classifier-Free Guidance: null embedding for unconditional pass
+        # Classifier-Free Guidance: null embedding for unconditional pass.
+        # Both the pooled embedding AND the per-token sequence are nulled so
+        # the unconditional pass sees a fully empty text condition; without
+        # nulling textTokens too, cross-attention would still attend to the
+        # real prompt and the CFG (cond − uncond) signal would be diluted.
         nullTextEmbeds = (
             torch.zeros_like(textEmbeds) if cfgScale > 1.0 else None
+        )
+        nullTextTokens = (
+            torch.zeros_like(textTokens) if cfgScale > 1.0 else None
         )
 
         diagActive = diag.get_logger() is not None
@@ -485,6 +542,8 @@ class MotionGenerator(nn.Module):
                 textEmbedding=textEmbeds,
                 timesteps=tBatch,
                 noisyGlobalFeatures=xGlobal,
+                textTokens=textTokens,
+                textTokenMask=attentionMask,
             )
             _, condBoneX0 = self._resolveModelPredictions(
                 noisyMotion=xBone, timesteps=tBatch, modelOutput=condBone,
@@ -502,6 +561,8 @@ class MotionGenerator(nn.Module):
                     textEmbedding=nullTextEmbeds,
                     timesteps=tBatch,
                     noisyGlobalFeatures=xGlobal,
+                    textTokens=nullTextTokens,
+                    textTokenMask=attentionMask,
                 )
                 _, uncondBoneX0 = self._resolveModelPredictions(
                     noisyMotion=xBone, timesteps=tBatch, modelOutput=uncondBone,
@@ -550,6 +611,11 @@ class MotionGenerator(nn.Module):
         xBone = self.denormalizeMotion(xBone)
         if xGlobal is not None:
             xGlobal = self.denormalizeGlobalFeatures(xGlobal)
+            # Apply sigmoid to channels whose component has
+            # skipNormalization=True (e.g. foot_contact): the denoiser
+            # predicted logits (since those channels were not z-normed),
+            # so we convert to probabilities for downstream use.
+            xGlobal = self._applySigmoidToRawComponents(xGlobal)
 
         # Extract rotation6d for quaternion conversion.
         rot6d = self._extractRotation6d(xBone)
@@ -592,7 +658,7 @@ class MotionGenerator(nn.Module):
         ddimSteps: int = 50,
         device: Optional[torch.device] = None,
         applyPostProcessing: bool = True,
-        cfgScale: float = 2.5,
+        cfgScale: float = 3.5,
     ) -> torch.Tensor:
         """
         Generate motion from text prompt using DDIM sampling.
@@ -726,11 +792,27 @@ class MotionGenerator(nn.Module):
         mean: torch.Tensor,
         std: torch.Tensor,
     ) -> None:
-        """Store dataset mean/std for global feature Z-normalization."""
+        """Store dataset mean/std for global feature Z-normalization.
+
+        Channels whose component has ``skipNormalization = True`` are
+        forced to mean=0 / std=1 (identity transform) regardless of
+        the computed values.  This ensures the denoiser sees raw values
+        for those channels even when resuming from a checkpoint that
+        stored stale stats.
+        """
         if self.globalChannels == 0:
             return
-        self.global_mean.copy_(mean.view(self.global_mean.shape))
-        self.global_std.copy_(std.view(self.global_std.shape))
+        mean = mean.view(self.global_mean.shape).clone()
+        std = std.view(self.global_std.shape).clone()
+        # Force identity normalization on skipNormalization components.
+        offset = 0
+        for component in self._globalComponents:
+            if getattr(component, "skipNormalization", False):
+                mean[..., offset:offset + component.channels] = 0.0
+                std[..., offset:offset + component.channels] = 1.0
+            offset += component.channels
+        self.global_mean.copy_(mean)
+        self.global_std.copy_(std)
 
     def normalizeMotion(self, motion: torch.Tensor) -> torch.Tensor:
         """Normalize raw bone features to zero-mean unit-variance."""
@@ -751,6 +833,46 @@ class MotionGenerator(nn.Module):
         if self.globalChannels == 0:
             return features
         return features * self.global_std + self.global_mean
+
+    def enforceSkipNormalization(self) -> None:
+        """Force mean=0/std=1 on global channels with skipNormalization.
+
+        Call this after loading a checkpoint whose ``global_mean`` /
+        ``global_std`` buffers were computed before the
+        ``skipNormalization`` flag was added.  This overwrites the
+        stale stats for those channels so the denoiser sees raw values.
+        """
+        if self.globalChannels == 0:
+            return
+        offset = 0
+        for component in self._globalComponents:
+            if getattr(component, "skipNormalization", False):
+                self.global_mean.data[..., offset:offset + component.channels] = 0.0
+                self.global_std.data[..., offset:offset + component.channels] = 1.0
+            offset += component.channels
+
+    def _applySigmoidToRawComponents(
+        self,
+        globalFeatures: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply sigmoid to global channels that skipped z-normalization.
+
+        Components with ``skipNormalization = True`` (e.g. foot_contact)
+        produce logits at inference: the denoiser saw raw {0, 1} targets
+        during training (mean=0, std=1 identity norm) and outputs logits
+        in the same space.  Sigmoid converts these to probabilities.
+        """
+        offset = 0
+        for component in self._globalComponents:
+            if getattr(component, "skipNormalization", False):
+                globalFeatures = globalFeatures.clone()
+                globalFeatures[..., offset:offset + component.channels] = (
+                    torch.sigmoid(
+                        globalFeatures[..., offset:offset + component.channels]
+                    )
+                )
+            offset += component.channels
+        return globalFeatures
 
     def trainableParameters(self) -> tuple[nn.Parameter, ...]:
         """Return every parameter optimized during generation training."""
@@ -925,8 +1047,12 @@ class MotionGenerator(nn.Module):
 
     def _componentLossWeight(self, componentKey: str) -> float:
         """Resolve the default weight for one auxiliary motion component."""
-        if componentKey in {"root_translation", "joint_xyz", "pelvis_height"}:
-            return max(1.0, float(self.xyzWeight))
+        if componentKey == "root_translation":
+            return float(self.rootTranslationWeight)
+        if componentKey == "joint_xyz":
+            return float(self.jointXyzWeight)
+        if componentKey == "pelvis_height":
+            return float(self.pelvisHeightWeight)
         if componentKey in {
             "root_velocity",
             "joint_velocity",

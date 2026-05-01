@@ -92,10 +92,22 @@ class SinusoidalPositionalEncoding(nn.Module):
 
 class DenoiserBlock(nn.Module):
     """
-    Single denoising transformer block (MDM-style).
+    Single denoising transformer block (MDM-style) with cross-attention.
 
-    Self-attention with FiLM conditioning and a feed-forward transform,
-    both wrapped in residual connections.
+    Architecture:
+      1. Self-attention residual (motion ↔ motion).
+      2. FiLM conditioning (timestep modulation).
+      3. Cross-attention residual (motion → text tokens).
+      4. Feed-forward residual.
+
+    The conditioning is split: timestep goes through FiLM (a global scalar
+    modulation, well-suited to a per-sample scalar) and text tokens go
+    through cross-attention (each motion frame attends to each prompt
+    token, the standard MDM/MotionDiffuse design).  Before this refactor
+    text was pooled into a single vector and mixed into ``cond`` for FiLM,
+    which provided no per-token attention and led to posterior collapse —
+    the network ignored the prompt and produced the dataset's mean
+    distribution regardless of input.
     """
 
     def __init__(
@@ -111,6 +123,13 @@ class DenoiserBlock(nn.Module):
             embedDim, numHeads, dropout=dropout, batch_first=True,
         )
         self.filmCondition = FiLM(embedDim, condDim)
+        # Cross-attention onto text tokens.  query=motion, key=value=text.
+        # normCross is applied to the query (pre-norm transformer design,
+        # consistent with norm1/norm2).
+        self.normCross = nn.LayerNorm(embedDim)
+        self.crossAttention = nn.MultiheadAttention(
+            embedDim, numHeads, dropout=dropout, batch_first=True,
+        )
         self.norm2 = nn.LayerNorm(embedDim)
         self.ffn = nn.Sequential(
             nn.Linear(embedDim, embedDim * 4),
@@ -118,6 +137,9 @@ class DenoiserBlock(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(embedDim * 4, embedDim),
         )
+        # adalnCondition kept dead for checkpoint compatibility — see the
+        # historical comment in ``forward`` below.  Its weights are zero on
+        # fresh init and ignored on resume.
         self.adalnCondition = AdaLN(embedDim, condDim)
         self.dropout = nn.Dropout(dropout)
 
@@ -125,6 +147,8 @@ class DenoiserBlock(nn.Module):
         self,
         x: torch.Tensor,
         cond: torch.Tensor,
+        textTokens: Optional[torch.Tensor] = None,
+        textKeyPaddingMask: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
@@ -135,16 +159,25 @@ class DenoiserBlock(nn.Module):
         x : torch.Tensor
             Input tensor shaped (batch_size, seq_len, embedDim).
         cond : torch.Tensor
-            Conditioning tensor shaped (batch_size, condDim).
+            Conditioning tensor shaped (batch_size, [seq_len,] condDim).
+            Carries the timestep (and optionally per-frame PE) modulation
+            consumed by FiLM.
+        textTokens : Optional[torch.Tensor]
+            Projected text token sequence shaped
+            (batch_size, textSeqLen, embedDim).  When None, cross-attention
+            is skipped (backward-compat for ablations or pretraining).
+        textKeyPaddingMask : Optional[torch.Tensor]
+            Key padding mask aligned with ``textTokens`` (True = pad),
+            shaped (batch_size, textSeqLen).
         mask : Optional[torch.Tensor], optional
-            Key padding mask (True = pad), by default None.
+            Self-attention key padding mask (True = pad).
 
         Returns
         -------
         torch.Tensor
             Output tensor shaped (batch_size, seq_len, embedDim).
         """
-        # Self-attention with residual + FiLM conditioning.
+        # 1. Self-attention with residual + FiLM conditioning.
         # FiLM applies ``x * (1 + gamma) + beta`` which is residual-safe at
         # zero-init (gamma=0, beta=0 -> identity), so the attention residual
         # keeps its magnitude.
@@ -155,7 +188,22 @@ class DenoiserBlock(nn.Module):
         h = x + self.dropout(h)
         h = self.filmCondition(h, cond)
 
-        # Feed-forward residual with pre-LayerNorm.
+        # 2. Cross-attention residual onto text tokens.
+        # Pre-norm on the query, residual add on the original h so the
+        # block is identity-safe at init (the cross-attn out_proj receives
+        # gradient and pulls toward useful text alignment over training).
+        if textTokens is not None:
+            qCross = self.normCross(h)
+            crossOut, _ = self.crossAttention(
+                query=qCross,
+                key=textTokens,
+                value=textTokens,
+                key_padding_mask=textKeyPaddingMask,
+                need_weights=False,
+            )
+            h = h + self.dropout(crossOut)
+
+        # 3. Feed-forward residual with pre-LayerNorm.
         h = h + self.dropout(self.ffn(self.norm2(h)))
 
         # IMPORTANT: the AdaLN module is intentionally NOT applied here.
@@ -166,9 +214,7 @@ class DenoiserBlock(nn.Module):
         # collapse over ``numLayers`` blocks.  The zero-init of DiT's
         # AdaLN-Zero is meant to be *inside* a residual (``x + scale * f(x)``
         # with ``scale`` zero-init), not to replace the block output.
-        # Removing this line restores gradient flow from output all the way
-        # back to ``noisyMotion`` and lets the transformer produce per-frame
-        # variation.  The AdaLN module is kept in ``__init__`` for checkpoint
+        # The AdaLN module is kept in ``__init__`` for checkpoint
         # compatibility; its weights remain at zero when loaded fresh and are
         # ignored when resuming from checkpoints trained before this fix.
         # h = self.adalnCondition(h, cond)  # structural bug — see comment
@@ -290,6 +336,16 @@ class MotionDenoiser(nn.Module):
             nn.SiLU(),
             nn.Linear(embedDim * 2, embedDim),
         )
+        # Token-level projection used by cross-attention in DenoiserBlock.
+        # Maps the raw XLM-R last_hidden_state (shape (B, seqLen, textHiddenSize))
+        # into the denoiser's embedding space (B, seqLen, embedDim) so each
+        # motion frame can attend to each prompt token directly.  Before this
+        # refactor only the pooled vector reached the denoiser, which made
+        # the network ignore the prompt (posterior collapse — see plan).
+        self.textTokenProj = nn.Sequential(
+            nn.Linear(self.textEmbedDim, embedDim),
+            nn.LayerNorm(embedDim),
+        )
 
         # Conditioning embeddings
         self.timestepEmbed = TimestepEmbedding(embedDim)
@@ -357,6 +413,8 @@ class MotionDenoiser(nn.Module):
         timesteps: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         noisyGlobalFeatures: Optional[torch.Tensor] = None,
+        textTokens: Optional[torch.Tensor] = None,
+        textTokenMask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Predict clean motion features from noisy input.
@@ -366,13 +424,25 @@ class MotionDenoiser(nn.Module):
         noisyMotion : torch.Tensor
             Noisy bone-scoped features shaped (batch, frames, bones, motionChannels).
         textEmbedding : torch.Tensor
-            Text embedding shaped (batch, textEmbedDim).
+            Pooled text embedding shaped (batch, textEmbedDim).  Used for the
+            global FiLM modulation channel and the conditioning prepend token.
         timesteps : torch.Tensor
             Diffusion timesteps shaped (batch,).
         mask : Optional[torch.Tensor], optional
-            Temporal mask, by default None.
+            Motion temporal key padding mask (True = pad).
         noisyGlobalFeatures : Optional[torch.Tensor], optional
             Noisy global-scoped features shaped (batch, frames, globalChannels).
+        textTokens : Optional[torch.Tensor], optional
+            Per-token text representation shaped
+            (batch, textSeqLen, textEmbedDim) — usually the last_hidden_state
+            from the frozen XLM-Roberta encoder.  When provided, every
+            DenoiserBlock applies a cross-attention residual onto these tokens
+            (motion → text).  When ``None``, the cross-attention path is
+            skipped (legacy / ablation behaviour).
+        textTokenMask : Optional[torch.Tensor], optional
+            Attention mask for ``textTokens`` (1 = valid, 0 = pad), shaped
+            (batch, textSeqLen).  Internally inverted to the ``True = pad``
+            convention required by ``nn.MultiheadAttention``.
 
         Returns
         -------
@@ -434,9 +504,29 @@ class MotionDenoiser(nn.Module):
             )
             mask = torch.cat([condMask, mask], dim=1)
 
+        # Project text tokens for cross-attention (motion → tokens).  Each
+        # block takes the same projected sequence; the projection lives at
+        # the model level (not per-block) so the parameter count stays
+        # bounded and the same cross-attention "vocabulary" is shared
+        # across depths.  textKeyPaddingMask follows nn.MultiheadAttention's
+        # convention: True = pad.  ``textTokenMask`` from the dataloader is
+        # 1=valid / 0=pad, so we invert it.
+        projectedTextTokens: Optional[torch.Tensor] = None
+        textKeyPaddingMask: Optional[torch.Tensor] = None
+        if textTokens is not None:
+            projectedTextTokens = self.textTokenProj(textTokens)
+            if textTokenMask is not None:
+                textKeyPaddingMask = ~textTokenMask.bool()
+
         # Apply denoising blocks
         for block in self.blocks:
-            xseq = block(xseq, condSeq, mask)
+            xseq = block(
+                xseq,
+                condSeq,
+                textTokens=projectedTextTokens,
+                textKeyPaddingMask=textKeyPaddingMask,
+                mask=mask,
+            )
 
         # Remove the conditioning token from the output.
         h = xseq[:, 1:]

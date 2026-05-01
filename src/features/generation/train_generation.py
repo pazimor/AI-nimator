@@ -34,6 +34,7 @@ if sys.platform == "darwin":
         pass  # pyobjc not installed, skip
 
 from src.shared.model.generation.ddim import DDIM
+from src.shared.model.generation.ema import ExponentialMovingAverage
 from src.shared.model.generation.motion_generator import MotionGenerator
 from src.shared.progress import TrainingProgressBar
 
@@ -191,6 +192,7 @@ def _buildLossPostfix(
 def buildOptimizer(
     model: MotionGenerator,
     learningRate: float,
+    weightDecay: float = 0.0,
 ) -> torch.optim.Optimizer:
     """
     Create optimizer for trainable parameters only.
@@ -201,6 +203,10 @@ def buildOptimizer(
         The generation model.
     learningRate : float
         Learning rate.
+    weightDecay : float
+        L2 weight decay passed to AdamW. 0.0 disables regularization
+        (historical default).  1e-4 is a conservative value that narrows
+        the train/val gap on small datasets.
 
     Returns
     -------
@@ -209,7 +215,11 @@ def buildOptimizer(
     """
     # Train the denoiser and any auxiliary generation heads (CLIP is frozen).
     trainableParams = list(model.trainableParameters())
-    return torch.optim.AdamW(trainableParams, lr=learningRate)
+    return torch.optim.AdamW(
+        trainableParams,
+        lr=learningRate,
+        weight_decay=float(weightDecay),
+    )
 
 
 def trainOneEpoch(
@@ -222,9 +232,9 @@ def trainOneEpoch(
     epoch: int = 1,
     totalEpochs: int = 1,
     chunkInfo: Optional[str] = None,
-    memoryLimitGB: float = 0.0,
     clearMpsCache: bool = True,
     deterministicCorruption: bool = False,
+    ema: Optional[ExponentialMovingAverage] = None,
 ) -> tuple[float, LossComponents]:
     """
     Run a single training epoch.
@@ -249,10 +259,11 @@ def trainOneEpoch(
         Total number of epochs.
     chunkInfo : Optional[str]
         Optional description of current dataset chunk.
-    memoryLimitGB : float
-        Maximum memory usage in GB before triggering cleanup (0 = disabled).
     clearMpsCache : bool
         When False, skip explicit torch.mps.empty_cache() calls.
+    ema : Optional[ExponentialMovingAverage]
+        When provided, the EMA shadow is updated after every real
+        optimizer step (i.e. after gradient accumulation completes).
 
     Returns
     -------
@@ -269,11 +280,8 @@ def trainOneEpoch(
     bucketCounts: dict[int, int] = {}
     numBuckets = 10
     
-    # Setup memory manager
-    memoryConfig = MemoryManagerConfig(
-        MM_memoryLimitGB=memoryLimitGB,
-        clearMpsCache=clearMpsCache,
-    )
+    # Setup memory manager for status logging / cache eviction.
+    memoryConfig = MemoryManagerConfig(clearMpsCache=clearMpsCache)
     memoryManager = MemoryManager(memoryConfig, device)
     memoryManager.logMemoryStatus("epoch start")
 
@@ -333,14 +341,16 @@ def trainOneEpoch(
                 )
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                # Advance the EMA shadow AFTER every real optimizer step
+                # (never on grad-accumulation micro-steps): the shadow must
+                # track the trajectory of actually-applied updates.
+                if ema is not None:
+                    ema.update(model.trainableParameters())
                 accumSteps = 0
                 
                 # Clear MPS cache after optimizer step
                 if clearMpsCache and device.type == "mps":
                     torch.mps.empty_cache()
-                    
-            # Check memory and cleanup if needed
-            memoryManager.checkAndCleanup(numBatches)
 
         gc.collect()
         if clearMpsCache and device.type == "mps":
@@ -354,6 +364,12 @@ def trainOneEpoch(
                 }
                 for bucket in sorted(bucketSums.keys())
             }
+            # valLoss is intentionally None here: validation runs *after*
+            # this training-epoch summary in the CLI loop, and is logged
+            # separately via diagnostics.logValSummary so each event carries
+            # the metrics available at its own emission point.  Downstream
+            # post-processing should join epoch_summary + val_summary on
+            # the `epoch` key rather than expecting val_loss on this record.
             diag.logEpochSummary(
                 epoch=epoch,
                 trainLoss=pbar.metrics.avgLoss,
@@ -402,16 +418,24 @@ def _runBatch(
         set_to_none=True
     )  # More memory-efficient than zero_grad()
 
-    # Move data to device
-    textEmbedding = batch["generation_text_embedding"].to(device)
-    # Classifier-Free Guidance: randomly zero text embeddings
+    # Move data to device.  Cross-attention requires the per-token text
+    # representation, which the cached pooled ``generation_text_embedding``
+    # doesn't contain.  Feed raw tokens; ``MotionGenerator.forward`` runs
+    # CLIP fresh (no_grad, frozen text encoder) and produces both the
+    # pooled vector and the per-token sequence in one pass.
+    textInputIds = batch["input_ids"].to(device)
+    textAttentionMask = batch["attention_mask"].to(device)
+    # CFG dropout mask: applied AFTER the CLIP encode by
+    # ``MotionGenerator.forward`` so pooled + tokens + key-padding mask
+    # are zeroed in lockstep on the dropped samples.  Before the cross-
+    # attention refactor this dropout was applied to the cached pooled
+    # vector directly, which no longer drives the full conditioning path.
+    condDropoutMask: Optional[torch.Tensor] = None
     if model.training and model.condMaskProb > 0.0:
-        cfgDropMask = (
-            torch.rand(textEmbedding.shape[0], device=device)
+        condDropoutMask = (
+            torch.rand(textInputIds.shape[0], device=device)
             < model.condMaskProb
         )
-        textEmbedding = textEmbedding.clone()
-        textEmbedding[cfgDropMask] = 0.0
     # Assemble combined bone and global feature tensors.
     boneFeatures = model.assembleBoneFeatures(batch, device)
     globalFeatures = model.assembleGlobalFeatures(batch, device)
@@ -445,7 +469,8 @@ def _runBatch(
 
     # Predict noise
     outputs = model(
-        textEmbedding=textEmbedding,
+        textInputIds=textInputIds,
+        textAttentionMask=textAttentionMask,
         noisyMotion=noisyMotion,
         timesteps=timesteps,
         targetMotion=boneFeatures,
@@ -453,11 +478,14 @@ def _runBatch(
         clipMotionContext=clipMotionContext,
         noisyGlobalFeatures=noisyGlobal,
         targetGlobalFeatures=globalFeatures,
+        condDropoutMask=condDropoutMask,
     )
-    
+
     # Delete inputs early
     del (
-        textEmbedding,
+        textInputIds,
+        textAttentionMask,
+        condDropoutMask,
         noisyMotion,
         boneFeatures,
         motionMask,
@@ -519,16 +547,18 @@ def _runBatchAccumulate(
     tuple[float, LossComponents]
         Batch loss value and component breakdown.
     """
-    # Move data to device
-    textEmbedding = batch["generation_text_embedding"].to(device)
-    # Classifier-Free Guidance: randomly zero text embeddings
+    # Move data to device.  Same fresh-CLIP path as ``trainOneEpoch`` —
+    # cross-attention requires the per-token text representation that the
+    # cached pooled embedding doesn't carry.
+    textInputIds = batch["input_ids"].to(device)
+    textAttentionMask = batch["attention_mask"].to(device)
+    # CFG dropout is applied post-encode by ``MotionGenerator.forward``.
+    condDropoutMask: Optional[torch.Tensor] = None
     if model.training and model.condMaskProb > 0.0:
-        cfgDropMask = (
-            torch.rand(textEmbedding.shape[0], device=device)
+        condDropoutMask = (
+            torch.rand(textInputIds.shape[0], device=device)
             < model.condMaskProb
         )
-        textEmbedding = textEmbedding.clone()
-        textEmbedding[cfgDropMask] = 0.0
     # Assemble combined bone and global feature tensors.
     boneFeatures = model.assembleBoneFeatures(batch, device)
     globalFeatures = model.assembleGlobalFeatures(batch, device)
@@ -580,7 +610,8 @@ def _runBatchAccumulate(
 
     # Predict noise
     outputs = model(
-        textEmbedding=textEmbedding,
+        textInputIds=textInputIds,
+        textAttentionMask=textAttentionMask,
         noisyMotion=noisyMotion,
         timesteps=timesteps,
         targetMotion=boneFeatures,
@@ -588,6 +619,7 @@ def _runBatchAccumulate(
         clipMotionContext=clipMotionContext,
         noisyGlobalFeatures=noisyGlobal,
         targetGlobalFeatures=globalFeatures,
+        condDropoutMask=condDropoutMask,
     )
 
     diagActive = diag.get_logger() is not None
@@ -602,7 +634,9 @@ def _runBatchAccumulate(
     noiseForDiag = noise.detach() if diagActive else None
 
     del (
-        textEmbedding,
+        textInputIds,
+        textAttentionMask,
+        condDropoutMask,
         noisyMotion,
         boneFeatures,
         motionMask,
@@ -650,6 +684,7 @@ def evaluateValidation(
     ddim: DDIM,
     device: torch.device,
     deterministicCorruption: bool = False,
+    ema: Optional[ExponentialMovingAverage] = None,
 ) -> tuple[float, LossComponents]:
     """
     Compute average loss on validation set.
@@ -664,83 +699,109 @@ def evaluateValidation(
         Diffusion scheduler.
     device : torch.device
         Device.
+    ema : Optional[ExponentialMovingAverage]
+        When provided, the model's online parameters are swapped with the
+        EMA shadow for the duration of validation (then restored).  This
+        is what produces the stable, inference-aligned val_loss series.
 
     Returns
     -------
     tuple[float, LossComponents]
         Average validation loss and component breakdown.
     """
-    model.eval()
-    totalLoss = 0.0
-    numBatches = 0
-    componentSums = _initLossComponents()
+    # Swap EMA weights into the model BEFORE eval() / no_grad() — the swap
+    # itself is already under torch.no_grad via the EMA manager.  The
+    # try/finally guarantees the online parameters are always restored, so
+    # the next training step resumes from the correct trajectory even if
+    # validation raises.
+    if ema is not None:
+        ema.storeAndSwap(model.trainableParameters())
+    try:
+        model.eval()
+        totalLoss = 0.0
+        numBatches = 0
+        componentSums = _initLossComponents()
 
-    with torch.no_grad():
-        for batch in dataloader:
-            textEmbedding = batch["generation_text_embedding"].to(device)
-            boneFeatures = model.assembleBoneFeatures(batch, device)
-            globalFeatures = model.assembleGlobalFeatures(batch, device)
-            motionMask = batch.get("motion_mask")
-            if motionMask is not None:
-                motionMask = motionMask.to(device)
-            clipMotionContext = model.clip.extractMotionContext(batch)
+        with torch.no_grad():
+            for batch in dataloader:
+                # Validation runs the same fresh-CLIP path so the
+                # cross-attention conditioning is identical to training.
+                # No CFG dropout in eval mode.
+                textInputIds = batch["input_ids"].to(device)
+                textAttentionMask = batch["attention_mask"].to(device)
+                boneFeatures = model.assembleBoneFeatures(batch, device)
+                globalFeatures = model.assembleGlobalFeatures(batch, device)
+                motionMask = batch.get("motion_mask")
+                if motionMask is not None:
+                    motionMask = motionMask.to(device)
+                clipMotionContext = model.clip.extractMotionContext(batch)
 
-            normalizedBone = model.normalizeMotion(boneFeatures)
-            normalizedGlobal = (
-                model.normalizeGlobalFeatures(globalFeatures)
-                if globalFeatures is not None
-                else None
-            )
+                normalizedBone = model.normalizeMotion(boneFeatures)
+                normalizedGlobal = (
+                    model.normalizeGlobalFeatures(globalFeatures)
+                    if globalFeatures is not None
+                    else None
+                )
 
-            timesteps, noise, noisyMotion = _prepareDiffusionInputs(
-                batch=batch,
-                motion=normalizedBone,
-                ddim=ddim,
-                device=device,
-                deterministicCorruption=deterministicCorruption,
-            )
-            noisyGlobal: torch.Tensor | None = None
-            if normalizedGlobal is not None:
-                globalNoise = torch.randn_like(normalizedGlobal)
-                noisyGlobal = ddim.q_sample(normalizedGlobal, timesteps, globalNoise)
+                timesteps, noise, noisyMotion = _prepareDiffusionInputs(
+                    batch=batch,
+                    motion=normalizedBone,
+                    ddim=ddim,
+                    device=device,
+                    deterministicCorruption=deterministicCorruption,
+                )
+                noisyGlobal: torch.Tensor | None = None
+                if normalizedGlobal is not None:
+                    globalNoise = torch.randn_like(normalizedGlobal)
+                    noisyGlobal = ddim.q_sample(
+                        normalizedGlobal, timesteps, globalNoise,
+                    )
 
-            outputs = model(
-                textEmbedding=textEmbedding,
-                noisyMotion=noisyMotion,
-                timesteps=timesteps,
-                targetMotion=boneFeatures,
-                motionMask=motionMask,
-                clipMotionContext=clipMotionContext,
-                noisyGlobalFeatures=noisyGlobal,
-                targetGlobalFeatures=globalFeatures,
-            )
+                outputs = model(
+                    textInputIds=textInputIds,
+                    textAttentionMask=textAttentionMask,
+                    noisyMotion=noisyMotion,
+                    timesteps=timesteps,
+                    targetMotion=boneFeatures,
+                    motionMask=motionMask,
+                    clipMotionContext=clipMotionContext,
+                    noisyGlobalFeatures=noisyGlobal,
+                    targetGlobalFeatures=globalFeatures,
+                )
 
-            totalLoss += float(outputs["loss"].item())
-            _updateLossComponents(
-                componentSums,
-                _extractLossComponents(outputs),
-            )
-            numBatches += 1
+                totalLoss += float(outputs["loss"].item())
+                _updateLossComponents(
+                    componentSums,
+                    _extractLossComponents(outputs),
+                )
+                numBatches += 1
 
-            # Free memory in validation loop
-            del (
-                textEmbedding,
-                boneFeatures,
-                noisyMotion,
-                noise,
-                timesteps,
-                outputs,
-                motionMask,
-                clipMotionContext,
-                globalFeatures,
-                noisyGlobal,
-            )
+                # Free memory in validation loop
+                del (
+                    textInputIds,
+                    textAttentionMask,
+                    boneFeatures,
+                    noisyMotion,
+                    noise,
+                    timesteps,
+                    outputs,
+                    motionMask,
+                    clipMotionContext,
+                    globalFeatures,
+                    noisyGlobal,
+                )
 
-    gc.collect()
-    model.train()
-    avgLoss = totalLoss / max(numBatches, 1)
-    avgComponents = _averageLossComponents(componentSums, numBatches)
-    return avgLoss, avgComponents
+        gc.collect()
+        model.train()
+        avgLoss = totalLoss / max(numBatches, 1)
+        avgComponents = _averageLossComponents(componentSums, numBatches)
+        return avgLoss, avgComponents
+    finally:
+        # Always restore online weights, even if the validation loop raised.
+        # Training in the next epoch must resume from the online trajectory,
+        # not from the EMA shadow.
+        if ema is not None:
+            ema.restore(model.trainableParameters())
 
 
 def disableDropoutModules(module: nn.Module) -> int:
@@ -926,6 +987,10 @@ def computeGlobalStatistics(
 
     Padded frames are excluded via ``batch["motion_mask"]`` when available.
 
+    Channels belonging to components with ``skipNormalization = True``
+    (e.g. ``FootContactComponent``) are forced to mean=0 / std=1 so the
+    denoiser sees raw values instead of z-normalized ones.
+
     Returns tensors shaped ``(1, 1, globalChannels)``.
     """
     count = 0.0
@@ -966,6 +1031,25 @@ def computeGlobalStatistics(
     mean = runningSum / count
     variance = (runningSumSq / count - mean ** 2).clamp(min=0.0)
     std = torch.sqrt(variance).clamp(min=1e-5)
+
+    # Force identity normalization (mean=0, std=1) on channels whose
+    # component has skipNormalization=True.  This lets those channels
+    # pass through the z-norm/denorm unchanged so the denoiser sees
+    # raw values (e.g. binary {0,1} for foot_contact).
+    offset = 0
+    for component in model._globalComponents:
+        if getattr(component, "skipNormalization", False):
+            mean[offset:offset + component.channels] = 0.0
+            std[offset:offset + component.channels] = 1.0
+            LOGGER.info(
+                "Global stats: skipping z-norm for %s (channels %d-%d) "
+                "→ mean=0, std=1 (identity).",
+                component.key,
+                offset,
+                offset + component.channels - 1,
+            )
+        offset += component.channels
+
     return mean.unsqueeze(0).unsqueeze(0), std.unsqueeze(0).unsqueeze(0)
 
 
@@ -976,9 +1060,16 @@ def saveCheckpoint(
     loss: float,
     checkpointDir: Path,
     filename: str = "best_model.pt",
+    ema: Optional[ExponentialMovingAverage] = None,
 ) -> Path:
     """
     Save model checkpoint.
+
+    When ``ema`` is provided, the EMA shadow weights are written as
+    ``model_state_dict`` (so ``generate_animation.py`` loads them by
+    default) and the true online weights are preserved under
+    ``online_state_dict`` so the next ``loadCheckpoint`` call can resume
+    training from the exact trajectory.
 
     Parameters
     ----------
@@ -994,24 +1085,44 @@ def saveCheckpoint(
         Directory for checkpoints.
     filename : str, optional
         Checkpoint filename.
+    ema : Optional[ExponentialMovingAverage]
+        When provided, the EMA shadow is saved alongside the online state
+        and the primary ``model_state_dict`` key points at the EMA weights.
 
     Returns
     -------
     Path
         Path to saved checkpoint.
     """
+    onlineStateDict = model.state_dict()
+    denoiserStateDict = model.denoiser.state_dict()
+    payload: dict[str, object] = {
+        "epoch": epoch,
+        "optimizer_state_dict": optimizer.state_dict(),
+        "loss": loss,
+        "prediction_target": PREDICTION_TARGET_X0,
+    }
+    if ema is not None:
+        # Materialise the EMA weights as a full model.state_dict() shape by
+        # swapping in-place, snapshotting, then restoring — no second model
+        # instance, no DDP quirks.
+        ema.storeAndSwap(model.trainableParameters())
+        try:
+            emaAsStateDict = model.state_dict()
+            emaDenoiserStateDict = model.denoiser.state_dict()
+        finally:
+            ema.restore(model.trainableParameters())
+        payload["model_state_dict"] = emaAsStateDict
+        payload["denoiser_state_dict"] = emaDenoiserStateDict
+        payload["online_state_dict"] = onlineStateDict
+        payload["online_denoiser_state_dict"] = denoiserStateDict
+        payload["ema_state_dict"] = ema.stateDict()
+    else:
+        payload["model_state_dict"] = onlineStateDict
+        payload["denoiser_state_dict"] = denoiserStateDict
+
     checkpointPath = checkpointDir / filename
-    saveTorchObjectAtomically(
-        {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "denoiser_state_dict": model.denoiser.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "loss": loss,
-            "prediction_target": PREDICTION_TARGET_X0,
-        },
-        checkpointPath,
-    )
+    saveTorchObjectAtomically(payload, checkpointPath)
 
     return checkpointPath
 
@@ -1020,9 +1131,18 @@ def loadCheckpoint(
     checkpointPath: Path,
     model: MotionGenerator,
     optimizer: Optional[torch.optim.Optimizer] = None,
+    ema: Optional[ExponentialMovingAverage] = None,
 ) -> Tuple[int, float]:
     """
     Load model checkpoint.
+
+    When ``ema`` is provided (training resume), the EMA shadow is
+    restored from ``ema_state_dict`` and the online weights are loaded
+    from ``online_state_dict`` — the true training trajectory, not the
+    EMA-smoothed snapshot that lives under ``model_state_dict``.  When
+    ``ema`` is ``None`` (inference), the primary ``model_state_dict`` is
+    used directly, which already contains the EMA weights if the
+    checkpoint was produced with EMA enabled.
 
     Parameters
     ----------
@@ -1032,6 +1152,8 @@ def loadCheckpoint(
         Model to load into.
     optimizer : Optional[torch.optim.Optimizer], optional
         Optimizer to load state into.
+    ema : Optional[ExponentialMovingAverage], optional
+        EMA manager to restore.  Signals "this is a training resume".
 
     Returns
     -------
@@ -1060,16 +1182,55 @@ def loadCheckpoint(
             "Only x0 checkpoints can be loaded."
         )
 
-    # Try to load full model state first, fallback to denoiser only.
-    # ``strict=False`` on both branches lets older checkpoints resume after
-    # architecture upgrades (e.g. the motionSkipProj / min-SNR fixes) that
-    # introduce new parameters absent from the saved state_dict.
-    if "model_state_dict" in checkpoint:
+    # Resume logic:
+    #  - Training resume (ema given): prefer online_state_dict so the next
+    #    training step picks up the exact trajectory; fall back to the old
+    #    flat model_state_dict for backward compat with pre-EMA checkpoints.
+    #  - Inference (ema is None): load model_state_dict directly.  On an
+    #    EMA-aware checkpoint that is already the EMA-smoothed snapshot,
+    #    which is what we want at generation time.
+    # ``strict=False`` on every branch keeps old checkpoints loadable after
+    # architecture upgrades (new / dropped parameters tolerated).
+    if ema is not None and "online_state_dict" in checkpoint:
+        model.load_state_dict(
+            checkpoint["online_state_dict"], strict=False,
+        )
+    elif "model_state_dict" in checkpoint:
         model.load_state_dict(checkpoint["model_state_dict"], strict=False)
     elif "denoiser_state_dict" in checkpoint:
         model.denoiser.load_state_dict(
             checkpoint["denoiser_state_dict"], strict=False,
         )
+
+    # After loading checkpoint weights, enforce skipNormalization on global
+    # stats buffers.  Old checkpoints may contain stale z-norm stats for
+    # components that now opt out (e.g. foot_contact BCE fix).  This forces
+    # mean=0 / std=1 for those channels so the denoiser sees raw values.
+    model.enforceSkipNormalization()
+
+    # Restore EMA shadow when we are resuming training.
+    if ema is not None:
+        if "ema_state_dict" in checkpoint:
+            try:
+                ema.loadStateDict(checkpoint["ema_state_dict"])
+            except RuntimeError as error:
+                LOGGER.warning(
+                    "EMA state in checkpoint is incompatible (%s); "
+                    "re-initialising EMA from the loaded online weights.",
+                    error,
+                )
+                ema.copyTo(model.trainableParameters())  # no-op on params
+        else:
+            LOGGER.warning(
+                "Checkpoint predates EMA support; re-initialising EMA "
+                "shadow from the online weights."
+            )
+            # Re-seed shadow with the freshly loaded online params by
+            # overwriting the internal shadow tensors.
+            for shadow, param in zip(
+                ema.shadow, list(model.trainableParameters())
+            ):
+                shadow.data.copy_(param.detach())
 
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
         try:

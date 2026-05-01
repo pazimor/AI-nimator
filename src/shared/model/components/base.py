@@ -33,7 +33,15 @@ class MotionComponent:
     Components expose enough metadata for dataset preprocessing, tensor
     validation, and loss routing. Concrete subclasses can override
     ``extract`` and ``loss`` when a component needs custom behavior.
+
+    Set ``skipNormalization = True`` on a subclass to exclude its
+    channels from the shared z-normalization pass.  The statistics for
+    those channels are forced to mean=0 / std=1 (identity transform)
+    after ``computeGlobalStatistics`` runs.
     """
+
+    # Override in subclasses to skip z-normalization.
+    skipNormalization: bool = False
 
     descriptor = MotionComponentDescriptor(
         key="component",

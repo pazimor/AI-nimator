@@ -22,7 +22,10 @@ from src.shared.preprocessed_dataset import PreprocessedLinkDataset
 LOGGER = logging.getLogger("shared.dataset_manager")
 
 BYTES_PER_GB = 1024 * 1024 * 1024
-AUTO_MEMORY_FRACTION = 0.6
+# Leave 1 GB headroom for the OS and other processes.  Dataset chunk
+# sizing uses (available_RAM - SYSTEM_RAM_HEADROOM_BYTES - model_memory)
+# as the hard budget; there is no user-tunable memory knob anymore.
+SYSTEM_RAM_HEADROOM_BYTES = 1 * BYTES_PER_GB
 AUTO_MIN_SAMPLE_MULTIPLIER = 4
 MIN_SAMPLES = 1
 MODEL_MEMORY_MULTIPLIER = 3
@@ -48,28 +51,19 @@ class MemoryManagerConfig:
 
     Attributes
     ----------
-    MM_memoryLimitGB : float
-        Maximum memory usage in GB before triggering cleanup.
-        Set to 0 to disable memory-based cleanup.
     clearMpsCache : bool
         When False, skip torch.mps.empty_cache() during cleanup.
     """
 
-    MM_memoryLimitGB: float = 0.0
     clearMpsCache: bool = True
-
-    @property
-    def MM_memoryLimitBytes(self) -> int:
-        """Return memory limit in bytes."""
-        return int(self.MM_memoryLimitGB * BYTES_PER_GB)
 
 
 class MemoryManager:
     """
-    Manages memory usage during training.
+    Manages memory reporting and cache eviction during training.
 
-    Uses a threshold-based approach instead of interval-based GC.
-    Monitors both CPU and GPU (MPS/CUDA) memory.
+    Monitors both CPU and GPU (MPS/CUDA) memory for logging; explicit
+    cache eviction runs on epoch boundaries via `clearCache`.
     """
 
     def __init__(
@@ -89,8 +83,6 @@ class MemoryManager:
         """
         self.config = config
         self.device = device
-        self._lastCheckBatch = 0
-        self._checkInterval = 10
 
     def getMemoryUsageGB(self) -> float:
         """
@@ -132,50 +124,6 @@ class MemoryManager:
                 return None
 
         return None
-
-    def checkAndCleanup(self, batchIndex: int, force: bool = False) -> bool:
-        """
-        Check memory usage and trigger cleanup if needed.
-
-        Parameters
-        ----------
-        batchIndex : int
-            Current batch index.
-        force : bool
-            Force cleanup regardless of threshold.
-
-        Returns
-        -------
-        bool
-            True if cleanup was performed.
-        """
-        if self.config.MM_memoryLimitGB <= 0 and not force:
-            return False
-
-        if not force and (
-            batchIndex - self._lastCheckBatch
-        ) < self._checkInterval:
-            return False
-
-        self._lastCheckBatch = batchIndex
-
-        cpuMemGB = self.getMemoryUsageGB()
-        gpuMemGB = self.getGPUMemoryUsageGB()
-
-        currentUsageGB = cpuMemGB
-        if gpuMemGB is not None:
-            currentUsageGB = max(currentUsageGB, gpuMemGB)
-
-        if currentUsageGB > self.config.MM_memoryLimitGB or force:
-            self._performCleanup()
-            LOGGER.debug(
-                "MM: Memory cleanup triggered at %.2f GB (limit: %.2f GB)",
-                currentUsageGB,
-                self.config.MM_memoryLimitGB,
-            )
-            return True
-
-        return False
 
     def _performCleanup(self) -> None:
         """Perform garbage collection and GPU cache cleanup."""
@@ -238,6 +186,7 @@ class DatasetManager:
         generationCacheCheckpoint: Optional[Path] = None,
         includeTokenizedText: bool = True,
         preloadEpochChunks: bool = False,
+        mirrorProbability: float = 0.0,
     ) -> None:
         self.datasetRoot = datasetRoot
         self.batchSize = batchSize
@@ -251,6 +200,7 @@ class DatasetManager:
         self.generationCacheCheckpoint = generationCacheCheckpoint
         self.includeTokenizedText = includeTokenizedText
         self.preloadEpochChunks = preloadEpochChunks
+        self.mirrorProbability = float(mirrorProbability)
 
         self.memoryConfig = memoryConfig or MemoryManagerConfig()
         self.memoryManager = MemoryManager(self.memoryConfig, device)
@@ -523,7 +473,7 @@ class DatasetManager:
                 label=f"train {chunkInfo}",
             )
             trainLoader = self._makeDataloader(
-                trainDataset,
+                self._wrapTrainingDataset(trainDataset),
                 shuffle=True,
             )
             valLoader = self._buildFixedValidationLoader()
@@ -531,14 +481,20 @@ class DatasetManager:
         chunkDataset = self._buildEpochDataset(indices, label=chunkInfo)
 
         if self.validationSplit <= 0.0 or len(indices) < 2:
-            trainLoader = self._makeDataloader(chunkDataset, shuffle=True)
+            trainLoader = self._makeDataloader(
+                self._wrapTrainingDataset(chunkDataset),
+                shuffle=True,
+            )
             return trainLoader, None, chunkInfo
 
         valSize = max(1, int(len(indices) * self.validationSplit))
         trainSize = len(indices) - valSize
         trainSubset, valSubset = random_split(chunkDataset, [trainSize, valSize])
 
-        trainLoader = self._makeDataloader(trainSubset, shuffle=True)
+        trainLoader = self._makeDataloader(
+            self._wrapTrainingDataset(trainSubset),
+            shuffle=True,
+        )
         valLoader = self._makeDataloader(valSubset, shuffle=False)
 
         return trainLoader, valLoader, chunkInfo
@@ -588,6 +544,15 @@ class DatasetManager:
         self._shuffledCycleOrder = order
         return order
 
+    def _wrapTrainingDataset(
+        self,
+        dataset: Dataset[Dict[str, object]],
+    ) -> Dataset[Dict[str, object]]:
+        """Wrap ``dataset`` with mirror augmentation if enabled."""
+        if self.mirrorProbability <= 0.0:
+            return dataset
+        return _MirrorAugmentedDataset(dataset, self.mirrorProbability)
+
     def _makeDataloader(
         self,
         dataset: Dataset[Dict[str, object]],
@@ -603,24 +568,6 @@ class DatasetManager:
             num_workers=0,
             pin_memory=pinMemory,
         )
-
-    def checkMemory(self, batchIndex: int, force: bool = False) -> bool:
-        """
-        Check memory and cleanup if needed.
-
-        Parameters
-        ----------
-        batchIndex : int
-            Current batch index.
-        force : bool
-            Force cleanup regardless of threshold.
-
-        Returns
-        -------
-        bool
-            True if cleanup was performed.
-        """
-        return self.memoryManager.checkAndCleanup(batchIndex, force)
 
     def clearCache(self) -> None:
         """
@@ -947,7 +894,7 @@ def _computeAutoChunkSize(
         Estimated model memory footprint.
     """
     availableBytes = psutil.virtual_memory().available
-    budgetBytes = int(availableBytes * AUTO_MEMORY_FRACTION) - modelMemoryBytes
+    budgetBytes = availableBytes - SYSTEM_RAM_HEADROOM_BYTES - modelMemoryBytes
     if budgetBytes <= 0:
         return max(batchSize, MIN_SAMPLES)
     averageSampleBytes = dataset.getAverageSampleBytes()
@@ -1040,3 +987,41 @@ class _InMemorySampleDataset(Dataset[Dict[str, object]]):
 
     def __getitem__(self, index: int) -> Dict[str, object]:
         return self.samples[index]
+
+
+class _MirrorAugmentedDataset(Dataset[Dict[str, object]]):
+    """
+    Wrap a training dataset so each sample is mirrored with probability ``p``.
+
+    Applied only to the *training* side of any split; the validation loader
+    keeps the original dataset instance untouched so metrics remain
+    comparable across runs.  Each __getitem__ call reseeds from a Torch
+    generator — dataloader shuffling drives iteration order, and we draw
+    a fresh coin per fetch so an epoch sees a roughly 50/50 mix rather
+    than a fixed set.
+    """
+
+    def __init__(
+        self,
+        base: Dataset[Dict[str, object]],
+        probability: float,
+        seed: Optional[int] = None,
+    ) -> None:
+        # Import here to avoid a circular import with feature builders.
+        from src.shared.augmentation.mirror import mirrorMotionSample
+
+        self._base = base
+        self._probability = float(probability)
+        self._mirror = mirrorMotionSample
+        self._generator = random.Random(
+            seed if seed is not None else random.randrange(1 << 30),
+        )
+
+    def __len__(self) -> int:
+        return len(self._base)
+
+    def __getitem__(self, index: int) -> Dict[str, object]:
+        sample = self._base[index]
+        if self._probability > 0.0 and self._generator.random() < self._probability:
+            return self._mirror(sample)
+        return sample
