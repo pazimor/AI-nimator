@@ -3,23 +3,27 @@ paths:
   # All 17 AMASS folders available:
   # ["ACCAD", "BioMotionLab_NTroje", "BMLHandball", "BMLmovi", "CMU", "DFaust_67", "EKUT", "Eyes_Japan_Dataset", "HumanEva", "KIT", "MPI_HDM05", "MPI_Limits", "MPI_mosh", "SFU", "SSM_synced", "TotalCapture", "Transitions_mocap"]
   #
-  # Étape 1 — Light triage by ROI for "natural locomotion" goal.
-  # Selected the 4 datasets with highest density of walking/everyday motion;
-  # ACCAD alone biased the model toward stylized/dance moves ("ballerina
-  # jumping" output at the previous best_model.pt val=0.397).
+  # v2 refonte — Extended folder set including KIT (AMASS-KIT subset with
+  # HumanML3D annotations).  KIT was reserved during Étape 1 because the
+  # focus was natural locomotion and the dataset was ACCAD/BML-heavy; the
+  # v2 plan calls for a richer prompt distribution to escape the
+  # locomotion-collapse mode and get the network to actually respect
+  # non-locomotion prompts (crawl, dance, sit, etc.).
   #
-  #   ACCAD              ~1500 mtn — keep for stylistic diversity (diluted by the others)
-  #   BioMotionLab_NTroje ~3000 mtn — THE locomotion dataset (age/gender/speed walking variants)
-  #   CMU                ~2500 mtn — gold standard, very diverse, lots of walking/running
-  #   BMLmovi            ~1800 mtn — natural daily activities, ~90 subjects
+  # Active folders (preprocessed sample counts from sample_index.json):
+  #   ACCAD                1,482 mtn — stylistic diversity
+  #   BioMotionLab_NTroje  2,264 mtn — locomotion variants (age/gender/speed)
+  #   CMU                 19,124 mtn — gold standard, very diverse
+  #   BMLmovi              9,619 mtn — natural daily activities (~90 subjects)
+  #   KIT                 23,973 mtn — varied sports + manipulation + ADL,
+  #                                    HumanML3D-style annotations (3 captions/mtn)
+  # Total active: ~56,462 samples (vs ~32,489 in Étape 1, +73%).
   #
-  # Excluded (reasoning in plan: domain mismatch or volume too small to matter):
-  #   BMLHandball (sport-specific), DFaust_67 (body deformation, no locomotion),
-  #   MPI_Limits (static poses), MPI_mosh (test data), Transitions_mocap (niche),
-  #   EKUT/HumanEva/SFU/SSM_synced/TotalCapture/Eyes_Japan_Dataset (small volumes,
-  #   marginal gain vs noise).  KIT and MPI_HDM05 reserved for Heavy option if
-  #   Light fails to break val_loss < 0.32.
-  dataset-folders: ["ACCAD", "BioMotionLab_NTroje", "CMU", "BMLmovi"]
+  # Still excluded (reserved for "Heavy option" if v2 fails to break the
+  # ceiling): Eyes_Japan_Dataset (13k), MPI_HDM05 (6.6k), EKUT (1.5k),
+  # MPI_Limits/MPI_mosh/SFU/SSM_synced/TotalCapture/HumanEva/BMLhandball/
+  # DFaust_67/Transitions_mocap (small volumes or domain mismatch).
+  dataset-folders: ["ACCAD", "BioMotionLab_NTroje", "CMU", "BMLmovi", "KIT"]
   clip-checkpoint: "../../output/clip/best_model.pt"
   checkpoint-dir: "../../output/generation"
 
@@ -43,12 +47,14 @@ training:
   early-stopping-patience: 80
   batch-size: 2
   gradient-accumulation: 8
-  # max-samples-per-epoch caps the random sub-sample drawn each epoch so the
-  # ~9000-sample multi-folder set (ACCAD + BioMotionLab + CMU + BMLmovi)
-  # doesn't make every epoch take 25+ minutes on MPS.  Lowered 10000 → 5000
-  # for Étape 1: still 3.4× the old ACCAD-only set in coverage, keeps epoch
-  # time around ~13 min, and over ~150 epochs the model sees ~750k
-  # sample-presentations (plenty for generalization).
+  # max-samples-per-epoch caps the random sub-sample drawn each epoch.
+  # With the v2 refonte folder set (ACCAD + BioMotionLab + CMU + BMLmovi +
+  # KIT ≈ 56,462 samples), 5000 means ~9% coverage per epoch.  This keeps
+  # epoch time around ~13 min on MPS and lets the random sub-sampler
+  # rotate through different parts of the corpus across epochs.  Over a
+  # 200-epoch run the model sees ~1M sample-presentations, ≈18× the
+  # active dataset size — plenty for generalisation without
+  # over-saturating any single subset.
   max-samples-per-epoch: 5000
   # Chunk sizing is automatic: available RAM - 1 GB headroom - model memory.
   # Resume from Étape 1 best checkpoint (epoch 238, val_loss 0.4381).

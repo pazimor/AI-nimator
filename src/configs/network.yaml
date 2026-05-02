@@ -129,3 +129,73 @@ overfit:
       joint-velocity: true
       end-effector-velocity: true
       pelvis-height: false
+
+# ============================================
+# Profile: v2 (refonte)
+# ============================================
+# Lean representation + compact denoiser, matching the v2 plan:
+# * 4 transformer blocks, embedDim 384, 8 heads (vs 6/512/8 in `default`)
+# * No spatial GCN, no spatio-temporal mix layers
+# * Only rotation6d (132 ch) + root_translation (3 ch) = 135 channels
+#   active.  All FK-derivable signals (joint_xyz, joint_velocity,
+#   foot_contact, end_effector_velocity, pelvis_height) are disabled —
+#   they are computed at the loss stage from rotation6d via FK rather
+#   than predicted as redundant channels.
+#
+# This profile is consumed by the v2 stack
+# (`src.shared.model.generation.denoiser_v2.MotionDenoiserV2`).  The
+# legacy `default` and `overfit` profiles continue to drive
+# `src.shared.model.generation.denoiser.MotionDenoiser` until the
+# migration completes.
+# ============================================
+v2:
+  # Top-level embed-dim is unused by v2 (no CLIP contrastive pre-train).
+  # Kept for schema compatibility with the loader.
+  embed-dim: 384
+
+  # CLIP block: kept to satisfy the loader, but the v2 stack does NOT
+  # use this branch.  Will be removed once the legacy CLIP module is
+  # archived (Phase A.6).
+  clip:
+    motion-num-heads: 4
+    motion-num-layers: 2
+    bone-data:
+      rotation6d: true
+      foot-contact: false
+      hand-contact: false
+      root-translation: true
+      root-velocity: false
+      root-yaw: false
+      root-yaw-velocity: false
+      joint-xyz: false
+      joint-velocity: false
+      end-effector-velocity: false
+      pelvis-height: false
+
+  generation:
+    # MotionDenoiserV2: compact stack, cross-attn only.
+    embed-dim: 384
+    num-heads: 8
+    num-layers: 4
+    num-bones: 22
+    diffusion-steps: 1000
+    # No spatial/spatio-temporal pre-blocks in v2 — they were removed
+    # from MotionDenoiserV2 entirely.  Both flags must stay at 0.
+    num-spatial-layers: 0
+    num-spatio-temporal-layers: 0
+
+    bone-data:
+      rotation6d: true        # primary motion signal (132 ch)
+      root-translation: true  # global trajectory (3 ch)
+      # All other channels are disabled.  FK-derivable signals are
+      # supervised through the auxiliary `vel_xyz_loss` instead of
+      # being predicted.
+      foot-contact: false
+      hand-contact: false
+      root-velocity: false
+      root-yaw: false
+      root-yaw-velocity: false
+      joint-xyz: false
+      joint-velocity: false
+      end-effector-velocity: false
+      pelvis-height: false

@@ -1,0 +1,64 @@
+# ============================================
+# Custom Text Encoder — AI-nimator v2
+# ============================================
+# Configuration for the custom BPE tokenizer + small transformer text
+# encoder that replaces the frozen XLM-RoBERTa pipeline (110M params,
+# 768-d, multilingual) with a domain-specific stack (~5M params, 256-d,
+# English motion descriptions only).
+#
+# This file is consumed by:
+#   * src/cli/train_custom_tokenizer.py (tokenizer.* keys only)
+#   * src/features/generation/train_generation.py (encoder.* keys when
+#     building the v2 text branch — to be wired in Phase A.5).
+# ============================================
+
+tokenizer:
+  # Target BPE vocabulary size (including 4 special tokens).
+  # ~8k covers the AMASS-Babel + KIT prompt vocabulary (~3k unique
+  # words) with comfortable headroom for compound BPE merges.  Going
+  # higher (16k, 32k) gives marginal token-length savings on a
+  # short-prompt domain and is not worth the embedding cost.
+  vocab-size: 8000
+
+  # Minimum number of occurrences for a BPE merge to be considered.
+  # `2` keeps rare-but-real motion terms; `1` lets typo noise leak in.
+  min-frequency: 2
+
+  # Default maximum number of tokens kept after truncation.
+  # 64 matches the legacy `maxPromptLength` from the XLM-R pipeline so
+  # the cross-attention sequence length is unchanged downstream.
+  max-length: 64
+
+  # Special-token strings.  IDs are deterministic in this order:
+  #   pad=0, unk=1, bos=2, eos=3.
+  pad-token: "<pad>"
+  unk-token: "<unk>"
+  bos-token: "<bos>"
+  eos-token: "<eos>"
+
+encoder:
+  # Width of the encoder.  256 keeps the encoder ~5M params (vs the
+  # 110M of XLM-RoBERTa-base) while leaving enough capacity for the
+  # ~3k unique-word motion vocabulary.
+  hidden-dim: 256
+
+  # Stacked pre-norm transformer blocks (self-attn + GELU FFN).
+  # 4 is the v2 default — deeper stacks risk underfitting on the
+  # corpus size (~37k unique prompts).
+  num-layers: 4
+
+  # Attention heads.  Must divide `hidden-dim`.  8 → 32 dim/head.
+  num-heads: 8
+
+  # FFN inner dimension.  0 means use 4 × hidden-dim (= 1024 here),
+  # which matches the convention in the existing `TemporalLayer`.
+  ffn-dim: 0
+
+  # Dropout applied inside attention and FFN sublayers.
+  dropout: 0.1
+
+  # Output projection dimension.  When the denoiser's embed-dim is
+  # known (target 384 in the v2 plan, see network.yaml refonte in
+  # Phase A.5), set this to 384 to spare the consumer an extra
+  # projection.  0 = keep `hidden-dim` and let the consumer adapt.
+  output-dim: 384
