@@ -33,6 +33,61 @@ def test_preprocessed_link_dataset_loads_sample_and_text(tmp_path) -> None:
     assert tuple(item["pooled_text"].shape) == (3,)
 
 
+def test_preprocessed_link_dataset_propagates_raw_text(tmp_path) -> None:
+    """Phase F iter-3 (2026-05-15) — regression guard.
+
+    Prior to the fix, ``__getitem__`` copied ``pooled_text`` from the
+    text shard but silently dropped ``raw_text``, so every downstream
+    consumer (``collateV2Batch`` → tokenizer → text encoder) saw an
+    empty string for every sample of every batch.  The encoder
+    collapsed to a single output, ``enc_sim`` was a constant 1.0
+    across batches, and the v2 contrastive / CFG paths could not
+    learn.
+    """
+    datasetRoot = _writeDataset(tmp_path)
+    dataset = PreprocessedLinkDataset(datasetRoot)
+    item = dataset[0]
+
+    assert "raw_text" in item, (
+        "raw_text must be propagated from the text shard into the "
+        "per-sample payload — without it, the v2 training loop falls "
+        "back to the empty string for every sample."
+    )
+    assert item["raw_text"] == "walk"
+
+
+def test_preprocessed_link_dataset_distinct_raw_texts(tmp_path) -> None:
+    """Distinct text-shard entries must surface as distinct raw_text fields."""
+    datasetRoot = _writeMultiShardDataset(tmp_path)
+    dataset = PreprocessedLinkDataset(datasetRoot)
+
+    rawTexts = [str(dataset[i]["raw_text"]) for i in range(len(dataset))]
+    # The multi-shard fixture writes distinct raw_text per text_id; several
+    # samples can legitimately share the same text_id, but we must observe
+    # more than a single value across the dataset.  A constant raw_text was
+    # the exact symptom of the iter-2 bug (everything fell back to "").
+    assert len(set(rawTexts)) > 1, (
+        f"raw_text values must vary across samples; got {rawTexts!r}"
+    )
+
+
+def test_preprocessed_link_dataset_raw_text_missing_falls_back_empty(
+    tmp_path,
+) -> None:
+    """Older shards without ``raw_text`` must still load (graceful fallback)."""
+    datasetRoot = _writeDataset(tmp_path)
+    # Rewrite the text shard without the raw_text field.
+    textShard = datasetRoot / "text_shards" / "text_shard_00000.pt"
+    entries = torch.load(textShard, map_location="cpu", weights_only=False)
+    for entry in entries:
+        entry.pop("raw_text", None)
+    torch.save(entries, textShard)
+
+    dataset = PreprocessedLinkDataset(datasetRoot)
+    item = dataset[0]
+    assert item["raw_text"] == ""
+
+
 def test_preprocessed_link_dataset_loads_generation_cache(tmp_path) -> None:
     datasetRoot = _writeDataset(tmp_path)
     checkpointPath = datasetRoot / "clip_checkpoint.pt"

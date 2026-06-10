@@ -294,3 +294,107 @@ def test_encode_texts_helper_returns_correct_shape() -> None:
         ["a person walks forward.", "someone runs backward then stops."],
     )
     assert output.hiddenStates.shape == (2, 16, 32)
+
+
+# ---------------------------------------------------------------------
+# Phase F — null embedding + L2-normalisation
+# ---------------------------------------------------------------------
+def _buildSmallEncoder(
+    useNullEmbedding: bool = True,
+    l2NormalizeOutput: bool = True,
+    outputDim: int = 0,
+) -> tuple[CustomTokenizer, CustomTextEncoder]:
+    tokenizer = _trainTokenizer(maxLength=16, vocabSize=256)
+    config = CustomTextEncoderConfig(
+        vocabSize=tokenizer.vocabSize,
+        maxLength=tokenizer.config.maxLength,
+        hiddenDim=32,
+        numLayers=2,
+        numHeads=4,
+        ffnDim=64,
+        dropout=0.0,
+        padTokenId=tokenizer.padTokenId,
+        outputDim=outputDim,
+        useNullEmbedding=useNullEmbedding,
+        l2NormalizeOutput=l2NormalizeOutput,
+    )
+    encoder = CustomTextEncoder(config=config)
+    encoder.eval()
+    return tokenizer, encoder
+
+
+def test_null_embedding_is_registered_parameter() -> None:
+    _, encoder = _buildSmallEncoder(useNullEmbedding=True)
+    assert encoder.nullEmbedding is not None
+    assert encoder.nullEmbedding.requires_grad
+    assert encoder.nullEmbedding.shape == (1, 1, encoder.outputDim)
+
+
+def test_null_embedding_can_be_disabled() -> None:
+    _, encoder = _buildSmallEncoder(useNullEmbedding=False)
+    assert encoder.nullEmbedding is None
+    with pytest.raises(RuntimeError, match="useNullEmbedding=False"):
+        encoder.forwardNull(batchSize=2)
+
+
+def test_forward_null_returns_expected_shapes() -> None:
+    _, encoder = _buildSmallEncoder()
+    out = encoder.forwardNull(batchSize=4)
+    assert out.hiddenStates.shape == (4, 1, encoder.outputDim)
+    assert out.keyPaddingMask.shape == (4, 1)
+    # All positions are real (not padding) — keyPaddingMask is all False.
+    assert not out.keyPaddingMask.any().item()
+
+
+def test_forward_null_is_constant_across_batch() -> None:
+    _, encoder = _buildSmallEncoder()
+    out = encoder.forwardNull(batchSize=8)
+    first = out.hiddenStates[0]
+    assert torch.allclose(out.hiddenStates, first.expand_as(out.hiddenStates))
+
+
+def test_forward_null_distinct_from_empty_string_encoding() -> None:
+    # Sanity check that the null embedding is NOT a function of the
+    # encoder forward path on EMPTY_PROMPT="" — that was the whole point
+    # of the change.
+    tokenizer, encoder = _buildSmallEncoder()
+    emptyBatch = tokenizer.encode([""])
+    encOutput = encoder(emptyBatch.inputIds, emptyBatch.attentionMask)
+    nullOutput = encoder.forwardNull(batchSize=1)
+    # Pool both to a single (1, D) vector and compare.
+    encMask = (~encOutput.keyPaddingMask).float().unsqueeze(-1)
+    encPooled = (encOutput.hiddenStates * encMask).sum(dim=1) / encMask.sum(
+        dim=1
+    ).clamp(min=1.0)
+    nullPooled = nullOutput.hiddenStates.squeeze(1)
+    cosine = torch.nn.functional.cosine_similarity(encPooled, nullPooled).item()
+    # They should NOT be identical.  With random init the two vectors
+    # live in independent subspaces, so cosine ≪ 1.
+    assert abs(cosine) < 0.95, (
+        f"Null embedding cosine to empty-string encoding is {cosine:.4f}, "
+        "which suggests the null token collapsed onto the BOS embedding."
+    )
+
+
+def test_l2_normalise_output_has_unit_norm() -> None:
+    tokenizer, encoder = _buildSmallEncoder(l2NormalizeOutput=True)
+    batch = tokenizer.encode(["a person walks forward."])
+    output = encoder(batch.inputIds, batch.attentionMask)
+    norms = output.hiddenStates.norm(dim=-1)
+    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
+
+
+def test_l2_normalise_output_can_be_disabled() -> None:
+    tokenizer, encoder = _buildSmallEncoder(l2NormalizeOutput=False)
+    batch = tokenizer.encode(["a person walks forward."])
+    output = encoder(batch.inputIds, batch.attentionMask)
+    norms = output.hiddenStates.norm(dim=-1)
+    # With L2 disabled, norms are NOT all 1.0.
+    assert not torch.allclose(norms, torch.ones_like(norms), atol=1e-2)
+
+
+def test_forward_null_respects_l2_normalisation_setting() -> None:
+    _, encoder = _buildSmallEncoder(l2NormalizeOutput=True)
+    out = encoder.forwardNull(batchSize=2)
+    norms = out.hiddenStates.norm(dim=-1)
+    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)

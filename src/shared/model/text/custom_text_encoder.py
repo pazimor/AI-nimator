@@ -99,6 +99,17 @@ class CustomTextEncoderConfig:
     dropout: float = 0.1
     padTokenId: int = 0
     outputDim: int = 0  # 0 → use hiddenDim (no extra projection)
+    # Phase F — learnable null embedding for CFG unconditional branch.
+    # Replaces re-encoding of EMPTY_PROMPT="" which produced [BOS, pad, ...]
+    # whose pooled embedding sat near the centroid of cond embeddings,
+    # destroying the cond/uncond contrast (diagnosed cfg_sim ≈ 0.9995 on
+    # phaseD/E checkpoints).  A free Parameter is forced to a distinct
+    # region of the embedding space by the contrastive + diffusion losses.
+    useNullEmbedding: bool = True
+    # Phase F — L2-normalize the per-token hiddenStates before output
+    # projection.  Stabilises the magnitude of K/V into the denoiser
+    # cross-attention and gives the contrastive head a unit-norm signal.
+    l2NormalizeOutput: bool = True
 
     def __post_init__(self) -> None:
         if self.hiddenDim % self.numHeads != 0:
@@ -287,6 +298,19 @@ class CustomTextEncoder(nn.Module):
         else:
             self.outputProjection = nn.Identity()
 
+        # Phase F — learnable null embedding for CFG unconditional branch.
+        # Stored as a single token (B,1,D) at the output dim; broadcast at
+        # use-time to (B, T_null, D) with T_null = 1 plus padding to match
+        # the cond branch length when needed.  Initialised with the same
+        # std as token embeddings to land in the same magnitude range.
+        if config.useNullEmbedding:
+            self.nullEmbedding = nn.Parameter(
+                torch.randn(1, 1, config.effectiveOutputDim)
+                * (1.0 / math.sqrt(config.effectiveOutputDim))
+            )
+        else:
+            self.register_parameter("nullEmbedding", None)
+
         self._initWeights()
 
     # ------------------------------------------------------------------
@@ -404,8 +428,75 @@ class CustomTextEncoder(nn.Module):
         hidden = self.finalNorm(hidden)
         hidden = self.outputProjection(hidden)
 
+        # Phase F — optional L2-normalize per-token before exposing to
+        # downstream consumers (cross-attention K/V + contrastive head).
+        # Padded positions are also normalized but they are masked out by
+        # keyPaddingMask anyway.  ``+ eps`` keeps the gradient finite.
+        if self._config.l2NormalizeOutput:
+            hidden = nn.functional.normalize(hidden, p=2.0, dim=-1, eps=1e-8)
+
         return TextEncoderOutput(
             hiddenStates=hidden,
+            keyPaddingMask=keyPaddingMask,
+        )
+
+    def forwardNull(
+        self,
+        batchSize: int,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> TextEncoderOutput:
+        """Return the learnable null embedding for CFG's unconditional branch.
+
+        The unconditional branch must be **constant across the batch** and
+        **distinct from any cond embedding**.  Re-encoding the empty
+        string only gives a quasi-constant signal (the pooled-masked-mean
+        collapses to a function of the BOS token) which sits near the
+        centroid of cond embeddings; that destroys CFG sensitivity.  This
+        method bypasses the encoder entirely and broadcasts the learnable
+        ``nullEmbedding`` to ``(B, 1, D)`` with a key-padding mask that
+        marks the single position as a real token.
+
+        Parameters
+        ----------
+        batchSize : int
+            Number of unconditional samples to produce.
+        device : optional
+            Device of the returned tensors.  Defaults to the encoder's.
+        dtype : optional
+            Dtype of the returned tensors.  Defaults to ``nullEmbedding``'s.
+
+        Returns
+        -------
+        TextEncoderOutput
+            ``hiddenStates`` of shape ``(B, 1, D_out)`` and
+            ``keyPaddingMask`` of shape ``(B, 1)`` (all False = real).
+        """
+        if self.nullEmbedding is None:
+            raise RuntimeError(
+                "CustomTextEncoder.forwardNull called but the encoder was "
+                "configured with useNullEmbedding=False.  Either enable "
+                "the flag or fall back to encoding EMPTY_PROMPT manually."
+            )
+        if batchSize < 1:
+            raise ValueError(f"batchSize must be >= 1, got {batchSize}.")
+
+        targetDevice = (
+            torch.device(device) if device is not None else self.nullEmbedding.device
+        )
+        targetDtype = dtype if dtype is not None else self.nullEmbedding.dtype
+
+        nullToken = self.nullEmbedding.to(device=targetDevice, dtype=targetDtype)
+        if self._config.l2NormalizeOutput:
+            nullToken = nn.functional.normalize(
+                nullToken, p=2.0, dim=-1, eps=1e-8
+            )
+        hiddenStates = nullToken.expand(batchSize, 1, -1).contiguous()
+        keyPaddingMask = torch.zeros(
+            batchSize, 1, dtype=torch.bool, device=targetDevice
+        )
+        return TextEncoderOutput(
+            hiddenStates=hiddenStates,
             keyPaddingMask=keyPaddingMask,
         )
 

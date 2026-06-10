@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -42,6 +43,17 @@ def buildArgumentParser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--canonicalize-facing",
+        dest="canonicalizeFacing",
+        action="store_true",
+        help=(
+            "Phase 1.3 — rotate every clip so the pelvis at frame 0 "
+            "faces +Z.  Eliminates the heading ambiguity the denoiser "
+            "would otherwise have to learn from data.  Requires a "
+            "full preprocessing pass (the normaliser fit changes too)."
+        ),
+    )
+    parser.add_argument(
         "--network-config",
         type=Path,
         default=None,
@@ -64,6 +76,11 @@ def main() -> None:
     """
     parser = buildArgumentParser()
     arguments = parser.parse_args()
+    if arguments.canonicalizeFacing:
+        # The preprocessor checks this env var inside its window loop —
+        # set it before constructing the DatasetPreprocessor so child
+        # workers (if any) inherit it.
+        os.environ["AINIMATOR_CANONICALIZE_FACING"] = "1"
     config = loadPreprocessConfig(arguments.config)
     if arguments.network_config is not None:
         config = replace(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Mapping, Sequence
+from typing import Mapping, MutableMapping, Sequence
 
 import torch
 
@@ -210,6 +210,94 @@ def _extractRootTranslation(
     # Anchor to origin: every training sample starts at (0, 0, 0).
     translation = translation - translation[0:1]
     return translation
+
+
+def canonicalizeMotionFacing(
+    motion: torch.Tensor,
+    extras: MutableMapping[str, object] | Mapping[str, object],
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """Rotate motion + extras so frame 0 always faces world +Z.
+
+    Phase 1.3 (2026-05-17) — facing-direction canonicalisation.  Removes
+    one degree of freedom the model otherwise has to memorise (the
+    starting yaw of every sample).  Two things happen:
+
+    1. The pelvis yaw at frame 0 (``yaw0``) is extracted from the pelvis
+       6D rotation via :func:`_computeRootYaw`.
+    2. A rotation of ``-yaw0`` around the world Y axis is applied to
+       BOTH the pelvis 6D rotation (every frame) AND the root
+       translation (every frame).  All downstream joints inherit the
+       new pelvis frame via forward kinematics, so they do not need a
+       separate transform.
+
+    The result is bit-identical motion content but in a canonical
+    frame: every sample begins facing +Z, which dramatically reduces
+    the entropy of the input distribution the diffusion model has to
+    capture.  This is the standard HumanML3D / MDM pre-processing step.
+
+    Parameters
+    ----------
+    motion : torch.Tensor
+        Rotation6d tensor shaped ``(frames, 22, 6)``.
+    extras : Mapping[str, object]
+        Top-level extras (may include ``"trans"``).  The returned dict
+        is a shallow copy with ``"trans"`` rotated in place if present.
+
+    Returns
+    -------
+    tuple[torch.Tensor, dict[str, object]]
+        Canonicalised ``(motion, extras)``.  Other extras are passed
+        through untouched.
+    """
+    if motion.dim() != 3 or motion.shape[1] != len(SMPL22_BONE_ORDER) or motion.shape[2] != 6:
+        raise ValueError(
+            "canonicalizeMotionFacing expects motion of shape "
+            f"(frames, 22, 6); got {tuple(motion.shape)}."
+        )
+
+    yaw0 = _computeRootYaw(motion)[0, 0]  # scalar — yaw at frame 0
+    cosA = torch.cos(-yaw0)
+    sinA = torch.sin(-yaw0)
+    # Rotation around the world Y axis by -yaw0:
+    #     [[ cos, 0, sin],
+    #      [   0, 1,   0],
+    #      [-sin, 0, cos]]
+    rotY = torch.stack(
+        [
+            torch.stack([cosA, torch.zeros_like(cosA), sinA]),
+            torch.stack(
+                [torch.zeros_like(cosA), torch.ones_like(cosA), torch.zeros_like(cosA)]
+            ),
+            torch.stack([-sinA, torch.zeros_like(cosA), cosA]),
+        ]
+    ).to(dtype=motion.dtype, device=motion.device)
+
+    # --- Pelvis rotation: left-multiply pelvis matrix by rotY ----
+    motion = motion.clone()
+    pelvisRotation = motion[:, PELVIS_INDEX, :]  # (F, 6)
+    pelvisMatrix = sixdToRotationMatrix(pelvisRotation)  # (F, 3, 3)
+    pelvisMatrixCanon = rotY.unsqueeze(0) @ pelvisMatrix
+    # Re-pack to 6D as the first two columns of the rotation matrix.
+    pelvisCanon6d = torch.cat(
+        [pelvisMatrixCanon[..., 0], pelvisMatrixCanon[..., 1]],
+        dim=-1,
+    )
+    motion[:, PELVIS_INDEX, :] = pelvisCanon6d
+
+    # --- Root translation: rotate every frame by rotY ------------
+    extrasOut: dict[str, object] = dict(extras)
+    raw = extrasOut.get(ROOT_TRANSLATION_KEY)
+    if raw is not None:
+        translation = torch.as_tensor(raw, dtype=motion.dtype)
+        if translation.dim() != 2 or translation.shape[1] != 3:
+            raise ValueError(
+                "canonicalizeMotionFacing expects 'trans' of shape "
+                f"(frames, 3); got {tuple(translation.shape)}."
+            )
+        translationCanon = translation @ rotY.t()
+        extrasOut[ROOT_TRANSLATION_KEY] = translationCanon
+
+    return motion, extrasOut
 
 
 def _computeRootYaw(motion: torch.Tensor) -> torch.Tensor:

@@ -128,6 +128,19 @@ class PreprocessedLinkDataset(Dataset[Dict[str, object]]):
             "sample_id": int(linkEntry.sampleId),
             "text_id": int(linkEntry.textId),
             "pooled_text": textPayload["pooled_text"],
+            # Phase F iter-3 (2026-05-15) — propagate the human-readable
+            # ``raw_text`` from the text shard into the per-sample
+            # payload.  Before this fix the field stayed hidden inside
+            # textPayload and ``collateV2Batch`` silently fell back to
+            # the empty string for every sample, so the entire v2
+            # training pipeline was feeding ``[BOS, EOS]`` to the text
+            # encoder regardless of the underlying prompt — encoder
+            # within-batch pair sim was a constant 1.0 and the
+            # contrastive/CFG conditioning paths could not learn.  The
+            # ``.get`` default keeps older datasets without the field
+            # loadable (they fall through to ``""`` as before, but the
+            # diagnostic now surfaces the issue).
+            "raw_text": textPayload.get("raw_text", ""),
             "motion": samplePayload["motion"],
             "time": samplePayload["time"],
             "meta": samplePayload["meta"],

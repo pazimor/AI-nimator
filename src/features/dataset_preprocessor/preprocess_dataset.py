@@ -6,6 +6,7 @@ import gc
 import json
 import logging
 import math
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -35,6 +36,17 @@ from src.shared.model.components import (
     buildEnabledComponents,
     buildMotionFeatureTensors,
 )
+from src.shared.model.components.feature_builder import (
+    canonicalizeMotionFacing,
+)
+
+# Phase 1.3 (2026-05-17) — facing-direction canonicalisation toggle.
+# Off by default for backwards compatibility with existing preprocessed
+# datasets.  When set (any non-empty value), every window is rotated so
+# the pelvis at frame 0 faces world +Z before features are built.  This
+# changes the data distribution, so a new normaliser fit and a full
+# from-scratch retrain are required when flipping the flag.
+_CANONICALIZE_FACING_ENV = "AINIMATOR_CANONICALIZE_FACING"
 from src.shared.model.components.base import MotionComponent
 from src.shared.types import (
     PreprocessDatasetConfig,
@@ -245,6 +257,11 @@ class DatasetPreprocessor:
                 self.config.processing.maxSegmentFrames,
             ):
                 continue
+            if os.environ.get(_CANONICALIZE_FACING_ENV):
+                motionSlice, slicedExtras = canonicalizeMotionFacing(
+                    motion=motionSlice,
+                    extras=slicedExtras,
+                )
             featureTensors = buildMotionFeatureTensors(
                 motion=motionSlice,
                 extras=slicedExtras,

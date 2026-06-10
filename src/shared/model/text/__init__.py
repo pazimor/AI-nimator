@@ -6,6 +6,12 @@ denoiser.  The tokenizer is a BPE built on the prompt corpus (AMASS-Babel +
 KIT-ML), and the encoder is a small transformer (target ~5–10M params).
 """
 
+from src.shared.model.text.clip_text_encoder import (
+    ClipTextEncoder,
+    ClipTextEncoderConfig,
+    ClipTokenizer,
+    ClipTokenizerConfig,
+)
 from src.shared.model.text.custom_text_encoder import (
     CustomTextEncoder,
     CustomTextEncoderConfig,
@@ -18,6 +24,10 @@ from src.shared.model.text.custom_tokenizer import (
 )
 
 __all__ = [
+    "ClipTextEncoder",
+    "ClipTextEncoderConfig",
+    "ClipTokenizer",
+    "ClipTokenizerConfig",
     "CustomTextEncoder",
     "CustomTextEncoderConfig",
     "CustomTokenizer",

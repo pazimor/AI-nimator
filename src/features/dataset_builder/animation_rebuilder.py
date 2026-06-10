@@ -275,11 +275,14 @@ class AnimationRebuilder:
             id="Armature",
             name="Armature",
         )
+        # SMPL data is Y-up, the DAE declares Z_UP — rotate the Armature
+        # +90° around X so Blender (Z-up) shows the character upright
+        # instead of lying on its back. 2026-05-28 fix (plan section B).
         ET.SubElement(
             armature,
             "matrix",
             sid="transform",
-        ).text = "1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"
+        ).text = "1 0 0 0 0 0 -1 0 0 1 0 0 0 0 0 1"
         
         for bone_name in SMPL22_BONE_ORDER:
             parent_name = SMPL22_HIERARCHY.get(bone_name)

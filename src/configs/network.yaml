@@ -148,6 +148,12 @@ overfit:
 # `src.shared.model.generation.denoiser.MotionDenoiser` until the
 # migration completes.
 # ============================================
+# Phase F (2026-05-12) — the SOTA conditioning leviers (FiLM + per-block
+# AdaLN) and the learnable null embedding are now ON by default in the
+# Python dataclasses (V2FullTrainingConfig / MotionDenoiserV2Config).
+# Listed here for visibility — the YAML loader does not currently surface
+# these as overrides, but the keys make the configuration self-documenting
+# next to the architecture hyperparameters.
 v2:
   # Top-level embed-dim is unused by v2 (no CLIP contrastive pre-train).
   # Kept for schema compatibility with the loader.
@@ -173,7 +179,14 @@ v2:
       pelvis-height: false
 
   generation:
-    # MotionDenoiserV2: compact stack, cross-attn only.
+    # MotionDenoiserV2 (Phase F): compact stack, cross-attn + FiLM +
+    # per-block AdaLN.  The Phase E diagnostic on v2_full_best.pt showed
+    # the cross-attn-only path lets cond/uncond collapse (cfg_sim ≈
+    # 0.9995, seed_sim ≈ 0.97); the multiplicative paths added in
+    # Levier D / Levier E force a non-bypassable text gradient at every
+    # sub-layer.  Together with the learnable null embedding in the
+    # text encoder (useNullEmbedding=True) the CFG branch sees a real
+    # contrast against the cond branch.
     embed-dim: 384
     num-heads: 8
     num-layers: 4
@@ -183,6 +196,10 @@ v2:
     # from MotionDenoiserV2 entirely.  Both flags must stay at 0.
     num-spatial-layers: 0
     num-spatio-temporal-layers: 0
+    # Phase F flags — also defaulted to True in the Python dataclasses.
+    use-film-conditioning: true
+    use-per-block-film: true
+    use-null-embedding: true
 
     bone-data:
       rotation6d: true        # primary motion signal (132 ch)

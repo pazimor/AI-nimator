@@ -100,3 +100,45 @@ def test_root_translation_zeroing(tmp_path: Path) -> None:
     assert match, "pelvis translation channel missing"
     values = [float(v) for v in match.group(1).split()]
     assert all(abs(v) < 1e-4 for v in values)
+
+
+def test_armature_transform_is_yup_to_zup(tmp_path: Path) -> None:
+    """The Armature root must carry the +90°X matrix that maps Y-up
+    SMPL data to the Z-up coordinate system declared by the DAE.
+
+    Regression test for the 2026-05-28 orientation fix — without this
+    matrix Blender imports the character lying on its back.
+    """
+    config = _makeConfig(tmp_path)
+    builder = AnimationRebuilder(config)
+
+    frames = 2
+    bones = len(SMPL24_BONE_ORDER)
+    axisAngles = np.zeros((frames, bones * 3), dtype=np.float32)
+    sample = AnimationSample(
+        relativePath=Path("dummy.npz"),
+        resolvedPath=tmp_path / "dummy.npz",
+        axisAngles=axisAngles,
+        fps=30,
+        extras={"trans": np.zeros((frames, 3), dtype=np.float32)},
+    )
+
+    output = tmp_path / "out.dae"
+    builder.exportCollada(sample, output, zeroRootTranslation=True)
+    content = output.read_text()
+
+    match = re.search(
+        r'<node id="Armature"[^>]*>\s*<matrix[^>]*>([^<]+)</matrix>',
+        content,
+    )
+    assert match, "Armature root matrix missing"
+    values = [float(v) for v in match.group(1).split()]
+    expected = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, -1.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ]
+    assert values == expected, (
+        f"Armature transform must be Y-up→Z-up rotation; got {values}"
+    )
