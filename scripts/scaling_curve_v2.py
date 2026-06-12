@@ -20,14 +20,19 @@ from pathlib import Path
 
 import torch
 
-from src.features.generation.full_training_v2 import (
+from ainimator.training.full_training_v2 import (
     V2FullTrainingConfig,
     runFullTraining,
 )
-from src.features.generation.training_v2 import loadCheckpointV2, EMPTY_PROMPT
-from src.shared.model.components.ops import rot6dToJointXYZ
-from src.shared.model.generation.sampler_v2 import DDIMSamplerV2
-from src.shared.preprocessed_dataset import PreprocessedLinkDataset
+from ainimator.training.training_v2 import loadCheckpointV2, EMPTY_PROMPT
+from ainimator.model.sampler_v2 import DDIMSamplerV2
+from ainimator.data.preprocessed_dataset import PreprocessedLinkDataset
+from ainimator.health.evaluation import (
+    fkVector as _fk_health,
+    cosineSim as _cos,
+    pickProbes,
+    evaluateAtCfg,
+)
 
 DATASET = Path("/Users/pazimor/dataset_preprocessed")
 TOKENIZER = Path("output/text/custom_tokenizer")
@@ -45,30 +50,18 @@ def _log(line: str) -> None:
 
 
 def _fk(motion: torch.Tensor) -> torch.Tensor:
-    xyz = rot6dToJointXYZ(motion[:FRAMES].unsqueeze(0).float()).squeeze(0)
-    return (xyz - xyz[:, :1]).reshape(-1)
+    """FK vector — delegates to health/evaluation.py."""
+    return _fk_health(motion, maxFrames=FRAMES)
 
 
-def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
-    return float((a @ b) / (a.norm() * b.norm() + 1e-8))
-
-
-def _pickProbes(dataset: PreprocessedLinkDataset, accad: list[int]) -> list[int]:
-    wants = ["walk", "jump", "sit", "wave", "run", "kick", "turn"]
-    chosen: list[int] = []
-    usedWord: set[str] = set()
-    for index in accad:
-        text = (dataset[index].get("raw_text") or "").lower()
-        if dataset[index]["motion"].shape[0] < 80:
-            continue
-        for word in wants:
-            if word in text and word not in usedWord:
-                usedWord.add(word)
-                chosen.append(index)
-                break
-        if len(chosen) >= 5:
-            break
-    return chosen
+def _pickProbes(
+    dataset: PreprocessedLinkDataset, accad: list[int]
+) -> list[int]:
+    """Pick probe indices — delegates to health/evaluation.py."""
+    return pickProbes(
+        dataset, accad,
+        keywords=("walk", "jump", "sit", "wave", "run", "kick", "turn"),
+    )
 
 
 def _trainConfig(indices: list[int], epochs: int, outDir: Path) -> V2FullTrainingConfig:
@@ -92,40 +85,29 @@ def _evaluate(
     outDir: Path, probes: list[int], dataset, cfgScale: float = 1.0,
     checkpoint: str = "v2_full_best.pt",
 ) -> tuple[float, float, float]:
+    """Evaluate fidelity/retrieval/distinctness — delegates to health/evaluation.py."""
     tok, enc, den, sch, norm, _ = loadCheckpointV2(
         outDir / checkpoint, device=DEVICE
     )
-    enc.eval(); den.eval()
+    enc.eval()
+    den.eval()
     sampler = DDIMSamplerV2(sch, predictionMode="v")
-    gts = [_fk(dataset[i]["motion"]) for i in probes]
-    uncEnc = tok.encode(EMPTY_PROMPT)
-    unc = enc(uncEnc.inputIds.to(DEVICE), uncEnc.attentionMask.to(DEVICE))
-    useCfg = cfgScale != 1.0
-    gens: list[torch.Tensor] = []
-    for index in probes:
-        encoded = tok.encode(dataset[index].get("raw_text") or EMPTY_PROMPT)
-        out = enc(encoded.inputIds.to(DEVICE), encoded.attentionMask.to(DEVICE))
-        sample = sampler.sample(
-            denoiser=den, textHiddenStates=out.hiddenStates,
-            textKeyPaddingMask=out.keyPaddingMask, frames=FRAMES,
-            numSteps=100, cfgScale=cfgScale,
-            unconditionalTextHiddenStates=unc.hiddenStates if useCfg else None,
-            unconditionalTextKeyPaddingMask=unc.keyPaddingMask if useCfg else None,
-            eta=0.0, device=DEVICE, seed=0, normalizer=norm,
-        )
-        gens.append(_fk(sample.boneMotion[0].detach().cpu()))
-    fidelity = sum(_cos(gens[i], gts[i]) for i in range(len(probes))) / len(probes)
-    hits = sum(
-        1 for i in range(len(probes))
-        if max(range(len(probes)), key=lambda j: _cos(gens[i], gts[j])) == i
+    row = evaluateAtCfg(
+        probeIndices=probes,
+        dataset=dataset,
+        tokenizer=tok,
+        encoder=enc,
+        denoiser=den,
+        sampler=sampler,
+        normalizer=norm,
+        cfgScale=cfgScale,
+        device=DEVICE,
+        frames=FRAMES,
+        numSteps=100,
+        seed=0,
+        emptyPrompt=EMPTY_PROMPT,
     )
-    retrieval = hits / len(probes)
-    pairs = [
-        _cos(gens[a], gens[b])
-        for a, b in itertools.combinations(range(len(probes)), 2)
-    ]
-    distinct = sum(pairs) / len(pairs)
-    return fidelity, retrieval, distinct
+    return row["fidelity"], row["retrieval"], row["distinctness"]
 
 
 def main() -> None:

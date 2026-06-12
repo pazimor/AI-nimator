@@ -30,12 +30,12 @@ from typing import Sequence
 
 import torch
 
-from src.features.generation.training_v2 import (
+from ainimator.training.training_v2 import (
     EMPTY_PROMPT,
     loadCheckpointV2,
     resolveDevice,
 )
-from src.shared.model.generation.sampler_v2 import DDIMSamplerV2
+from ainimator.model.sampler_v2 import DDIMSamplerV2
 
 LOGGER = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ def _centered(motion: torch.Tensor) -> torch.Tensor:
 
 def _fkPositions(motion: torch.Tensor) -> torch.Tensor:
     """FK to pelvis-relative joint XYZ — a semantic motion descriptor."""
-    from src.shared.model.components.ops import rot6dToJointXYZ
+    from ainimator.geometry.components.ops import rot6dToJointXYZ
 
     xyz = rot6dToJointXYZ(motion.unsqueeze(0).float()).squeeze(0)
     return xyz - xyz[:, :1]
