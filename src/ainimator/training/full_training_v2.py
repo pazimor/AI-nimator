@@ -98,6 +98,7 @@ from ainimator.text import (
     TextEncoderOutput,
 )
 from ainimator.data.preprocessed_dataset import PreprocessedLinkDataset
+from ainimator.health.hub import HealthHub, buildHealthHub
 
 LOGGER = logging.getLogger(__name__)
 
@@ -317,6 +318,13 @@ class V2FullTrainingConfig:
     device: str = "auto"
     resumeCheckpoint: Path | None = None
 
+    # --- Health monitoring (A3) ----------------------------------
+    # New keys — not changes to existing defaults.
+    # healthEnabled=True activates hub.step() inside the training loop.
+    # healthEverySteps aligns with logEvery (default 50).
+    healthEnabled: bool = True
+    healthEverySteps: int = 50
+
     def __post_init__(self) -> None:
         if self.predictionMode not in SUPPORTED_PREDICTIONS:
             raise ValueError(
@@ -404,6 +412,8 @@ class V2FullTrainingConfig:
             raise ValueError("bestImprovementMin must be >= 0.")
         if self.stagnationPatience < 0:
             raise ValueError("stagnationPatience must be >= 0.")
+        if self.healthEverySteps < 1:
+            raise ValueError("healthEverySteps must be >= 1.")
 
 
 # =====================================================================
@@ -1829,6 +1839,11 @@ def runFullTraining(
     bestPath = config.outputDir / "v2_full_best.pt"
     latestPath = config.outputDir / "v2_full_latest.pt"
 
+    # --- Health hub (A3) ----------------------------------------
+    healthHub = _buildHealthHub(config) if config.healthEnabled else None
+    if healthHub is not None:
+        healthHub.attach(components.denoiser)
+
     if startEpoch > config.epochs:
         LOGGER.warning(
             "Resume requested but checkpoint already at epoch %d ≥ "
@@ -1897,6 +1912,11 @@ def runFullTraining(
                         )
                     )
                 completedSteps += 1
+                if healthHub is not None:
+                    healthHub.step(
+                        globalStep=completedSteps,
+                        metrics=metrics,
+                    )
                 if completedSteps % config.logEvery == 0:
                     LOGGER.info(
                         "epoch=%d step=%d  train_loss=%.4f",
@@ -2056,6 +2076,9 @@ def runFullTraining(
         bestEpoch,
         bestPath,
     )
+    if healthHub is not None:
+        healthHub.detach()
+        healthHub.close()
     return components, history
 
 
@@ -2398,3 +2421,21 @@ def _loadResumeCheckpoint(
         bestValTotal=bestValTotal,
         bestEpoch=bestEpoch,
     )
+
+
+
+def _buildHealthHub(config: "V2FullTrainingConfig") -> HealthHub:
+    """Construct a HealthHub from the run config.
+
+    Parameters
+    ----------
+    config : V2FullTrainingConfig
+        Training configuration (provides outputDir, healthEverySteps).
+
+    Returns
+    -------
+    HealthHub
+    """
+    hub = buildHealthHub(config.outputDir)
+    hub._everySteps = config.healthEverySteps
+    return hub

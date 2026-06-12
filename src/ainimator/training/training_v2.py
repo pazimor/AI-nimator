@@ -48,6 +48,7 @@ from torch.optim import AdamW
 
 from ainimator.core.checkpoint_io import saveTorchObjectAtomically
 from ainimator.core.resolved_config import writeResolvedConfig
+from ainimator.health.hub import HealthHub, buildHealthHub
 from ainimator.core.constants.preprocessed import (
     PREPROCESSED_LINK_INDEX_FILENAME,
     PREPROCESSED_MANIFEST_FILENAME,
@@ -269,6 +270,10 @@ class V2TrainingConfig:
     usePerBlockFilm: bool = True
     useNullEmbedding: bool = True
 
+    # --- Health monitoring (A3) ----------------------------------
+    healthEnabled: bool = True
+    healthEverySteps: int = 50
+
     def __post_init__(self) -> None:
         if self.predictionMode not in SUPPORTED_PREDICTIONS:
             raise ValueError(
@@ -286,6 +291,8 @@ class V2TrainingConfig:
             raise ValueError("dropout must be in [0, 1).")
         if not (0.0 <= self.condMaskProb <= 1.0):
             raise ValueError("condMaskProb must be in [0, 1].")
+        if self.healthEverySteps < 1:
+            raise ValueError("healthEverySteps must be >= 1.")
 
 
 # =====================================================================
@@ -807,12 +814,21 @@ def runOverfit(
         seed=config.seed, device=components.device
     )
 
+    # --- Health hub (A3) ----------------------------------------
+    healthHub: HealthHub | None = None
+    if config.healthEnabled:
+        healthHub = buildHealthHub(config.outputDir)
+        healthHub._everySteps = config.healthEverySteps
+        healthHub.attach(components.denoiser)
+
     history: list[dict[str, float]] = []
     startTime = time.time()
     for epoch in range(1, config.epochs + 1):
         metrics = trainStep(components, sample, config, generators)
         metrics["epoch"] = float(epoch)
         history.append(metrics)
+        if healthHub is not None:
+            healthHub.step(globalStep=epoch, metrics=metrics)
         if epoch == 1 or epoch % config.logEvery == 0 or epoch == config.epochs:
             elapsed = time.time() - startTime
             LOGGER.info(
@@ -826,6 +842,10 @@ def runOverfit(
                 int(metrics["timestep"]),
                 elapsed,
             )
+
+    if healthHub is not None:
+        healthHub.detach()
+        healthHub.close()
 
     checkpointPath = config.outputDir / "v2_overfit_checkpoint.pt"
     saveCheckpointV2(components, sample, config, checkpointPath)

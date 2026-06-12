@@ -192,6 +192,29 @@ class LossesConfigSchema(BaseModel, extra="forbid"):
     x0ContrastiveWeight: float = 0.0
 
 
+class HealthConfigSchema(BaseModel, extra="forbid"):
+    """Health monitoring configuration.
+
+    Attributes
+    ----------
+    enabled : bool
+        Enable HealthHub step() calls during training.
+    everySteps : int
+        Capture health metrics every N optimiser steps.
+    """
+
+    enabled: bool = True
+    everySteps: int = 50
+
+    @field_validator("everySteps")
+    @classmethod
+    def _checkEverySteps(cls, value: int) -> int:
+        """Ensure everySteps is positive."""
+        if value < 1:
+            raise ValueError("everySteps must be >= 1.")
+        return value
+
+
 class ValidationConfigSchema(BaseModel, extra="forbid"):
     """Validation and checkpoint-selection settings.
 
@@ -324,6 +347,7 @@ class V2FullTrainingConfigSchema(BaseModel, extra="forbid"):
     losses: LossesConfigSchema = LossesConfigSchema()
     validation: ValidationConfigSchema = ValidationConfigSchema()
     regularisation: RegularisationConfigSchema = RegularisationConfigSchema()
+    health: HealthConfigSchema = HealthConfigSchema()
 
     @model_validator(mode="after")
     def _validateConsistency(self) -> "V2FullTrainingConfigSchema":
@@ -406,6 +430,7 @@ class V2TrainingConfigSchema(BaseModel, extra="forbid"):
     diffusion: DiffusionConfigSchema = DiffusionConfigSchema()
     encoder: TextEncoderConfigSchema = TextEncoderConfigSchema()
     denoiser: MotionDenoiserV2ConfigSchema = MotionDenoiserV2ConfigSchema()
+    health: HealthConfigSchema = HealthConfigSchema()
 
     @model_validator(mode="after")
     def _validateConsistency(self) -> "V2TrainingConfigSchema":
