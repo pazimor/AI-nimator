@@ -69,9 +69,8 @@ Legacy v1 moves to `legacy/` (phase A5), importable by nothing.
 
 ## Commands
 All commands use the new `ainimator.*` package path (phase A2+).
-The poetry venv must have `src/` on its path; this is set up via a
-`.pth` file created once: `echo "$PWD/src" > $(poetry run python -c
-"import site; print(site.getsitepackages()[0])")/ainimator_dev.pth`
+`poetry install` registers `ainimator` as an editable package
+(no manual `.pth` setup required).
 
 - `poetry run python -m ainimator.cli.build_dataset` — match prompts
 - `poetry run python -m ainimator.cli.preprocess_dataset` — preprocess

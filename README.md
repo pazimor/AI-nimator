@@ -1,6 +1,7 @@
 # AI-nimator
 
-Text-to-motion project with a CLIP-like text encoder and a diffusion-based motion generator.
+Text-to-motion project with a custom BPE text encoder and a diffusion-based
+motion generator (v2 stack: v-prediction, cosine schedule, DDIM, CFG).
 
 ## Setup
 
@@ -10,52 +11,51 @@ This repo uses Poetry.
 poetry install
 ```
 
+The `ainimator` package is registered as an editable install automatically.
+
 ## Configuration
 
 Main config files:
-- `src/configs/network.yaml` - shared network architecture (embed dim, heads, layers, bones)
-- `src/configs/train_clip.yaml` - CLIP training settings
-- `src/configs/train_generation.yaml` - generation training settings
-- `src/configs/dataset.yaml` - dataset build settings
-
-Architecture reference:
-- `doc/architecture.md`
+- `src/configs/train_generation_v2.yaml` — v2 generation training settings
+- `src/configs/dataset.yaml` — dataset build settings
 
 ## Common workflow
 
 1) Build/convert dataset
 ```bash
-poetry run python -m src.cli.build_dataset --config src/configs/dataset.yaml
+poetry run python -m ainimator.cli.build_dataset --config src/configs/dataset.yaml
 ```
 
-2) Train CLIP (text-motion alignment)
+2) Train generation (diffusion denoiser v2)
 ```bash
-poetry run python -m src.cli.train_clip --config src/configs/train_clip.yaml
+poetry run python -m ainimator.cli.train_generation_v2 --profile overfit
+poetry run python -m ainimator.cli.train_generation_v2 --profile full
 ```
 
-3) Train generation (diffusion denoiser)
+3) Generate animation
 ```bash
-poetry run python -m src.cli.train_generation --config src/configs/train_generation.yaml
+poetry run python -m ainimator.cli.generate_animation_v2
 ```
 
 ## Tools
 
-### Inspect checkpoints
+### Diagnose conditioning
 ```bash
-poetry run python -m src.cli.tools inspect output/checkpoints/best_model.pt
+poetry run python -m ainimator.cli.diagnose_generation_v2
 ```
 
-### Shape check (architecture validation)
+### Run tests
 ```bash
-poetry run python -m src.cli.tools shape-check --network-profile default
+poetry run pytest
 ```
 
-### Convert JSON output to Collada
+### Verify import contracts
 ```bash
-poetry run python -m src.cli.json_to_collada -i path/to/animation.json -o out.dae
+poetry run lint-imports
 ```
 
 ## Notes
 
-- `network.yaml` controls shared dimensions across CLIP and generation. Keep `embed-dim` aligned.
-- `clip.bone-data` controls the motion features consumed by the CLIP motion encoder. If you change it, re-run CLIP training before generation training.
+- All commands use `ainimator.cli.*` (post phase A2).
+- Legacy v1 commands (`src.cli.*`) are archived and should not be extended.
+- `doc/ROADMAP.md` is the canonical reference for phases and decisions.
