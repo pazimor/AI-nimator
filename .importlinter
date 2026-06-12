@@ -1,0 +1,58 @@
+[importlinter]
+root_packages =
+    ainimator
+include_external_packages = True
+
+# ---------------------------------------------------------------------------
+# Contract 1 — strict layer ordering within ainimator
+# ---------------------------------------------------------------------------
+# Layer order (top = highest, may import from layers below):
+#   cli > training / health / export > model / text / diffusion > geometry > core
+#
+# model, text, diffusion are at the same level (L3); model is allowed to
+# depend on text and diffusion — but NOT on data — which is enforced by
+# contract 2 below. Lateral imports model<->text<->diffusion are checked
+# by an independent contract rather than here, to keep this contract simple.
+[importlinter:contract:layers]
+name = Layer ordering (L0-L5, ascending imports forbidden)
+type = layers
+layers =
+    ainimator.cli
+    ainimator.training | ainimator.health | ainimator.export
+    ainimator.model
+    ainimator.text | ainimator.diffusion
+    ainimator.geometry
+    ainimator.core
+
+# ---------------------------------------------------------------------------
+# Contract 2 — model NEVER imports data
+# ---------------------------------------------------------------------------
+[importlinter:contract:model_no_data]
+name = model must not import data
+type = forbidden
+source_modules =
+    ainimator.model
+forbidden_modules =
+    ainimator.data
+
+# ---------------------------------------------------------------------------
+# Contract 3 — model lateral: only text and diffusion allowed (not data/health/training)
+# ---------------------------------------------------------------------------
+# model is allowed to import text and diffusion (same L3) but nothing above
+# it. This is enforced by the layers contract above — this is documentation.
+
+# ---------------------------------------------------------------------------
+# Contract 4 — legacy isolation (A5-ready)
+# ---------------------------------------------------------------------------
+# Once ainimator.legacy exists (phase A5), nothing else may import it.
+# Currently commented out because the module does not yet exist and
+# import-linter would error on a missing source module.
+# Uncomment at phase A5:
+#
+# [importlinter:contract:no_legacy_imports]
+# name = nothing imports legacy
+# type = forbidden
+# source_modules =
+#     ainimator
+# forbidden_modules =
+#     ainimator.legacy

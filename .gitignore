@@ -1,6 +1,8 @@
 .venv/
 .idea/
+# test/ directory: allow ainimator/ subtree, ignore caches
 test/*
+!test/ainimator/
 .DS_Store
 
 # coverages
