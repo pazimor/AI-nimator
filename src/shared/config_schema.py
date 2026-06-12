@@ -318,7 +318,9 @@ class V2FullTrainingConfigSchema(BaseModel, extra="forbid"):
 
     diffusion: DiffusionConfigSchema = DiffusionConfigSchema()
     encoder: TextEncoderConfigSchema = TextEncoderConfigSchema()
-    denoiser: MotionDenoiserV2ConfigSchema = MotionDenoiserV2ConfigSchema()
+    denoiser: MotionDenoiserV2ConfigSchema = MotionDenoiserV2ConfigSchema(
+        dropout=0.1
+    )
     losses: LossesConfigSchema = LossesConfigSchema()
     validation: ValidationConfigSchema = ValidationConfigSchema()
     regularisation: RegularisationConfigSchema = RegularisationConfigSchema()

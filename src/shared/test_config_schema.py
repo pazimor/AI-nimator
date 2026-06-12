@@ -247,6 +247,32 @@ def test_overfit_config_minimal_parses(tmp_path: Path) -> None:
     assert schema.denoiser.usePerBlockFilm is True
 
 
+def test_full_config_denoiser_dropout_default_is_0_1(
+    tmp_path: Path,
+) -> None:
+    """Full config with dropout omitted must resolve denoiser dropout=0.1.
+
+    Matches V2FullTrainingConfig.dropout runtime default (0.1).
+    """
+    schema = V2FullTrainingConfigSchema.model_validate(
+        _makeMinimalFullConfig(tmp_path)
+    )
+    assert schema.denoiser.dropout == 0.1
+
+
+def test_overfit_config_denoiser_dropout_default_is_0_0(
+    tmp_path: Path,
+) -> None:
+    """Overfit config with dropout omitted must resolve denoiser dropout=0.0.
+
+    Matches V2TrainingConfig.dropout runtime default (0.0).
+    """
+    schema = V2TrainingConfigSchema.model_validate(
+        _makeMinimalOverfitConfig(tmp_path)
+    )
+    assert schema.denoiser.dropout == 0.0
+
+
 def test_full_config_nested_override(tmp_path: Path) -> None:
     """Nested sub-schema overrides must be accepted and applied."""
     raw = _makeMinimalFullConfig(tmp_path)
