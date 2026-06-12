@@ -47,6 +47,7 @@ import torch
 from torch.optim import AdamW
 
 from src.shared.checkpoint_io import saveTorchObjectAtomically
+from src.shared.resolved_config import writeResolvedConfig
 from src.shared.constants.preprocessed import (
     PREPROCESSED_LINK_INDEX_FILENAME,
     PREPROCESSED_MANIFEST_FILENAME,
@@ -760,6 +761,7 @@ def runOverfit(
     and the list of per-epoch log dicts.
     """
     config.outputDir.mkdir(parents=True, exist_ok=True)
+    writeResolvedConfig(config, config.outputDir)
     sample = loadDatasetSample(
         config.datasetRoot, linkIndex=config.sampleLinkIndex
     )

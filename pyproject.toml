@@ -17,6 +17,7 @@ dependencies = [
   "tqdm>=4.66",
   "transformers>=4.35",
   "kornia>=0.7",
+  "pydantic (>=2.13.4,<3.0.0)",
 ]
 
 [project.optional-dependencies]

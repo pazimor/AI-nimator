@@ -65,6 +65,7 @@ from src.features.generation.training_v2 import (
     resolveDevice,
 )
 from src.shared.checkpoint_io import saveTorchObjectAtomically
+from src.shared.resolved_config import writeResolvedConfig
 from src.shared.model.generation.ema import ExponentialMovingAverage
 from src.shared.model.generation.denoiser_v2 import (
     MotionDenoiserV2,
@@ -1723,6 +1724,7 @@ def runFullTraining(
     the per-epoch history dicts.
     """
     config.outputDir.mkdir(parents=True, exist_ok=True)
+    writeResolvedConfig(config, config.outputDir)
     device = resolveDevice(config.device)
 
     dataset = PreprocessedLinkDataset(
