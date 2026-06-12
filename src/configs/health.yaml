@@ -1,0 +1,116 @@
+# health.yaml — Probe/Contract configuration for HealthHub
+#
+# Each metric carries a comment with its row from ROADMAP §3.5:
+#   direction | healthy | WARNING | CRITICAL
+#
+# Probes: forward/backward hooks that capture scalar stats only.
+# Contracts: declarative criteria → OK / WARNING / CRITICAL.
+#
+# Guardrail (§3.3): start with 3 probes + 5 contracts only.
+# New additions require an "incident passé détecté" justification.
+# -----------------------------------------------------------------------
+
+# Runtime knobs (wired into full_training_v2 and training_v2)
+health:
+  enabled: true
+  everySteps: 50   # sample 1 step in N (aligned with logEvery default)
+
+# -----------------------------------------------------------------------
+# Probes — scalar stats captured via PyTorch hooks
+# -----------------------------------------------------------------------
+probes:
+  - name: denoiser_blocks
+    module_path: "denoiser"
+    capture:
+      - mean          # activation mean
+      - std           # activation std (dead-layer proxy)
+      - norm          # L2 norm
+      - effective_rank  # rank of hidden states (collapse detector)
+      - intra_batch_sim # cosine sim intra-batch (collapse Phase E)
+    hook_type: forward
+
+  - name: text_encoder_pool
+    module_path: "encoder"
+    capture:
+      - mean
+      - std
+      - norm
+      - encoder_cond_uncond_sim  # pool sim cond vs null (BOS-collapse)
+    hook_type: forward
+
+  - name: output_head
+    module_path: "denoiser.outputProj"
+    capture:
+      - mean
+      - std
+      - norm
+      - update_ratio  # ||Δw|| / ||w|| per layer (dead/exploding layer)
+    hook_type: forward_and_backward
+
+# -----------------------------------------------------------------------
+# Contracts — declarative criteria per metric
+# -----------------------------------------------------------------------
+contracts:
+  # Metric: cfg_sim
+  # Direction: ↓ towards 0
+  # Healthy: < 0.95  |  WARNING: 0.95–0.99  |  CRITICAL: > 0.99
+  # Incident: Phase E cfg_sim ≈ 0.9995, cond/uncond collapse
+  - name: cond_uncond_sim
+    metric: cfg_sim
+    direction: lower_is_better
+    ok_threshold: 0.95
+    warning_threshold: 0.99
+    critical_above: 0.99
+
+  # Metric: conditioning_sensitivity
+  # Direction: ↑ > 0 (delta loss real-text vs shuffled)
+  # Healthy: nettement > 0  |  WARNING: ≈ 0 on 1 window
+  # CRITICAL: ≈ 0 persistant
+  # Incident: Collapse Phase E (détection tardive)
+  - name: conditioning_sensitivity
+    metric: conditioning_sensitivity
+    direction: higher_is_better
+    ok_threshold: 0.01     # delta > 1% of base loss = healthy
+    warning_threshold: 0.001
+    critical_below: 0.001
+
+  # Metric: update_ratio  (||Δw|| / ||w||)
+  # Direction: stay in [1e-4, 1e-2]
+  # Healthy: 1e-4 – 1e-2  |  WARNING: < 1e-5 or > 1e-1
+  # CRITICAL: ≈ 0 persistant or NaN
+  # Incident: cond_proj AdaLN à zéro (audit)
+  - name: update_ratio
+    metric: update_ratio
+    direction: range
+    ok_min: 1.0e-5
+    ok_max: 1.0e-1
+    warning_min: 1.0e-5
+    warning_max: 1.0e-1
+    critical_below: 1.0e-7
+    critical_above: 1.0
+
+  # Metric: loss_share
+  # Direction: each component 1–70% of total (no dead or dominating)
+  # Healthy: each 1–70%  |  WARNING: < 1% or > 80%
+  # CRITICAL: exactly 0.0
+  # Incident: loss_root_velocity=0.0000 silencieux v1
+  - name: loss_decomposition
+    metric: loss_share
+    direction: range
+    ok_min: 0.01
+    ok_max: 0.70
+    warning_min: 0.01
+    warning_max: 0.80
+    critical_below: 0.001
+
+  # Metric: post_norm_stats
+  # Direction: mean → 0, std → 1
+  # Healthy: |mean| < 0.1 and |std-1| < 0.1
+  # WARNING: < 0.3  |  CRITICAL: beyond (z-norm broken)
+  # Incident: Bug z-normalization v2
+  - name: post_norm_stats
+    metric: post_norm_mean_deviation
+    direction: lower_is_better
+    ok_threshold: 0.1
+    warning_threshold: 0.3
+    critical_above: 0.3
