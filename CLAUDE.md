@@ -40,7 +40,7 @@ animations (SMPL-22) from text prompts, based on the AMASS dataset.
   retrieval/fidelity at cfg ∈ {1,4,6}. Details: ROADMAP §5.2, LOG.md.
 
 ## Directory Structure
-Current layout (post-A2):
+Current layout (post-A5):
 - `src/ainimator/` — single installable package in dependency layers:
     - `core/` (L0) — types, constants, config schema, device, logging
     - `geometry/` (L1) — quaternion, rot6d, FK, SMPL-22 skeleton,
@@ -48,13 +48,18 @@ Current layout (post-A2):
     - `data/` (L2) — preprocessed dataset, dataset builder, augmentation
     - `text/` (L3) — BPE tokenizer, custom encoder, CLIP wrapper
     - `diffusion/` (L3) — cosine schedule, DDIM math, noise schedule
-    - `model/` (L3, above text/diffusion) — denoiser v2, losses, sampler,
-      motion normalizer, layers, v1 CLIP model
-    - `health/` (L4) — diagnose_v2 (health/ tooling built in A3)
-    - `training/` (L4) — v2 and v1 training loops, dataset manager
+    - `model/` (L3, above text/diffusion) — denoiser v2, losses v2,
+      sampler v2, motion normalizer, layers
+    - `health/` (L4) — Probe/Contract/HealthHub (A3)
+    - `training/` (L4) — v2 training loops (full + overfit)
     - `export/` (L4) — postprocess/Collada (ONNX in A8)
     - `cli/` (L5) — entrypoints, zero logic
-- `src/configs/` — YAML configurations (outside the package)
+- `src/configs/` — YAML configurations (outside the package);
+  `network.yaml` now has the `v2` profile only (v1 profiles archived)
+- `legacy/` — v1 code archived in phase A5, importable by nothing
+    - `ainimator/` — archived v1 modules (training, model/clip, cli, core)
+    - `configs/` — archived v1 network profiles
+    - `test/` — archived v1 tests
 - `scripts/` — experiment orchestrators (scaling sweeps)
 - `output/` — generated files and run outputs
 - `test/ainimator/` — mirrors src/ainimator/ layer tree
@@ -65,7 +70,8 @@ Import rules enforced by `import-linter` (`.importlinter`):
 - `model` never imports `data`.
 - `training` is the only module that sees both `data` and `model`.
 - `cli` has zero logic.
-Legacy v1 moves to `legacy/` (phase A5), importable by nothing.
+- `legacy/` is importable by nothing in `ainimator.*` (contract active
+  since phase A5).
 
 ## Commands
 All commands use the new `ainimator.*` package path (phase A2+).
@@ -89,8 +95,10 @@ All commands use the new `ainimator.*` package path (phase A2+).
 - `poetry run pytest` — test suite
 - `poetry run lint-imports` — verify layer contracts (must be green)
 
-Legacy v1 (do NOT extend, archived in phase A5): `train_clip`,
-`train_generation`, `generate_animation` (v1).
+Legacy v1 (archived in phase A5 — see `legacy/`): `train_clip`,
+`train_generation`, `generate_animation` v1, `precompute_generation_text_cache`.
+Do NOT import from `legacy/` in any `src/ainimator/` module — enforced by
+`lint-imports` contract `no_legacy_imports`.
 
 ## Conventions
 - Document every method with full **DOCString** (NumPy Style).

@@ -1,6 +1,7 @@
 [importlinter]
 root_packages =
     ainimator
+    legacy
 include_external_packages = True
 
 # ---------------------------------------------------------------------------
@@ -13,8 +14,6 @@ include_external_packages = True
 #       health: uses L0-L3+data for audit/diagnose; never imports training.
 #       export: uses model/text/diffusion for ONNX export.
 #   L3: model | data  (model must not import data — enforced by contract 2)
-#       data and training share a legacy circular dep via generation_text_cache
-#       (to be fixed in A5 when generation_text_cache moves to legacy/).
 #   L3: text | diffusion
 #   L1: geometry
 #   L0: core
@@ -24,8 +23,8 @@ include_external_packages = True
 #   hub.step(); the dependency flows training→health, not health→training.
 # - health and training at the same L4 layer so they can coexist; the
 #   NO-IMPORT rule health→training is enforced by contract 3 (forbidden).
-# - data/training legacy circular dep (generation_text_cache) will be
-#   resolved in A5 when that module moves to legacy/.
+# - Phase A5 (2026-06-13): v1 legacy modules removed from ainimator.*;
+#   the circular dep data→training.generation_text_cache is gone.
 [importlinter:contract:layers]
 name = Layer ordering (L0-L5, ascending imports forbidden)
 type = layers
@@ -37,12 +36,11 @@ layers =
     ainimator.text | ainimator.diffusion
     ainimator.geometry
     ainimator.core
-# Pre-existing legacy violations to be fixed in phase A5:
-# - data.mirror_v2 → training (will move to legacy/)
-# - data.preprocessed_dataset → training.generation_text_cache (legacy v1)
+# Pre-existing layer violation to fix in a follow-up:
+# - data.mirror_v2 imports V2Batch from training.full_training_v2.
+#   Fix: move V2Batch to core/types so the import descends.
 ignore_imports =
     ainimator.data.mirror_v2 -> ainimator.training.full_training_v2
-    ainimator.data.preprocessed_dataset -> ainimator.training.generation_text_cache
 
 # ---------------------------------------------------------------------------
 # Contract 2 — model NEVER imports data
@@ -70,23 +68,20 @@ forbidden_modules =
     ainimator.training
 
 # ---------------------------------------------------------------------------
-# Contract 3 — model lateral: only text and diffusion allowed (not data/health/training)
+# Contract 4 — legacy isolation (activated phase A5, 2026-06-13)
 # ---------------------------------------------------------------------------
-# model is allowed to import text and diffusion (same L3) but nothing above
-# it. This is enforced by the layers contract above — this is documentation.
-
-# ---------------------------------------------------------------------------
-# Contract 4 — legacy isolation (A5-ready)
-# ---------------------------------------------------------------------------
-# Once ainimator.legacy exists (phase A5), nothing else may import it.
-# Currently commented out because the module does not yet exist and
-# import-linter would error on a missing source module.
-# Uncomment at phase A5:
+# Nothing in ainimator.* may import from legacy.*.
+# legacy/ lives at the repo root (sibling of src/), outside the ainimator
+# package.  It is importable as "legacy.*" on the Python path but must never
+# be imported by the main package.
 #
-# [importlinter:contract:no_legacy_imports]
-# name = nothing imports legacy
-# type = forbidden
-# source_modules =
-#     ainimator
-# forbidden_modules =
-#     ainimator.legacy
+# Negative-test demonstration (run then revert):
+#   Add "from legacy.ainimator.core.diagnostics import DiagLogger" to any
+#   ainimator module, run lint-imports → contract 4 reports BROKEN.
+[importlinter:contract:no_legacy_imports]
+name = nothing in ainimator imports legacy
+type = forbidden
+source_modules =
+    ainimator
+forbidden_modules =
+    legacy

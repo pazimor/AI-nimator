@@ -260,13 +260,16 @@ class PreprocessedLinkDataset(Dataset[Dict[str, object]]):
             cacheDir / PREPROCESSED_GENERATION_TEXT_CACHE_MANIFEST_FILENAME
         )
         if not manifestPath.exists():
-            from ainimator.training.generation_text_cache import ensureGenerationTextCache
-
-            LOGGER.info(
-                "Generation text cache missing for %s; building it now.",
-                checkpointPath,
+            # generation_text_cache was archived to legacy/ in phase A5.
+            # The v2 stack does not use XLM-R text caches.  If you need to
+            # rebuild a v1 cache, use the archived CLI:
+            #   python legacy/ainimator/cli/precompute_generation_text_cache.py
+            raise RuntimeError(
+                "Generation text cache missing for checkpoint "
+                f"{checkpointPath}. The cache-builder module was archived "
+                "to legacy/ in phase A5 and is no longer auto-invoked. "
+                "The v2 training stack does not use XLM-R text caches."
             )
-            ensureGenerationTextCache(self.datasetRoot, checkpointPath)
         manifest = _loadGenerationCacheManifest(manifestPath)
         if manifest.clipFingerprint != clipFingerprint:
             raise ValueError(

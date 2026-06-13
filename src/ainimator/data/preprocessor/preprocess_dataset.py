@@ -111,6 +111,7 @@ class DatasetPreprocessor:
 
         self.networkConfig = loadNetworkConfig(
             configPath=config.paths.networkConfigPath,
+            profile="v2",
         )
         self.enabledComponents = _mergeEnabledComponents(
             buildEnabledComponents(self.networkConfig.generation.boneData),
