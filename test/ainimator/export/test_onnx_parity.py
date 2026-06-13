@@ -244,6 +244,105 @@ class TestEncoderOnnxParity:
             assert ortHidden.shape == (_BATCH, newLen, _TEXT_DIM)
 
 
+    def test_encoder_partial_mask_ort_vs_torch_hidden_states(
+        self,
+    ) -> None:
+        """ORT must match PyTorch under a REAL partial padding mask.
+
+        Uses B=3 rows with DIFFERENT numbers of padded positions so a
+        row-uniform shortcut cannot accidentally pass.  This exercises the
+        ``_OnnxMHAReplace`` additive-bias path (True→-inf) which is the
+        subtlest part of the ONNX export and was untested for the
+        non-trivial masked case.
+
+        Mask design (attentionMask, 1.0=real 0.0=pad):
+        * row 0 : positions 0-7 real, 8-11 padded  (4 padded)
+        * row 1 : positions 0-4 real, 5-11 padded  (7 padded)
+        * row 2 : all 12 positions real             (0 padded)
+
+        inputIds at padded positions are valid token ids so only the mask
+        drives the masking (not the embedding table lookup).
+        """
+        _MASK_BATCH = 3
+        _PAD_ROW0 = 4   # last 4 positions padded in row 0
+        _PAD_ROW1 = 7   # last 7 positions padded in row 1
+        _REAL_LEN_0 = _TEXT_LEN - _PAD_ROW0   # 8
+        _REAL_LEN_1 = _TEXT_LEN - _PAD_ROW1   # 5
+
+        encoder = _makeEncoder()
+
+        inputIds = torch.ones(
+            _MASK_BATCH, _TEXT_LEN, dtype=torch.long
+        )
+
+        attMask = _buildPartialMask(
+            batchSize=_MASK_BATCH,
+            textLen=_TEXT_LEN,
+            realLengths=[_REAL_LEN_0, _REAL_LEN_1, _TEXT_LEN],
+        )
+
+        with torch.no_grad():
+            torchOut = encoder(inputIds, attMask)
+        torchHidden = torchOut.hiddenStates  # (B, T, D)
+
+        with tempfile.TemporaryDirectory() as tmpDir:
+            outPath = Path(tmpDir) / "encoder_partial.onnx"
+            exportEncoder(
+                encoder=encoder,
+                outputPath=outPath,
+                batchSize=_MASK_BATCH,
+                textLen=_TEXT_LEN,
+            )
+            session = _ortSession(outPath)
+            feeds = {
+                "inputIds": inputIds.numpy(),
+                "attentionMask": attMask.numpy(),
+            }
+            ortHidden, _ortMask = session.run(None, feeds)
+
+        diff = _maxAbsDiff(torchHidden, ortHidden)
+        assert diff <= ONNX_PARITY_TOLERANCE, (
+            f"Encoder hidden-states max abs diff under partial masking "
+            f"= {diff:.6f} exceeds tolerance {ONNX_PARITY_TOLERANCE}.  "
+            f"This likely indicates a mask polarity regression in "
+            f"_OnnxMHAReplace."
+        )
+
+
+def _buildPartialMask(
+    batchSize: int,
+    textLen: int,
+    realLengths: list[int],
+) -> torch.Tensor:
+    """Build an attention mask with row-varying real token counts.
+
+    Parameters
+    ----------
+    batchSize : int
+        Number of rows.  Must equal ``len(realLengths)``.
+    textLen : int
+        Total sequence length.
+    realLengths : list[int]
+        Number of real (non-padding) tokens in each row.  Remaining
+        positions are set to 0.0 (padding).
+
+    Returns
+    -------
+    torch.Tensor
+        Float32 tensor of shape ``(batchSize, textLen)`` with 1.0 on
+        real positions and 0.0 on padded positions.
+    """
+    if len(realLengths) != batchSize:
+        raise ValueError(
+            f"realLengths length {len(realLengths)} != "
+            f"batchSize {batchSize}."
+        )
+    mask = torch.zeros(batchSize, textLen, dtype=torch.float32)
+    for rowIdx, realLen in enumerate(realLengths):
+        mask[rowIdx, :realLen] = 1.0
+    return mask
+
+
 # ---------------------------------------------------------------------------
 # Denoiser step parity
 # ---------------------------------------------------------------------------
