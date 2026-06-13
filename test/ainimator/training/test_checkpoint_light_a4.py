@@ -52,6 +52,7 @@ from ainimator.text.clip_text_encoder import (
     ClipTextEncoderConfig,
 )
 from ainimator.training.training_v2 import (
+    _assertNoMissingTrainableKeys,
     _denoiserConfigToDict,
     _denoiserConfigFromDict,
     _encoderConfigToDict,
@@ -444,3 +445,183 @@ def test_old_clip_checkpoint_backward_compat(tmp_path: Path) -> None:
         "Denoiser output contains NaN/Inf after loading old-format "
         "CLIP checkpoint."
     )
+
+
+# =====================================================================
+# A4-hardening — strict=False missing-key guard
+# =====================================================================
+
+def test_missing_trainable_key_raises(tmp_path: Path) -> None:
+    """A payload missing a non-clip trainable key must raise RuntimeError.
+
+    Constructs a CLIP checkpoint where the ``outputProjection.weight``
+    key has been removed from the saved state-dict (simulating a future
+    architecture rename).  Asserts that ``loadCheckpointV2`` raises
+    ``RuntimeError`` and that the error message names the missing key.
+    """
+    tokenizerDir = _buildTokenizerDir(tmp_path / "tok")
+    outputDim = 32
+    clipHiddenDim = 4
+    realEncoder = _buildMockClipEncoder(outputDim=outputDim)
+    fullState = realEncoder.state_dict()
+
+    # Remove a non-clip trainable key to simulate architecture drift.
+    droppedKey = next(
+        k for k in fullState if not k.startswith("clip.")
+    )
+    truncatedState = {
+        k: v for k, v in fullState.items()
+        if k != droppedKey and not k.startswith("clip.")
+    }
+
+    denoiserConfig = _tinyDenoiserConfig()
+    denoiser = MotionDenoiserV2(denoiserConfig)
+    schedule = NoiseSchedule(_tinyScheduleConfig())
+    normalizer = MotionNormalizer(
+        numBones=22, motionChannels=6, globalChannels=3
+    )
+    torch.manual_seed(0)
+    normalizer.fitFromTensors(
+        [torch.randn(8, 22, 6)], [torch.randn(8, 3)]
+    )
+
+    payload: dict[str, Any] = {
+        "version": 3,
+        "text_encoder_type": "clip",
+        "encoder_state_dict": truncatedState,
+        "encoder_config": {
+            "modelName": "mock/clip",
+            "maxLength": 8,
+            "outputDim": outputDim,
+            "clipHiddenDim": clipHiddenDim,
+            "dropout": 0.0,
+            "useNullEmbedding": True,
+            "l2NormalizeOutput": True,
+        },
+        "denoiser_state_dict": denoiser.state_dict(),
+        "denoiser_config": _denoiserConfigToDict(denoiserConfig),
+        "schedule_config": _scheduleConfigToDict(schedule.config),
+        "schedule_state_dict": schedule.state_dict(),
+        "normalizer_config": normalizer.configToDict(),
+        "normalizer_state_dict": normalizer.state_dict(),
+        "tokenizer_dir": str(tokenizerDir.resolve()),
+        "training_config": {},
+        "training_sample": {
+            "sampleId": 0, "textId": 0,
+            "rawText": "test", "frames": 8,
+        },
+    }
+    ckptPath = tmp_path / "missing_trainable_ckpt.pt"
+    saveTorchObjectAtomically(payload, ckptPath)
+
+    mockClipTower = nn.Linear(clipHiddenDim, clipHiddenDim, bias=False)
+    mockClipTower.eval()
+    mockTokenizerBackend = MagicMock()
+    mockTokenizerBackend.vocab_size = 100
+    mockTokenizerBackend.pad_token_id = 0
+
+    with patch(
+        "transformers.CLIPTextModel.from_pretrained",
+        return_value=mockClipTower,
+    ), patch(
+        "transformers.CLIPTokenizerFast.from_pretrained",
+        return_value=mockTokenizerBackend,
+    ):
+        with pytest.raises(RuntimeError) as excInfo:
+            loadCheckpointV2(ckptPath, device="cpu")
+
+    assert droppedKey in str(excInfo.value), (
+        f"RuntimeError did not name the missing key {droppedKey!r}."
+    )
+
+
+def test_only_clip_keys_missing_loads_fine(tmp_path: Path) -> None:
+    """A light checkpoint (only clip.* absent) must load without error.
+
+    Constructs a CLIP checkpoint where only the frozen ``clip.*`` keys
+    are absent (the expected light-format case).  Asserts that
+    ``loadCheckpointV2`` loads successfully and that the trainable keys
+    are restored correctly.
+    """
+    tokenizerDir = _buildTokenizerDir(tmp_path / "tok")
+    outputDim = 32
+    clipHiddenDim = 4
+    realEncoder = _buildMockClipEncoder(outputDim=outputDim)
+    # Keep only non-clip keys — the standard light-format payload.
+    lightState = {
+        k: v for k, v in realEncoder.state_dict().items()
+        if not k.startswith("clip.")
+    }
+    assert lightState, "No trainable keys found — test is vacuous."
+
+    denoiserConfig = _tinyDenoiserConfig()
+    denoiser = MotionDenoiserV2(denoiserConfig)
+    schedule = NoiseSchedule(_tinyScheduleConfig())
+    normalizer = MotionNormalizer(
+        numBones=22, motionChannels=6, globalChannels=3
+    )
+    torch.manual_seed(0)
+    normalizer.fitFromTensors(
+        [torch.randn(8, 22, 6)], [torch.randn(8, 3)]
+    )
+
+    payload: dict[str, Any] = {
+        "version": 3,
+        "text_encoder_type": "clip",
+        "encoder_state_dict": lightState,
+        "encoder_config": {
+            "modelName": "mock/clip",
+            "maxLength": 8,
+            "outputDim": outputDim,
+            "clipHiddenDim": clipHiddenDim,
+            "dropout": 0.0,
+            "useNullEmbedding": True,
+            "l2NormalizeOutput": True,
+        },
+        "denoiser_state_dict": denoiser.state_dict(),
+        "denoiser_config": _denoiserConfigToDict(denoiserConfig),
+        "schedule_config": _scheduleConfigToDict(schedule.config),
+        "schedule_state_dict": schedule.state_dict(),
+        "normalizer_config": normalizer.configToDict(),
+        "normalizer_state_dict": normalizer.state_dict(),
+        "tokenizer_dir": str(tokenizerDir.resolve()),
+        "training_config": {},
+        "training_sample": {
+            "sampleId": 0, "textId": 0,
+            "rawText": "test", "frames": 8,
+        },
+    }
+    ckptPath = tmp_path / "light_clip_ckpt.pt"
+    saveTorchObjectAtomically(payload, ckptPath)
+
+    mockClipTower = nn.Linear(clipHiddenDim, clipHiddenDim, bias=False)
+    mockClipTower.eval()
+    mockTokenizerBackend = MagicMock()
+    mockTokenizerBackend.vocab_size = 100
+    mockTokenizerBackend.pad_token_id = 0
+
+    with patch(
+        "transformers.CLIPTextModel.from_pretrained",
+        return_value=mockClipTower,
+    ), patch(
+        "transformers.CLIPTokenizerFast.from_pretrained",
+        return_value=mockTokenizerBackend,
+    ):
+        (
+            _,
+            loadedEncoder,
+            _denoiser,
+            _schedule,
+            _normalizer,
+            _payload,
+        ) = loadCheckpointV2(ckptPath, device="cpu")
+
+    # Trainable keys must be restored to their saved values.
+    for key, expected in lightState.items():
+        loaded = loadedEncoder.state_dict().get(key)
+        assert loaded is not None, (
+            f"Trainable key {key!r} absent from loaded encoder."
+        )
+        assert torch.allclose(expected, loaded, atol=0.0), (
+            f"Trainable key {key!r} changed during light-format load."
+        )

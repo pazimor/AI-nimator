@@ -943,6 +943,52 @@ def saveCheckpointV2(
     saveTorchObjectAtomically(payload, path)
 
 
+def _assertNoMissingTrainableKeys(
+    module: torch.nn.Module,
+    missing_keys: list[str],
+    unexpected_keys: list[str],
+) -> None:
+    """Raise if any expected trainable key is absent after strict=False load.
+
+    Parameters
+    ----------
+    module : torch.nn.Module
+        The module that was just loaded (used to enumerate expected keys).
+    missing_keys : list[str]
+        The ``missing_keys`` attribute from the ``IncompatibleKeys`` result
+        returned by ``load_state_dict(..., strict=False)``.
+    unexpected_keys : list[str]
+        The ``unexpected_keys`` attribute from the same result.  Extra
+        ``clip.*`` keys (old-format payloads) are silently ignored;
+        other unexpected keys emit a warning.
+
+    Raises
+    ------
+    RuntimeError
+        If any non-``clip.*`` key expected by the module is missing from
+        the loaded state-dict — these are trainable weights that would
+        be silently left at init values.
+    """
+    _logger = logging.getLogger(__name__)
+    nonClipMissing = [
+        k for k in missing_keys if not k.startswith("clip.")
+    ]
+    if nonClipMissing:
+        raise RuntimeError(
+            "Encoder load failed: trainable keys missing from checkpoint"
+            f" — {nonClipMissing}. Architecture may have changed."
+        )
+    nonClipUnexpected = [
+        k for k in unexpected_keys if not k.startswith("clip.")
+    ]
+    if nonClipUnexpected:
+        _logger.warning(
+            "Encoder load: unexpected non-clip keys in checkpoint"
+            " (ignored): %s",
+            nonClipUnexpected,
+        )
+
+
 def loadCheckpointV2(
     path: Path,
     device: torch.device | str = "cpu",
@@ -986,8 +1032,15 @@ def loadCheckpointV2(
         # reloaded from the HF hub by ``ClipTextEncoder.__init__``.
         # Only the trainable projection + null embedding are persisted,
         # so ``strict=False`` tolerates the missing ``clip.*`` keys.
-        encoder.load_state_dict(
+        # Non-clip missing keys raise immediately — they are trainable
+        # weights that would be silently left at init values.
+        _incompatible = encoder.load_state_dict(
             payload["encoder_state_dict"], strict=False
+        )
+        _assertNoMissingTrainableKeys(
+            encoder,
+            _incompatible.missing_keys,
+            _incompatible.unexpected_keys,
         )
     else:
         tokenizerDir = Path(payload["tokenizer_dir"])

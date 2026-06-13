@@ -59,6 +59,7 @@ from ainimator.training.training_v2 import (
     EMPTY_PROMPT,
     TrainingRandomState,
     V2TrainingConfig,
+    _assertNoMissingTrainableKeys,
     _denoiserConfigToDict,
     _encoderConfigToDict,
     _scheduleConfigToDict,
@@ -2637,13 +2638,25 @@ def _loadResumeCheckpoint(
     # embedding (the frozen ``clip.*`` tower is filtered at save time
     # and reloaded from the HF hub by ``ClipTextEncoder.__init__``), so
     # the load must tolerate the missing ``clip.*`` keys.
+    # Non-clip missing keys raise immediately — they are trainable
+    # weights that would be silently left at init values.
     encoderStrict = not isinstance(components.encoder, ClipTextEncoder)
-    components.encoder.load_state_dict(
+    _encoderState = (
         onlineEncoder
         if onlineEncoder is not None
-        else payload["encoder_state_dict"],
-        strict=encoderStrict,
+        else payload["encoder_state_dict"]
     )
+    if encoderStrict:
+        components.encoder.load_state_dict(_encoderState, strict=True)
+    else:
+        _incompatible = components.encoder.load_state_dict(
+            _encoderState, strict=False
+        )
+        _assertNoMissingTrainableKeys(
+            components.encoder,
+            _incompatible.missing_keys,
+            _incompatible.unexpected_keys,
+        )
     components.denoiser.load_state_dict(
         onlineDenoiser
         if onlineDenoiser is not None
