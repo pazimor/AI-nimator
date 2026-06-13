@@ -488,7 +488,7 @@ def test_best_improvement_min_skips_noise_updates(tmp_path: Path) -> None:
     from dataclasses import replace
     config = replace(base, bestImprovementMin=1e6)
     runFullTraining(config)
-    bestPath = outputDir / "v2_full_best.pt"
+    bestPath = outputDir / "checkpoints" / "v2_full_best.pt"
     assert bestPath.exists()
     payload = torch.load(bestPath, map_location="cpu", weights_only=False)
     # Only the first epoch wrote a best; subsequent drops were below
@@ -514,7 +514,7 @@ def test_best_metric_loss_diffusion_writes_on_diffusion_drop(
     from dataclasses import replace
     config = replace(base, bestMetric="loss_diffusion")
     runFullTraining(config)
-    bestPath = outputDir / "v2_full_best.pt"
+    bestPath = outputDir / "checkpoints" / "v2_full_best.pt"
     assert bestPath.exists()
     payload = torch.load(bestPath, map_location="cpu", weights_only=False)
     # The best_val_total stored in the checkpoint reflects the chosen
@@ -604,7 +604,7 @@ def test_run_full_training_with_ema_writes_smoothed_best(
     runFullTraining(config)
 
     bestPayload = torch.load(
-        outputDir / "v2_full_best.pt", map_location="cpu",
+        outputDir / "checkpoints" / "v2_full_best.pt", map_location="cpu",
         weights_only=False,
     )
     # The best.pt must signal that its canonical state is the EMA.
@@ -637,7 +637,7 @@ def test_run_full_training_resume_with_ema_loads_shadow(
     secondConfig = replace(
         firstConfig,
         epochs=3,
-        resumeCheckpoint=outputDir / "v2_full_latest.pt",
+        resumeCheckpoint=outputDir / "checkpoints" / "v2_full_latest.pt",
     )
     components, _ = runFullTraining(secondConfig)
     assert components.ema is not None
@@ -665,7 +665,7 @@ def test_training_config_roundtrip_preserves_all_fields(
     )
     runFullTraining(base)
     payload = torch.load(
-        outputDir / "v2_full_latest.pt",
+        outputDir / "checkpoints" / "v2_full_latest.pt",
         map_location="cpu",
         weights_only=False,
     )
@@ -713,7 +713,7 @@ def test_phase_d_checkpoint_roundtrip_through_loadCheckpointV2(
     runFullTraining(config)
 
     # Reload from disk via the public API used by the generation CLI.
-    bestPath = outputDir / "v2_full_best.pt"
+    bestPath = outputDir / "checkpoints" / "v2_full_best.pt"
     assert bestPath.exists()
     (
         loadedTokenizer,
@@ -898,8 +898,8 @@ def test_run_full_training_writes_best_and_latest(tmp_path: Path) -> None:
     )
     components, history = runFullTraining(config)
     assert len(history) == 2
-    assert (outputDir / "v2_full_best.pt").exists()
-    assert (outputDir / "v2_full_latest.pt").exists()
+    assert (outputDir / "checkpoints" / "v2_full_best.pt").exists()
+    assert (outputDir / "checkpoints" / "v2_full_latest.pt").exists()
     # Validate the checkpoint round-trips through loadCheckpointV2.
     (
         loadedTokenizer,
@@ -908,7 +908,7 @@ def test_run_full_training_writes_best_and_latest(tmp_path: Path) -> None:
         loadedSchedule,
         loadedNormalizer,
         payload,
-    ) = loadCheckpointV2(outputDir / "v2_full_best.pt", device="cpu")
+    ) = loadCheckpointV2(outputDir / "checkpoints" / "v2_full_best.pt", device="cpu")
     assert loadedNormalizer.numBones == components.normalizer.numBones
     assert (
         loadedDenoiser.config.embedDim
@@ -1010,12 +1010,12 @@ def test_run_full_training_records_best_metadata(tmp_path: Path) -> None:
     runFullTraining(config)
 
     bestPayload = torch.load(
-        outputDir / "v2_full_best.pt",
+        outputDir / "checkpoints" / "v2_full_best.pt",
         map_location="cpu",
         weights_only=False,
     )
     latestPayload = torch.load(
-        outputDir / "v2_full_latest.pt",
+        outputDir / "checkpoints" / "v2_full_latest.pt",
         map_location="cpu",
         weights_only=False,
     )
@@ -1053,7 +1053,7 @@ def test_run_full_training_resume_continues_from_last_epoch(
     secondConfig = replace(
         firstConfig,
         epochs=5,
-        resumeCheckpoint=outputDir / "v2_full_latest.pt",
+        resumeCheckpoint=outputDir / "checkpoints" / "v2_full_latest.pt",
     )
     _, secondHistory = runFullTraining(secondConfig)
     assert len(secondHistory) == 2
@@ -1075,7 +1075,7 @@ def test_run_full_training_resume_preserves_best(tmp_path: Path) -> None:
     )
     runFullTraining(firstConfig)
     bestBefore = torch.load(
-        outputDir / "v2_full_best.pt",
+        outputDir / "checkpoints" / "v2_full_best.pt",
         map_location="cpu",
         weights_only=False,
     )["training_meta"]
@@ -1085,11 +1085,11 @@ def test_run_full_training_resume_preserves_best(tmp_path: Path) -> None:
     secondConfig = replace(
         firstConfig,
         epochs=4,
-        resumeCheckpoint=outputDir / "v2_full_latest.pt",
+        resumeCheckpoint=outputDir / "checkpoints" / "v2_full_latest.pt",
     )
     runFullTraining(secondConfig)
     bestAfter = torch.load(
-        outputDir / "v2_full_best.pt",
+        outputDir / "checkpoints" / "v2_full_best.pt",
         map_location="cpu",
         weights_only=False,
     )["training_meta"]
@@ -1118,7 +1118,7 @@ def test_run_full_training_resume_past_target_logs_warning(
     sameLengthResume = replace(
         firstConfig,
         epochs=3,  # same target as already trained
-        resumeCheckpoint=outputDir / "v2_full_latest.pt",
+        resumeCheckpoint=outputDir / "checkpoints" / "v2_full_latest.pt",
     )
     _, history = runFullTraining(sameLengthResume)
     assert history == []

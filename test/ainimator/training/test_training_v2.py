@@ -299,7 +299,8 @@ def test_run_overfit_writes_checkpoint(tmp_path: Path) -> None:
     components, history = runOverfit(config)
     assert isinstance(components, V2TrainingComponents)
     assert len(history) == 3
-    checkpointPath = outputDir / "v2_overfit_checkpoint.pt"
+    # A4: checkpoints now live under checkpoints/ subdirectory.
+    checkpointPath = outputDir / "checkpoints" / "v2_overfit_checkpoint.pt"
     assert checkpointPath.exists()
 
 
@@ -314,7 +315,7 @@ def test_checkpoint_round_trips_through_load(tmp_path: Path) -> None:
         epochs=2,
     )
     components, _ = runOverfit(config)
-    checkpointPath = outputDir / "v2_overfit_checkpoint.pt"
+    checkpointPath = outputDir / "checkpoints" / "v2_overfit_checkpoint.pt"
 
     (
         loadedTokenizer,

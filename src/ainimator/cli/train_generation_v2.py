@@ -792,15 +792,44 @@ def _argumentsToFullConfig(
     )
 
 
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+
+def _attachLogFile(outputDir: Path) -> logging.FileHandler:
+    """Add a FileHandler writing to ``outputDir/log.txt``.
+
+    The handler is attached to the root logger so every module's output
+    goes to the file.  The caller is responsible for removing it when the
+    run ends (or for leaving it open until process exit — both are fine).
+
+    Parameters
+    ----------
+    outputDir : Path
+        Run output directory.  Created if absent.
+
+    Returns
+    -------
+    logging.FileHandler
+        The attached handler (caller may keep a reference to close it).
+    """
+    outputDir.mkdir(parents=True, exist_ok=True)
+    logPath = outputDir / "log.txt"
+    fileHandler = logging.FileHandler(logPath, mode="a", encoding="utf-8")
+    fileHandler.setFormatter(logging.Formatter(_LOG_FORMAT))
+    logging.getLogger().addHandler(fileHandler)
+    return fileHandler
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = buildArgumentParser()
     arguments = parser.parse_args(argv)
     logging.basicConfig(
         level=getattr(logging, arguments.logLevel),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format=_LOG_FORMAT,
     )
 
     profile = str(arguments.profile)
+    fileHandler = _attachLogFile(Path(arguments.outputDir))
     try:
         if profile == "overfit":
             config = _argumentsToOverfitConfig(arguments)
@@ -833,6 +862,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     ) as error:
         LOGGER.error("Training failed: %s", error)
         return 1
+    finally:
+        fileHandler.close()
+        logging.getLogger().removeHandler(fileHandler)
     return 0
 
 

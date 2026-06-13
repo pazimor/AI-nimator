@@ -9,6 +9,33 @@ from typing import Any
 
 import torch
 
+# Subdirectory under outputDir where checkpoint files live.
+# All training loops write here so the run layout is:
+#   outputDir/
+#     checkpoints/   ← this constant names the subdirectory
+#     health/
+#     resolved_config.yaml
+#     log.txt
+CHECKPOINT_SUBDIR = "checkpoints"
+
+
+def checkpointDir(outputDir: Path) -> Path:
+    """Return and create the ``checkpoints/`` subdirectory under *outputDir*.
+
+    Parameters
+    ----------
+    outputDir : Path
+        Root output directory of the training run.
+
+    Returns
+    -------
+    Path
+        ``outputDir / CHECKPOINT_SUBDIR``, created if missing.
+    """
+    directory = outputDir / CHECKPOINT_SUBDIR
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
 
 def saveTorchObjectAtomically(payload: Any, targetPath: Path) -> Path:
     """Persist a torch-serializable object without exposing partial files."""

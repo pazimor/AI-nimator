@@ -46,7 +46,10 @@ from typing import Any, Sequence
 import torch
 from torch.optim import AdamW
 
-from ainimator.core.checkpoint_io import saveTorchObjectAtomically
+from ainimator.core.checkpoint_io import (
+    checkpointDir,
+    saveTorchObjectAtomically,
+)
 from ainimator.core.resolved_config import writeResolvedConfig
 from ainimator.health.hub import HealthHub, buildHealthHub
 from ainimator.core.constants.preprocessed import (
@@ -901,7 +904,7 @@ def runOverfit(
         healthHub.detach()
         healthHub.close()
 
-    checkpointPath = config.outputDir / "v2_overfit_checkpoint.pt"
+    checkpointPath = checkpointDir(config.outputDir) / "v2_overfit_checkpoint.pt"
     saveCheckpointV2(components, sample, config, checkpointPath)
     LOGGER.info("Checkpoint saved to %s.", checkpointPath)
 

@@ -64,7 +64,10 @@ from ainimator.training.training_v2 import (
     _scheduleConfigToDict,
     resolveDevice,
 )
-from ainimator.core.checkpoint_io import saveTorchObjectAtomically
+from ainimator.core.checkpoint_io import (
+    checkpointDir,
+    saveTorchObjectAtomically,
+)
 from ainimator.core.resolved_config import writeResolvedConfig
 from ainimator.model.ema import ExponentialMovingAverage
 from ainimator.model.denoiser_v2 import (
@@ -2091,8 +2094,9 @@ def runFullTraining(
     # policy.  Reset on every meaningful improvement; warning logged
     # when it crosses ``config.stagnationPatience``.
     stagnationEpochs = 0
-    bestPath = config.outputDir / "v2_full_best.pt"
-    latestPath = config.outputDir / "v2_full_latest.pt"
+    ckptDir = checkpointDir(config.outputDir)
+    bestPath = ckptDir / "v2_full_best.pt"
+    latestPath = ckptDir / "v2_full_latest.pt"
 
     # --- Health hub (A3) ----------------------------------------
     healthHub = _buildHealthHub(config) if config.healthEnabled else None
