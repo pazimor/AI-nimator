@@ -162,33 +162,52 @@ def test_zero_conditioning_sensitivity_gives_warning() -> None:
 def test_overhead_below_5_percent() -> None:
     """Health hub overhead stays under 5% at everySteps=50.
 
-    Methodology: measure N steps with a model large enough that the
-    forward pass dominates over I/O (hidden dim 512).  The hub is
-    configured with everySteps=50, so it fires 4 times in 200 steps.
+    Methodology (matches reviewer benchmark):
+    - 384-dim FFN × 4 blocks (B=8, F=120, so B×F=960 tokens)
+    - everySteps=50 — hub fires 4 times in 200 steps
+    - Probe captures: mean, std, intra_batch_sim, effective_rank
+      (the full production probe set including SVD)
+    - CPU only (most conservative environment)
+    - Asserts the AC6 target: < 5% overhead.
 
-    Note: on tiny toy models, JSONL I/O can dominate and give a large
-    percentage.  The 5% target is for real training models where a
-    denoiser forward pass costs 10-100ms.  This test uses a 512-dim
-    model to make the forward pass expensive enough to be meaningful.
+    This target is achievable because ``_computeEffectiveRank`` now
+    caps its submatrix to ``_RANK_MAX_ROWS × _RANK_MAX_COLS`` (64×64)
+    before calling SVD, bounding the cost to O(64^3) ≈ 0.26ms on CPU.
     """
     N_STEPS = 200
+    DIM = 384
+    N_TOKENS = 960  # B=8 × F=120 — reviewer benchmark
 
-    # Use a wider model so forward dominates over JSONL I/O.
-    class _WiderModel(nn.Module):
+    # Four-block FFN that produces (N_TOKENS, DIM) activations to
+    # simulate the denoiser hidden-state shape used in production.
+    class _FourBlockModel(nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.denoiser = nn.Linear(512, 512)
-            self.outputProj = nn.Linear(512, 256)
+            self.denoiser = nn.Sequential(
+                nn.Linear(DIM, DIM * 4),
+                nn.GELU(),
+                nn.Linear(DIM * 4, DIM),
+                nn.Linear(DIM, DIM * 4),
+                nn.GELU(),
+                nn.Linear(DIM * 4, DIM),
+                nn.Linear(DIM, DIM * 4),
+                nn.GELU(),
+                nn.Linear(DIM * 4, DIM),
+                nn.Linear(DIM, DIM * 4),
+                nn.GELU(),
+                nn.Linear(DIM * 4, DIM),
+            )
+            self.outputProj = nn.Linear(DIM, DIM)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             return self.outputProj(self.denoiser(x))
 
-    model = _WiderModel()
-    # Batch of 32 to simulate realistic load
-    x = torch.randn(32, 512)
+    model = _FourBlockModel()
+    # (N_TOKENS, DIM) — matches B×F=960, D=384 from reviewer benchmark
+    x = torch.randn(N_TOKENS, DIM)
 
-    # Warm up
-    for _ in range(10):
+    # Warm up to stabilise timing
+    for _ in range(5):
         _ = model(x)
 
     # --- Baseline: N steps without health --------------------------
@@ -197,13 +216,16 @@ def test_overhead_below_5_percent() -> None:
         _ = model(x)
     baselineMs = (time.perf_counter() - start) * 1000
 
-    # --- With health, everySteps=50 --------------------------------
+    # --- With health: full production probe set including effective_rank
     # Hub fires 4 times in 200 steps (steps 50, 100, 150, 200).
     with tempfile.TemporaryDirectory() as tmpDir:
         probe = Probe(
             name="denoiser_blocks",
             modulePath="denoiser",
-            capture=["mean", "std", "intra_batch_sim"],
+            # Full production probe set including effective_rank (SVD)
+            capture=[
+                "mean", "std", "intra_batch_sim", "effective_rank",
+            ],
             hookType="forward",
             captureEvery=50,
         )
@@ -237,24 +259,21 @@ def test_overhead_below_5_percent() -> None:
         hub.detach()
         hub.close()
 
-    if baselineMs > 0:
-        overhead = (withHealthMs - baselineMs) / baselineMs
-        print(
-            f"\n[overhead] baseline={baselineMs:.1f}ms  "
-            f"with_health={withHealthMs:.1f}ms  "
-            f"overhead={overhead:.1%}"
-        )
-        # The 5% target from AC6 is for real training models
-        # (denoiser ~17M params, B=8, forward ~50ms on MPS).
-        # In the unit test environment (tiny model, no GPU), JSONL I/O
-        # dominates: we allow 50% here to avoid flakiness.
-        # The micro-benchmark overhead is printed above for manual
-        # inspection — on a real model it should be < 5%.
-        assert overhead < 0.50, (
-            f"Health overhead {overhead:.1%} exceeds 50% threshold "
-            f"(unit-test environment guard, not the AC6 5% target). "
-            f"baseline={baselineMs:.1f}ms, with_health={withHealthMs:.1f}ms"
-        )
+    assert baselineMs > 0, "Baseline timing was zero"
+    overhead = (withHealthMs - baselineMs) / baselineMs
+    print(
+        f"\n[AC6] baseline={baselineMs:.1f}ms  "
+        f"with_health={withHealthMs:.1f}ms  "
+        f"overhead={overhead:.1%}  "
+        f"(model: {DIM}-dim × 4 blocks, {N_TOKENS} tokens, "
+        f"everySteps=50, CPU)"
+    )
+    assert overhead < 0.05, (
+        f"Health overhead {overhead:.1%} exceeds 5% AC6 target. "
+        f"baseline={baselineMs:.1f}ms, "
+        f"with_health={withHealthMs:.1f}ms. "
+        f"Root cause: check effective_rank SVD cost in probe.py."
+    )
 
 
 # ------------------------------------------------------------------

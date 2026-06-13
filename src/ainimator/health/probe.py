@@ -93,18 +93,30 @@ def _computeMeanStdNorm(
     )
 
 
+_RANK_MAX_ROWS = 64  # cap rows fed to SVD (keeps cost O(64^3))
+_RANK_MAX_COLS = 64  # cap cols fed to SVD
+
+
 def _computeEffectiveRank(
     tensor: torch.Tensor,
-    maxDim: int = 64,
+    maxDim: int = _RANK_MAX_COLS,
+    maxRows: int = _RANK_MAX_ROWS,
 ) -> float:
     """Stable-rank proxy: ||A||_F^2 / ||A||_2^2, normalised to [0,1].
+
+    The SVD is run on a *capped submatrix* of shape
+    (min(rows, maxRows), min(cols, maxDim)) to bound cost to
+    O(maxRows * maxDim^2).  Capping rows uses evenly-spaced stride
+    sampling to preserve the rank signal across the full batch.
 
     Parameters
     ----------
     tensor : torch.Tensor
         Activation of shape (B, T, D) or (B, D).
     maxDim : int
-        Cap the matrix size for SVD stability (takes first maxDim cols).
+        Cap the column dimension (default 64).
+    maxRows : int
+        Cap the row dimension after reshape (default 64).
 
     Returns
     -------
@@ -118,7 +130,12 @@ def _computeEffectiveRank(
             flat = flat.reshape(-1, flat.shape[-1])
         elif flat.ndim != 2:
             flat = flat.reshape(flat.shape[0], -1)
+        # Cap columns (feature dim)
         flat = flat[:, :maxDim]
+        # Cap rows via uniform stride (preserves distributional range)
+        if flat.shape[0] > maxRows:
+            stride = flat.shape[0] // maxRows
+            flat = flat[::stride][:maxRows]
         frobSq = float((flat * flat).sum().item())
         if frobSq < _EPS:
             return 0.0
