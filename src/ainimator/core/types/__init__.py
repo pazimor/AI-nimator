@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+from .batch import V2Batch
 from .clip import (
     AnimationFileDescriptor,
     ClipDatasetRecord,
@@ -136,4 +137,5 @@ __all__ = [
     "GenerationNetworkConfig",
     "LearningRateHyperparameters",
     "NetworkConfig",
+    "V2Batch",
 ]

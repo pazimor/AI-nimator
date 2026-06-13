@@ -55,6 +55,7 @@ import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
 
+from ainimator.core.types.batch import V2Batch
 from ainimator.training.training_v2 import (
     EMPTY_PROMPT,
     TrainingRandomState,
@@ -472,27 +473,9 @@ def selectLinkIndices(
 # =====================================================================
 # Batch payload
 # =====================================================================
-@dataclass(frozen=True)
-class V2Batch:
-    """A padded batch ready to feed the v2 training step.
-
-    Attributes
-    ----------
-    rotation6d : torch.Tensor
-        ``(B, F, 22, 6)`` float32 — already on the target device.
-    rootTranslation : torch.Tensor
-        ``(B, F, 3)`` float32.
-    motionMask : torch.Tensor
-        ``(B, F)`` bool, ``True`` on real frames, ``False`` on padding.
-    rawTexts : tuple[str, ...]
-        Source prompt for each sample.  Tokenised inside the training
-        step so we can apply ``cond-mask-prob`` at the string level.
-    """
-
-    rotation6d: torch.Tensor
-    rootTranslation: torch.Tensor
-    motionMask: torch.Tensor
-    rawTexts: tuple[str, ...]
+# V2Batch is defined in ainimator.core.types.batch and re-exported here
+# for the benefit of existing callers within the training layer.
+__all__ = ["V2Batch"]
 
 
 def _toTensor(value: object, label: str) -> torch.Tensor:
@@ -1032,10 +1015,8 @@ def trainStepBatch(
     components.denoiser.train()
     schedule = components.schedule
 
-    # Phase D.3 — SMPL-22 mirror augmentation.  Imported lazily to
-    # avoid a circular dependency (mirror_v2 imports V2Batch from this
-    # module).  When ``mirrorProb == 0`` the helper returns ``batch``
-    # unchanged with zero overhead.
+    # Phase D.3 — SMPL-22 mirror augmentation.  When ``mirrorProb == 0``
+    # the helper returns ``batch`` unchanged with zero overhead.
     if config.mirrorProb > 0.0:
         from ainimator.data.mirror_v2 import mirrorBatch
 

@@ -32,7 +32,7 @@ from dataclasses import replace
 
 import torch
 
-from ainimator.training.full_training_v2 import V2Batch
+from ainimator.core.types.batch import V2Batch
 from ainimator.data.augmentation.mirror import (
     ROT6D_MIRROR_SIGN,
     SMPL22_MIRROR_JOINT_PERMUTATION,

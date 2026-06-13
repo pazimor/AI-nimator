@@ -36,11 +36,6 @@ layers =
     ainimator.text | ainimator.diffusion
     ainimator.geometry
     ainimator.core
-# Pre-existing layer violation to fix in a follow-up:
-# - data.mirror_v2 imports V2Batch from training.full_training_v2.
-#   Fix: move V2Batch to core/types so the import descends.
-ignore_imports =
-    ainimator.data.mirror_v2 -> ainimator.training.full_training_v2
 
 # ---------------------------------------------------------------------------
 # Contract 2 — model NEVER imports data
