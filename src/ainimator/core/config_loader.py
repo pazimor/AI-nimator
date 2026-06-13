@@ -9,18 +9,11 @@ from typing import Any, Dict, Iterable, List, Optional
 import yaml
 
 from ainimator.core.constants.clip import (
-    DEFAULT_BATCH_SIZE,
-    DEFAULT_EARLY_STOPPING_PATIENCE,
-    DEFAULT_LEARNING_RATE,
     DEFAULT_MODEL_NAME,
     DEFAULT_PROMPT_MAX_LENGTH,
-    DEFAULT_VALIDATION_SPLIT,
 )
 from ainimator.core.types import (
     BoneDataConfig,
-    ClipTrainingConfig,
-    ClipTrainingHyperparameters,
-    ClipTrainingPaths,
     DatasetBuilderConfig,
     DatasetBuilderPaths,
     DatasetBuilderProcessing,
@@ -225,143 +218,6 @@ def _optionalString(section: Dict[str, Any], key: str) -> Optional[str]:
     if value is None or value == "null":
         return None
     return str(value).strip()
-
-
-# ==============================================================================
-# CLIP TRAINING CONFIG
-# ==============================================================================
-
-
-def loadTrainingConfig(
-    configPath: Path,
-    profile: Optional[str] = None,
-) -> ClipTrainingConfig:
-    """
-    Parse the CLIP training configuration YAML file.
-
-    Parameters
-    ----------
-    configPath : Path
-        Filesystem path to the YAML file.
-    profile : Optional[str]
-        Name of the profile to load (e.g., "spark"). If None, uses "training".
-
-    Returns
-    -------
-    ClipTrainingConfig
-        Fully-populated configuration dataclass.
-    """
-    resolved = configPath.expanduser().resolve()
-    if not resolved.exists():
-        raise FileNotFoundError(f"CLIP training config missing: {resolved}")
-    payload = yaml.safe_load(resolved.read_text(encoding="utf-8")) or {}
-    pathsSection = payload.get("paths", {})
-    
-    # Profile selection: default to "training".
-    # Fallback to legacy "training" key.
-    profileName = profile or "training"
-    if profileName in payload:
-        trainingSection = payload.get(profileName, {})
-    else:
-        # Fallback for legacy configs without profiles
-        trainingSection = payload.get("training", {})
-    
-    paths = _loadClipPaths(resolved, pathsSection)
-    
-    # Get network config path (must exist if provided)
-    networkConfigPath = _optionalExistingPath(
-        resolved,
-        pathsSection.get("network-config"),
-    )
-    checkpointDir = _optionalPath(
-        resolved,
-        pathsSection.get("checkpoint-dir"),
-    )
-    validationIndicesPath = _optionalResolvedPath(
-        resolved,
-        pathsSection.get("validation-indices"),
-    )
-    if validationIndicesPath is None and checkpointDir is not None:
-        validationIndicesPath = checkpointDir / "validation_indices.json"
-
-    hyperparameters = ClipTrainingHyperparameters(
-        batchSize=_int(trainingSection, "batch-size", DEFAULT_BATCH_SIZE),
-        maxPromptLength=_int(
-            trainingSection,
-            "max-length",
-            DEFAULT_PROMPT_MAX_LENGTH,
-        ),
-        modelName=str(
-            trainingSection.get("model-name", DEFAULT_MODEL_NAME),
-        ),
-        epochs=_int(trainingSection, "epochs", 1),
-        device=str(trainingSection.get("device", "auto")),
-        validationSplit=_float(
-            trainingSection,
-            "validation-split",
-            DEFAULT_VALIDATION_SPLIT,
-        ),
-        earlyStoppingPatience=_int(
-            trainingSection,
-            "early-stopping-patience",
-            DEFAULT_EARLY_STOPPING_PATIENCE,
-        ),
-        checkpointDir=checkpointDir,
-        validationIndicesPath=validationIndicesPath,
-        resumeCheckpoint=_optionalExistingPath(
-            resolved,
-            trainingSection.get("resume-checkpoint"),
-            strict=False,
-            label="resume-checkpoint",
-        ),
-        gradientAccumulation=_int(trainingSection, "gradient-accumulation", 1),
-        weightDecay=_float(trainingSection, "weight-decay", 0.0),
-        maxSamplesPerEpoch=_optionalInt(
-            trainingSection,
-            "max-samples-per-epoch",
-        ),
-        fixedTrainChunk=_bool(
-            trainingSection,
-            "fixed-train-chunk",
-            False,
-        ),
-        overfitSamples=_optionalString(
-            trainingSection,
-            "overfit-samples",
-        ),
-        disableDropout=_bool(
-            trainingSection,
-            "disable-dropout",
-            False,
-        ),
-        # Learning Rate
-        learningRate=_float(
-            trainingSection,
-            "learning-rate",
-            DEFAULT_LEARNING_RATE,
-        ),
-    )
-    return ClipTrainingConfig(
-        paths=paths,
-        training=hyperparameters,
-        networkConfigPath=networkConfigPath,
-    )
-
-
-def _loadClipPaths(
-    configPath: Path,
-    section: Dict[str, Any],
-) -> ClipTrainingPaths:
-    resolvedDataset = _resolveExistingPath(
-        configPath,
-        _require(section, "dataset-root"),
-        "dataset-root",
-    )
-    datasetFolders = _optionalStringList(section.get("dataset-folders"))
-    return ClipTrainingPaths(
-        datasetRoot=resolvedDataset,
-        datasetFolders=datasetFolders,
-    )
 
 
 # ==============================================================================

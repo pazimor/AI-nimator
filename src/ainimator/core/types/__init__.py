@@ -6,17 +6,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .batch import V2Batch
-from .clip import (
-    AnimationFileDescriptor,
-    ClipDatasetRecord,
-    ClipPromptSegment,
-    ClipTrainingConfig,
-    ClipTrainingHyperparameters,
-    ClipTrainingPaths,
-    ClipTrainingResult,
-    MotionTextSample,
-    PromptFileDescriptor,
-)
 from .datasets import (
     DatasetBuildOptions,
     DatasetBuildReport,
@@ -95,15 +84,6 @@ __all__ = [
     "DatasetBuilderPaths",
     "DatasetBuilderProcessing",
     "DatasetPaths",
-    "AnimationFileDescriptor",
-    "ClipDatasetRecord",
-    "ClipPromptSegment",
-    "ClipTrainingConfig",
-    "ClipTrainingHyperparameters",
-    "ClipTrainingPaths",
-    "ClipTrainingResult",
-    "MotionTextSample",
-    "PromptFileDescriptor",
     "DeviceSelectionOptions",
     "PromptData",
     "PromptRecord",
