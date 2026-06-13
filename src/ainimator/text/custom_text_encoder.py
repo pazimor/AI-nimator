@@ -366,6 +366,30 @@ class CustomTextEncoder(nn.Module):
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
+    def encode(
+        self,
+        inputIds: torch.Tensor,
+        attentionMask: torch.Tensor,
+    ) -> TextEncoderOutput:
+        """Encode a batch of token sequences — protocol entry point.
+
+        Delegates to :meth:`forward`.  Satisfies
+        :class:`ainimator.text.protocol.TextEncoderProtocol`.
+
+        Parameters
+        ----------
+        inputIds : torch.Tensor
+            Long tensor ``(B, T)`` from :meth:`CustomTokenizer.encode`.
+        attentionMask : torch.Tensor
+            Float tensor ``(B, T)`` — 1.0 on real tokens, 0.0 on padding.
+
+        Returns
+        -------
+        TextEncoderOutput
+            Hidden states ``(B, T, D_out)`` and key-padding mask.
+        """
+        return self.forward(inputIds, attentionMask)
+
     def forward(
         self,
         inputIds: torch.Tensor,

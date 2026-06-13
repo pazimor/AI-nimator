@@ -102,6 +102,13 @@ from ainimator.text import (
     CustomTokenizer,
     TextEncoderOutput,
 )
+from ainimator.text.artifact import (
+    AnyEncoder,
+    AnyTokenizer,
+    loadEncoderArtifact,
+    readArtifactHash,
+    saveEncoderArtifact,
+)
 from ainimator.data.preprocessed_dataset import PreprocessedLinkDataset
 from ainimator.health.hub import HealthHub, buildHealthHub
 
@@ -223,6 +230,17 @@ class V2FullTrainingConfig:
     textEncoderType: str = "custom"
     clipModelName: str = "openai/clip-vit-base-patch32"
     clipMaxLength: int = 32
+    # --- Phase A7 — Standalone encoder artifact (§2.9) ---------------
+    # When ``encoderArtifactPath`` is set, the encoder is loaded FROM
+    # this artifact directory (produced by ``train_text_encoder`` CLI or
+    # :func:`ainimator.text.artifact.saveEncoderArtifact`) rather than
+    # constructed inline.  ``None`` = construct inline as before.
+    encoderArtifactPath: Path | None = None
+    # When ``True`` (default) the encoder is fine-tuned jointly with the
+    # denoiser and its weights appear in the generation checkpoint.
+    # When ``False``, the encoder is frozen; only the artifact reference
+    # + hash is stored in the checkpoint (not the weights themselves).
+    encoderTrainable: bool = True
 
     # --- Architecture (matches network.yaml v2 profile) -----------
     encoderHiddenDim: int = 256
@@ -656,7 +674,26 @@ def buildFullTrainingComponents(
 
     tokenizer: CustomTokenizer | ClipTokenizer
     encoder: CustomTextEncoder | ClipTextEncoder
-    if config.textEncoderType == "clip":
+    if config.encoderArtifactPath is not None:
+        # Phase A7 — load encoder from a standalone artifact.  The
+        # artifact path takes precedence over inline construction.
+        # ``encoderTrainable`` controls whether the encoder receives
+        # gradient and appears in the checkpoint weights.
+        _encoder, _tokenizer = loadEncoderArtifact(
+            config.encoderArtifactPath, device=device
+        )
+        encoder = _encoder  # type: ignore[assignment]
+        tokenizer = _tokenizer  # type: ignore[assignment]
+        if not config.encoderTrainable:
+            for parameter in encoder.parameters():
+                parameter.requires_grad_(False)
+            encoder.eval()
+        LOGGER.info(
+            "Encoder loaded from artifact %s (trainable=%s).",
+            config.encoderArtifactPath,
+            config.encoderTrainable,
+        )
+    elif config.textEncoderType == "clip":
         # Phase 2 — frozen CLIP ViT-B/32 text tower.  The tokenizer is
         # CLIP's own 49k BPE (loaded from the HF hub, no local dir) and
         # the encoder exposes a trainable 512→embedDim projection.
@@ -2425,6 +2462,12 @@ def _trainingConfigForCheckpoint(
         "textEncoderType": config.textEncoderType,
         "clipModelName": config.clipModelName,
         "clipMaxLength": config.clipMaxLength,
+        "encoderArtifactPath": (
+            str(config.encoderArtifactPath)
+            if config.encoderArtifactPath is not None
+            else None
+        ),
+        "encoderTrainable": config.encoderTrainable,
         "encoderHiddenDim": config.encoderHiddenDim,
         "encoderNumLayers": config.encoderNumLayers,
         "encoderNumHeads": config.encoderNumHeads,
@@ -2503,17 +2546,17 @@ def _saveCheckpoint(
             k: v.clone() for k, v in components.denoiser.state_dict().items()
         }
 
-    # Phase 2 — the encoder config schema differs between the custom
-    # BPE transformer and the frozen CLIP tower.  ``text_encoder_type``
-    # tells :func:`loadCheckpointV2` which branch to rebuild.
+    # Phase 2 / Phase A7 — choose what to persist for the encoder.
+    # * CLIP encoder: always strip the frozen ~63M CLIP tower weights.
+    # * encoderTrainable=False (any encoder): omit weights entirely;
+    #   only the artifact reference + hash are stored so the checkpoint
+    #   stays lean and the encoder is reconstructed from the artifact at
+    #   load time.
     isClipEncoder = isinstance(components.encoder, ClipTextEncoder)
     if isClipEncoder:
         encoderConfigDict = _clipEncoderConfigToDict(
             components.encoder.config
         )
-        # Drop the ~63M frozen CLIP weights from the checkpoint — they
-        # are reloaded from the HF hub by ``ClipTextEncoder.__init__``.
-        # Only the trainable projection + null embedding are persisted.
         encoderState = {
             k: v for k, v in encoderState.items()
             if not k.startswith("clip.")
@@ -2526,9 +2569,22 @@ def _saveCheckpoint(
     else:
         encoderConfigDict = _encoderConfigToDict(components.encoder.config)
 
+    # Phase A7 — when encoder is frozen (encoderTrainable=False) drop
+    # weights from the checkpoint; rely on artifact path + hash instead.
+    encoderArtifactRef: str | None = None
+    if not config.encoderTrainable:
+        encoderState = {}
+        onlineEncoder = None
+        if config.encoderArtifactPath is not None:
+            encoderArtifactRef = str(
+                config.encoderArtifactPath.resolve()
+            )
+
     payload: dict[str, Any] = {
         "version": 3,
         "text_encoder_type": "clip" if isClipEncoder else "custom",
+        "encoder_trainable": config.encoderTrainable,
+        "encoder_artifact_path": encoderArtifactRef,
         "encoder_state_dict": encoderState,
         "encoder_config": encoderConfigDict,
         "denoiser_state_dict": denoiserState,
@@ -2618,29 +2674,43 @@ def _loadResumeCheckpoint(
     # the online weights live under ``*_online_state_dict``.
     onlineEncoder = payload.get("encoder_online_state_dict")
     onlineDenoiser = payload.get("denoiser_online_state_dict")
-    # CLIP checkpoints persist only the trainable projection + null
-    # embedding (the frozen ``clip.*`` tower is filtered at save time
-    # and reloaded from the HF hub by ``ClipTextEncoder.__init__``), so
-    # the load must tolerate the missing ``clip.*`` keys.
-    # Non-clip missing keys raise immediately — they are trainable
-    # weights that would be silently left at init values.
-    encoderStrict = not isinstance(components.encoder, ClipTextEncoder)
-    _encoderState = (
-        onlineEncoder
-        if onlineEncoder is not None
-        else payload["encoder_state_dict"]
+    # Phase A7 — when encoderTrainable=False the encoder weights were
+    # not persisted (empty dict); skip the encoder state restore.
+    # The encoder was already loaded from an artifact at component-build
+    # time so its weights are correct.
+    encoderNotPersisted = not bool(
+        payload.get("encoder_trainable", True)
     )
-    if encoderStrict:
-        components.encoder.load_state_dict(_encoderState, strict=True)
-    else:
-        _incompatible = components.encoder.load_state_dict(
-            _encoderState, strict=False
+    if not encoderNotPersisted:
+        # CLIP checkpoints persist only the trainable projection + null
+        # embedding (the frozen ``clip.*`` tower is filtered at save
+        # time and reloaded from the HF hub by
+        # ``ClipTextEncoder.__init__``), so the load must tolerate the
+        # missing ``clip.*`` keys.  Non-clip missing keys raise
+        # immediately — they are trainable weights that would be left at
+        # init values silently otherwise.
+        encoderStrict = not isinstance(
+            components.encoder, ClipTextEncoder
         )
-        _assertNoMissingTrainableKeys(
-            components.encoder,
-            _incompatible.missing_keys,
-            _incompatible.unexpected_keys,
+        _encoderState = (
+            onlineEncoder
+            if onlineEncoder is not None
+            else payload["encoder_state_dict"]
         )
+        if _encoderState:
+            if encoderStrict:
+                components.encoder.load_state_dict(
+                    _encoderState, strict=True
+                )
+            else:
+                _incompatible = components.encoder.load_state_dict(
+                    _encoderState, strict=False
+                )
+                _assertNoMissingTrainableKeys(
+                    components.encoder,
+                    _incompatible.missing_keys,
+                    _incompatible.unexpected_keys,
+                )
     components.denoiser.load_state_dict(
         onlineDenoiser
         if onlineDenoiser is not None

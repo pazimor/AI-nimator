@@ -89,6 +89,18 @@ class TextEncoderConfigSchema(BaseModel, extra="forbid"):
         Text encoder LR = base LR * this multiplier.
     useNullEmbedding : bool
         Use a learnable null embedding for CFG dropout.
+    encoderArtifactPath : Optional[Path]
+        Phase A7 — path to a standalone encoder artifact directory
+        produced by :func:`ainimator.text.artifact.saveEncoderArtifact`.
+        When set, the generation run loads the encoder FROM this
+        artifact instead of constructing it inline.  The artifact
+        must be compatible with ``encoderType``.
+    encoderTrainable : bool
+        Phase A7 — when ``True`` (default) the encoder is fine-tuned
+        jointly with the denoiser and its weights are saved in the
+        generation checkpoint.  When ``False``, the encoder is frozen
+        and its weights are omitted from the checkpoint (reference +
+        artifact hash only).
     """
 
     encoderHiddenDim: int = 256
@@ -99,6 +111,9 @@ class TextEncoderConfigSchema(BaseModel, extra="forbid"):
     clipMaxLength: int = 32
     encoderLrMultiplier: float = 3.0
     useNullEmbedding: bool = True
+    # Phase A7 — standalone encoder artifact (§2.9).
+    encoderArtifactPath: Optional[Path] = None
+    encoderTrainable: bool = True
 
     @field_validator("clipMaxLength")
     @classmethod
