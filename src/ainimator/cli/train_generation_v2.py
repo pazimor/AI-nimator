@@ -1,19 +1,29 @@
 """CLI entry-point for the v2 training loop.
 
-Two profiles are exposed via ``--profile``:
+Three profiles are exposed via ``--profile`` (default: overfit):
 
-* ``overfit`` (default) — trains on a single sample picked by
+* ``overfit`` — trains on a single sample picked by
   ``--sample-link-index``.  Used for the architectural sanity check.
 * ``full`` — multi-sample production training over the dataset
-  filtered by ``--include-folders``.  Reads
-  :func:`runFullTraining` from ``full_training_v2``.
+  filtered by ``--include-folders``.
+* ``debug`` — **fast end-to-end iteration** (< 2 min on MPS): reduced
+  model dims, 50 training steps with health probes at every step,
+  followed by one generation exported as ``debug_sample.dae``.
+  Alternatively use ``--debug`` to bypass ``--profile``.
 
 Examples
 --------
 .. code-block:: bash
 
+    # Debug run (fast, end-to-end)
+    poetry run python -m ainimator.cli.train_generation_v2 \\
+        --debug \\
+        --dataset-root /Users/pazimor/dataset_preprocessed \\
+        --tokenizer-dir output/text/custom_tokenizer \\
+        --output-dir output/debug_run
+
     # Overfit on a single sample
-    poetry run python -m src.cli.train_generation_v2 \\
+    poetry run python -m ainimator.cli.train_generation_v2 \\
         --profile overfit \\
         --dataset-root /Users/pazimor/dataset_preprocessed \\
         --tokenizer-dir output/text/custom_tokenizer \\
@@ -22,7 +32,7 @@ Examples
         --epochs 200
 
     # Full training on all 5 v2 folders
-    poetry run python -m src.cli.train_generation_v2 \\
+    poetry run python -m ainimator.cli.train_generation_v2 \\
         --profile full \\
         --dataset-root /Users/pazimor/dataset_preprocessed \\
         --tokenizer-dir output/text/custom_tokenizer \\
@@ -42,6 +52,10 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from ainimator.training.debug_runner import (
+    DebugTrainingConfig,
+    runDebug,
+)
 from ainimator.training.full_training_v2 import (
     V2FullTrainingConfig,
     runFullTraining,
@@ -62,15 +76,28 @@ def buildArgumentParser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--debug",
+        dest="debugMode",
+        action="store_true",
+        default=False,
+        help=(
+            "Fast end-to-end debug run: reduced model dims, 50 training "
+            "steps, health probes at every step, one generation exported "
+            "as ``debug_sample.dae``.  Target wall-clock < 2 min on MPS. "
+            "Equivalent to ``--profile debug``.  Overrides ``--profile``."
+        ),
+    )
+    parser.add_argument(
         "--profile",
         dest="profile",
         type=str,
         default="overfit",
-        choices=["overfit", "full"],
+        choices=["overfit", "full", "debug"],
         help=(
             "Training profile.  ``overfit`` trains on a single sample "
             "(sanity check); ``full`` trains on the whole filtered "
-            "dataset. (default: %(default)s)"
+            "dataset; ``debug`` is a fast end-to-end pass (< 2 min). "
+            "(default: %(default)s)"
         ),
     )
     parser.add_argument(
@@ -820,6 +847,20 @@ def _attachLogFile(outputDir: Path) -> logging.FileHandler:
     return fileHandler
 
 
+def _argumentsToDebugConfig(
+    arguments: argparse.Namespace,
+) -> DebugTrainingConfig:
+    """Build a :class:`DebugTrainingConfig` from parsed CLI arguments."""
+    return DebugTrainingConfig(
+        datasetRoot=arguments.datasetRoot,
+        tokenizerDir=arguments.tokenizerDir,
+        outputDir=arguments.outputDir,
+        sampleLinkIndex=int(arguments.sampleLinkIndex),
+        seed=int(arguments.seed),
+        device=str(arguments.device),
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = buildArgumentParser()
     arguments = parser.parse_args(argv)
@@ -828,10 +869,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         format=_LOG_FORMAT,
     )
 
-    profile = str(arguments.profile)
+    # --debug flag overrides --profile.
+    profile = (
+        "debug"
+        if bool(arguments.debugMode)
+        else str(arguments.profile)
+    )
     fileHandler = _attachLogFile(Path(arguments.outputDir))
     try:
-        if profile == "overfit":
+        if profile == "debug":
+            debugConfig = _argumentsToDebugConfig(arguments)
+            result = runDebug(debugConfig)
+            LOGGER.info(
+                "Debug run done in %.1fs. "
+                "checkpoint=%s  generation=%s",
+                result.elapsedSeconds,
+                result.checkpointPath,
+                result.generationPath,
+            )
+        elif profile == "overfit":
             config = _argumentsToOverfitConfig(arguments)
             components, history = runOverfit(config)
             finalLoss = (

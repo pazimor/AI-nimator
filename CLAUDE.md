@@ -81,8 +81,14 @@ All commands use the new `ainimator.*` package path (phase A2+).
 - `poetry run python -m ainimator.cli.build_dataset` — match prompts
 - `poetry run python -m ainimator.cli.preprocess_dataset` — preprocess
 - `poetry run python -m ainimator.cli.train_custom_tokenizer` — BPE
-- `poetry run python -m ainimator.cli.train_generation_v2 --profile {overfit,full}`
-  — v2 training (overfit = sanity check, full = real run)
+- `poetry run python -m ainimator.cli.train_generation_v2 --profile {overfit,full,debug}`
+  — v2 training (overfit = sanity check, full = real run, debug = fast
+  end-to-end < 2 min); equivalent shorthand: `--debug` flag
+- `poetry run python -m ainimator.cli.train_generation_v2 --debug --dataset-root <path> --tokenizer-dir <path> --output-dir output/debug_run`
+  — fast debug run: reduced 64d/1L model, 50 steps, health every step,
+  one `.dae` generated; target < 2 min on MPS
+- `make smoke-test` — overfit-1-batch sanity check (no real dataset needed,
+  runs on synthetic data via pytest)
 - `poetry run python -m ainimator.cli.generate_animation_v2` — sample + export .dae
 - `poetry run python -m ainimator.cli.diagnose_generation_v2` — conditioning
   diagnostics (absorbed into `ainimator.cli.health` after phase A3)
