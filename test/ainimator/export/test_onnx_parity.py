@@ -1,0 +1,435 @@
+"""ONNX parity tests for the encoder and denoiser (Phase A8).
+
+These tests export both models to ONNX, run inference with ONNXRuntime
+(CPU) and PyTorch on IDENTICAL inputs, and assert that the outputs match
+within :data:`TOLERANCE`.
+
+The tests are marked with the ``onnx`` pytest mark so they can be
+filtered independently, but they run in the default suite (no
+``--run-slow`` gate) because they complete in seconds on CPU.
+
+CI contract (§2.10): these tests must stay green.  Any future PR that
+breaks ONNX export is refused.
+"""
+
+from __future__ import annotations
+
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+from ainimator.model.denoiser_v2 import (
+    MotionDenoiserV2,
+    MotionDenoiserV2Config,
+)
+from ainimator.text.custom_text_encoder import (
+    CustomTextEncoder,
+    CustomTextEncoderConfig,
+)
+from ainimator.export.onnx import (
+    exportEncoder,
+    exportDenoiser,
+    ONNX_PARITY_TOLERANCE,
+)
+
+# ---------------------------------------------------------------------------
+# pytest mark — lets CI run "pytest -m onnx" independently if desired
+# ---------------------------------------------------------------------------
+pytestmark = pytest.mark.onnx
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+_EMBED_DIM = 64
+_TEXT_DIM = 64
+_NUM_LAYERS = 2
+_NUM_HEADS = 4
+_NUM_BONES = 22
+_MOTION_CH = 6
+_GLOBAL_CH = 3
+_FRAMES = 8
+_TEXT_LEN = 12
+_BATCH = 2
+_VOCAB_SIZE = 200
+
+
+def _makeEncoder() -> CustomTextEncoder:
+    """Build a minimal encoder for tests."""
+    config = CustomTextEncoderConfig(
+        vocabSize=_VOCAB_SIZE,
+        maxLength=_TEXT_LEN,
+        hiddenDim=_EMBED_DIM,
+        numLayers=_NUM_LAYERS,
+        numHeads=_NUM_HEADS,
+        dropout=0.0,
+        outputDim=_TEXT_DIM,
+        useNullEmbedding=True,
+        l2NormalizeOutput=True,
+    )
+    encoder = CustomTextEncoder(config)
+    encoder.eval()
+    return encoder
+
+
+def _makeDenoiser() -> MotionDenoiserV2:
+    """Build a minimal denoiser for tests."""
+    config = MotionDenoiserV2Config(
+        embedDim=_EMBED_DIM,
+        numHeads=_NUM_HEADS,
+        numLayers=_NUM_LAYERS,
+        numBones=_NUM_BONES,
+        motionChannels=_MOTION_CH,
+        globalChannels=_GLOBAL_CH,
+        textEmbedDim=_TEXT_DIM,
+        maxFrames=32,
+        dropout=0.0,
+        useFilmConditioning=False,
+        usePerBlockFilm=False,
+    )
+    denoiser = MotionDenoiserV2(config)
+    denoiser.eval()
+    return denoiser
+
+
+def _ortSession(onnxPath: Path) -> "onnxruntime.InferenceSession":
+    """Create an ONNXRuntime CPU session."""
+    import onnxruntime
+
+    return onnxruntime.InferenceSession(
+        str(onnxPath),
+        providers=["CPUExecutionProvider"],
+    )
+
+
+def _maxAbsDiff(
+    torchOut: torch.Tensor,
+    ortOut: np.ndarray,
+) -> float:
+    """Return the max absolute difference between torch and ORT outputs."""
+    npTorch = torchOut.detach().numpy()
+    return float(np.abs(npTorch - ortOut).max())
+
+
+# ---------------------------------------------------------------------------
+# Encoder parity
+# ---------------------------------------------------------------------------
+class TestEncoderOnnxParity:
+    """Export encoder → run ORT → compare to PyTorch."""
+
+    def test_encoder_export_produces_valid_onnx(self) -> None:
+        """onnx.checker must pass on the exported encoder graph."""
+        import onnx
+
+        encoder = _makeEncoder()
+        with tempfile.TemporaryDirectory() as tmpDir:
+            outPath = Path(tmpDir) / "encoder.onnx"
+            exportEncoder(
+                encoder=encoder,
+                outputPath=outPath,
+                batchSize=_BATCH,
+                textLen=_TEXT_LEN,
+            )
+            assert outPath.exists(), "Export did not produce a file."
+            model = onnx.load(str(outPath))
+            onnx.checker.check_model(model)  # raises on invalid graph
+
+    def test_encoder_ort_vs_torch_hidden_states(self) -> None:
+        """ORT hidden-states must match PyTorch within tolerance."""
+        encoder = _makeEncoder()
+        inputIds = torch.zeros(_BATCH, _TEXT_LEN, dtype=torch.long)
+        attMask = torch.ones(_BATCH, _TEXT_LEN, dtype=torch.float32)
+
+        with torch.no_grad():
+            torchOut = encoder(inputIds, attMask)
+        torchHidden = torchOut.hiddenStates  # (B, T, D)
+
+        with tempfile.TemporaryDirectory() as tmpDir:
+            outPath = Path(tmpDir) / "encoder.onnx"
+            exportEncoder(
+                encoder=encoder,
+                outputPath=outPath,
+                batchSize=_BATCH,
+                textLen=_TEXT_LEN,
+            )
+            session = _ortSession(outPath)
+            feeds = {
+                "inputIds": inputIds.numpy(),
+                "attentionMask": attMask.numpy(),
+            }
+            ortHidden, _ortMask = session.run(None, feeds)
+
+        diff = _maxAbsDiff(torchHidden, ortHidden)
+        assert diff <= ONNX_PARITY_TOLERANCE, (
+            f"Encoder hidden-states max abs diff = {diff:.6f} "
+            f"exceeds tolerance {ONNX_PARITY_TOLERANCE}."
+        )
+
+    def test_encoder_ort_vs_torch_key_padding_mask(self) -> None:
+        """ORT key-padding-mask must match PyTorch within tolerance."""
+        encoder = _makeEncoder()
+        inputIds = torch.zeros(_BATCH, _TEXT_LEN, dtype=torch.long)
+        attMask = torch.ones(_BATCH, _TEXT_LEN, dtype=torch.float32)
+
+        with torch.no_grad():
+            torchOut = encoder(inputIds, attMask)
+        torchMask = torchOut.keyPaddingMask.to(torch.float32)
+
+        with tempfile.TemporaryDirectory() as tmpDir:
+            outPath = Path(tmpDir) / "encoder.onnx"
+            exportEncoder(
+                encoder=encoder,
+                outputPath=outPath,
+                batchSize=_BATCH,
+                textLen=_TEXT_LEN,
+            )
+            session = _ortSession(outPath)
+            feeds = {
+                "inputIds": inputIds.numpy(),
+                "attentionMask": attMask.numpy(),
+            }
+            _ortHidden, ortMask = session.run(None, feeds)
+
+        diff = _maxAbsDiff(torchMask, ortMask)
+        assert diff <= ONNX_PARITY_TOLERANCE, (
+            f"Encoder mask max abs diff = {diff:.6f} "
+            f"exceeds tolerance {ONNX_PARITY_TOLERANCE}."
+        )
+
+    def test_encoder_dynamic_axes_different_batch(self) -> None:
+        """Exported encoder runs with a different batch size."""
+        encoder = _makeEncoder()
+        with tempfile.TemporaryDirectory() as tmpDir:
+            outPath = Path(tmpDir) / "encoder.onnx"
+            exportEncoder(
+                encoder=encoder,
+                outputPath=outPath,
+                batchSize=_BATCH,
+                textLen=_TEXT_LEN,
+            )
+            session = _ortSession(outPath)
+            newBatch = 3
+            inputIds = torch.zeros(newBatch, _TEXT_LEN, dtype=torch.long)
+            attMask = torch.ones(newBatch, _TEXT_LEN, dtype=torch.float32)
+            feeds = {
+                "inputIds": inputIds.numpy(),
+                "attentionMask": attMask.numpy(),
+            }
+            ortHidden, _ = session.run(None, feeds)
+            assert ortHidden.shape == (newBatch, _TEXT_LEN, _TEXT_DIM)
+
+    def test_encoder_dynamic_axes_different_text_len(self) -> None:
+        """Exported encoder runs with a different text length."""
+        encoder = _makeEncoder()
+        with tempfile.TemporaryDirectory() as tmpDir:
+            outPath = Path(tmpDir) / "encoder.onnx"
+            exportEncoder(
+                encoder=encoder,
+                outputPath=outPath,
+                batchSize=_BATCH,
+                textLen=_TEXT_LEN,
+            )
+            session = _ortSession(outPath)
+            newLen = 6
+            inputIds = torch.zeros(_BATCH, newLen, dtype=torch.long)
+            attMask = torch.ones(_BATCH, newLen, dtype=torch.float32)
+            feeds = {
+                "inputIds": inputIds.numpy(),
+                "attentionMask": attMask.numpy(),
+            }
+            ortHidden, _ = session.run(None, feeds)
+            assert ortHidden.shape == (_BATCH, newLen, _TEXT_DIM)
+
+
+# ---------------------------------------------------------------------------
+# Denoiser step parity
+# ---------------------------------------------------------------------------
+class TestDenoiserOnnxParity:
+    """Export denoiser-step → run ORT → compare to PyTorch."""
+
+    def _makeInputs(self) -> dict[str, torch.Tensor]:
+        """Build concrete example inputs for one denoiser step."""
+        return {
+            "noisyMotion": torch.randn(
+                _BATCH, _FRAMES, _NUM_BONES, _MOTION_CH
+            ),
+            "noisyGlobal": torch.randn(_BATCH, _FRAMES, _GLOBAL_CH),
+            "timesteps": torch.zeros(_BATCH, dtype=torch.long),
+            "textHiddenStates": torch.randn(_BATCH, _TEXT_LEN, _TEXT_DIM),
+            "textKeyPaddingMask": torch.zeros(
+                _BATCH, _TEXT_LEN, dtype=torch.float32
+            ),
+            "motionKeyPaddingMask": torch.zeros(
+                _BATCH, _FRAMES, dtype=torch.float32
+            ),
+        }
+
+    def test_denoiser_export_produces_valid_onnx(self) -> None:
+        """onnx.checker must pass on the exported denoiser graph."""
+        import onnx
+
+        denoiser = _makeDenoiser()
+        with tempfile.TemporaryDirectory() as tmpDir:
+            outPath = Path(tmpDir) / "denoiser_step.onnx"
+            exportDenoiser(
+                denoiser=denoiser,
+                outputPath=outPath,
+                batchSize=_BATCH,
+                frames=_FRAMES,
+                textLen=_TEXT_LEN,
+            )
+            assert outPath.exists(), "Export did not produce a file."
+            model = onnx.load(str(outPath))
+            onnx.checker.check_model(model)
+
+    def test_denoiser_ort_vs_torch_bone_output(self) -> None:
+        """ORT boneOutput must match PyTorch within tolerance."""
+        denoiser = _makeDenoiser()
+        inputs = self._makeInputs()
+
+        with torch.no_grad():
+            torchResult = denoiser(
+                noisyMotion=inputs["noisyMotion"],
+                timesteps=inputs["timesteps"],
+                textHiddenStates=inputs["textHiddenStates"],
+                textKeyPaddingMask=inputs["textKeyPaddingMask"].bool(),
+                noisyGlobalFeatures=inputs["noisyGlobal"],
+                motionKeyPaddingMask=inputs["motionKeyPaddingMask"].bool(),
+            )
+
+        with tempfile.TemporaryDirectory() as tmpDir:
+            outPath = Path(tmpDir) / "denoiser_step.onnx"
+            exportDenoiser(
+                denoiser=denoiser,
+                outputPath=outPath,
+                batchSize=_BATCH,
+                frames=_FRAMES,
+                textLen=_TEXT_LEN,
+            )
+            session = _ortSession(outPath)
+            feeds = {
+                key: inputs[key].numpy() for key in inputs
+            }
+            ortBone, _ortGlobal = session.run(None, feeds)
+
+        diff = _maxAbsDiff(torchResult.boneOutput, ortBone)
+        assert diff <= ONNX_PARITY_TOLERANCE, (
+            f"Denoiser boneOutput max abs diff = {diff:.6f} "
+            f"exceeds tolerance {ONNX_PARITY_TOLERANCE}."
+        )
+
+    def test_denoiser_ort_vs_torch_global_output(self) -> None:
+        """ORT globalOutput must match PyTorch within tolerance."""
+        denoiser = _makeDenoiser()
+        inputs = self._makeInputs()
+
+        with torch.no_grad():
+            torchResult = denoiser(
+                noisyMotion=inputs["noisyMotion"],
+                timesteps=inputs["timesteps"],
+                textHiddenStates=inputs["textHiddenStates"],
+                textKeyPaddingMask=inputs["textKeyPaddingMask"].bool(),
+                noisyGlobalFeatures=inputs["noisyGlobal"],
+                motionKeyPaddingMask=inputs["motionKeyPaddingMask"].bool(),
+            )
+
+        with tempfile.TemporaryDirectory() as tmpDir:
+            outPath = Path(tmpDir) / "denoiser_step.onnx"
+            exportDenoiser(
+                denoiser=denoiser,
+                outputPath=outPath,
+                batchSize=_BATCH,
+                frames=_FRAMES,
+                textLen=_TEXT_LEN,
+            )
+            session = _ortSession(outPath)
+            feeds = {
+                key: inputs[key].numpy() for key in inputs
+            }
+            _ortBone, ortGlobal = session.run(None, feeds)
+
+        assert torchResult.globalOutput is not None
+        diff = _maxAbsDiff(torchResult.globalOutput, ortGlobal)
+        assert diff <= ONNX_PARITY_TOLERANCE, (
+            f"Denoiser globalOutput max abs diff = {diff:.6f} "
+            f"exceeds tolerance {ONNX_PARITY_TOLERANCE}."
+        )
+
+    def test_denoiser_dynamic_axes_different_batch(self) -> None:
+        """Exported denoiser-step runs with a different batch size."""
+        denoiser = _makeDenoiser()
+        with tempfile.TemporaryDirectory() as tmpDir:
+            outPath = Path(tmpDir) / "denoiser_step.onnx"
+            exportDenoiser(
+                denoiser=denoiser,
+                outputPath=outPath,
+                batchSize=_BATCH,
+                frames=_FRAMES,
+                textLen=_TEXT_LEN,
+            )
+            session = _ortSession(outPath)
+            newBatch = 3
+            feeds = {
+                "noisyMotion": torch.randn(
+                    newBatch, _FRAMES, _NUM_BONES, _MOTION_CH
+                ).numpy(),
+                "noisyGlobal": torch.randn(
+                    newBatch, _FRAMES, _GLOBAL_CH
+                ).numpy(),
+                "timesteps": np.zeros(newBatch, dtype=np.int64),
+                "textHiddenStates": torch.randn(
+                    newBatch, _TEXT_LEN, _TEXT_DIM
+                ).numpy(),
+                "textKeyPaddingMask": np.zeros(
+                    (newBatch, _TEXT_LEN), dtype=np.float32
+                ),
+                "motionKeyPaddingMask": np.zeros(
+                    (newBatch, _FRAMES), dtype=np.float32
+                ),
+            }
+            ortBone, ortGlobal = session.run(None, feeds)
+            assert ortBone.shape == (
+                newBatch, _FRAMES, _NUM_BONES, _MOTION_CH
+            )
+            assert ortGlobal.shape == (newBatch, _FRAMES, _GLOBAL_CH)
+
+    def test_denoiser_dynamic_axes_different_frames(self) -> None:
+        """Exported denoiser-step runs with a different frame count."""
+        denoiser = _makeDenoiser()
+        with tempfile.TemporaryDirectory() as tmpDir:
+            outPath = Path(tmpDir) / "denoiser_step.onnx"
+            exportDenoiser(
+                denoiser=denoiser,
+                outputPath=outPath,
+                batchSize=_BATCH,
+                frames=_FRAMES,
+                textLen=_TEXT_LEN,
+            )
+            session = _ortSession(outPath)
+            newFrames = 16
+            feeds = {
+                "noisyMotion": torch.randn(
+                    _BATCH, newFrames, _NUM_BONES, _MOTION_CH
+                ).numpy(),
+                "noisyGlobal": torch.randn(
+                    _BATCH, newFrames, _GLOBAL_CH
+                ).numpy(),
+                "timesteps": np.zeros(_BATCH, dtype=np.int64),
+                "textHiddenStates": torch.randn(
+                    _BATCH, _TEXT_LEN, _TEXT_DIM
+                ).numpy(),
+                "textKeyPaddingMask": np.zeros(
+                    (_BATCH, _TEXT_LEN), dtype=np.float32
+                ),
+                "motionKeyPaddingMask": np.zeros(
+                    (_BATCH, newFrames), dtype=np.float32
+                ),
+            }
+            ortBone, ortGlobal = session.run(None, feeds)
+            assert ortBone.shape == (
+                _BATCH, newFrames, _NUM_BONES, _MOTION_CH
+            )
+            assert ortGlobal.shape == (_BATCH, newFrames, _GLOBAL_CH)

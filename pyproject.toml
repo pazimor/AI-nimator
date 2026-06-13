@@ -19,6 +19,8 @@ dependencies = [
   "kornia>=0.7",
   "pydantic (>=2.13.4,<3.0.0)",
   "tensorboard (>=2.20.0,<3.0.0)",
+  "onnx (>=1.21.0,<2.0.0)",
+  "onnxruntime (>=1.26.0,<2.0.0)",
 ]
 
 [project.optional-dependencies]
@@ -65,6 +67,9 @@ pretty = true
 addopts = "-ra"
 pythonpath = [".", "src"]
 testpaths = ["src", "test"]
+markers = [
+  "onnx: ONNX export and parity tests (Phase A8). Must stay green — CI contract §2.10.",
+]
 
 [tool.coverage.run]
 source = ["src/shared"]

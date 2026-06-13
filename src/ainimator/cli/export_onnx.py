@@ -1,0 +1,178 @@
+"""CLI entry point for ONNX export (Phase A8).
+
+Usage
+-----
+.. code-block:: bash
+
+    poetry run python -m ainimator.cli.export_onnx encoder \\
+        --encoder-artifact path/to/encoder_artifact \\
+        --output output/onnx/encoder.onnx
+
+    poetry run python -m ainimator.cli.export_onnx denoiser \\
+        --checkpoint path/to/checkpoint.pt \\
+        --output output/onnx/denoiser_step.onnx
+
+This CLI is logic-free: it parses arguments, loads the components
+from existing artifacts/checkpoints, delegates to
+:mod:`ainimator.export.onnx`, and reports success.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+_ENCODER_COMMAND = "encoder"
+_DENOISER_COMMAND = "denoiser"
+
+
+def _buildParser() -> argparse.ArgumentParser:
+    """Build the argument parser for the export_onnx CLI."""
+    parser = argparse.ArgumentParser(
+        prog="python -m ainimator.cli.export_onnx",
+        description="Export encoder or denoiser to ONNX.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # --- encoder sub-command -------------------------------------------
+    encParser = sub.add_parser(
+        _ENCODER_COMMAND,
+        help="Export the text encoder (encode() path).",
+    )
+    encParser.add_argument(
+        "--encoder-artifact",
+        type=Path,
+        required=True,
+        metavar="DIR",
+        help="Path to an encoder artifact directory "
+        "(contains config.yaml + weights.pt).",
+    )
+    encParser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("output/onnx/encoder.onnx"),
+        metavar="FILE",
+        help="Destination .onnx file.  Default: output/onnx/encoder.onnx",
+    )
+    encParser.add_argument(
+        "--batch-size", type=int, default=1, metavar="N"
+    )
+    encParser.add_argument(
+        "--text-len", type=int, default=16, metavar="N"
+    )
+
+    # --- denoiser sub-command ------------------------------------------
+    denParser = sub.add_parser(
+        _DENOISER_COMMAND,
+        help="Export one denoiser step (the DDIM loop stays in Python).",
+    )
+    denParser.add_argument(
+        "--checkpoint",
+        type=Path,
+        required=True,
+        metavar="FILE",
+        help="Path to a v2 checkpoint (.pt).",
+    )
+    denParser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("output/onnx/denoiser_step.onnx"),
+        metavar="FILE",
+        help=(
+            "Destination .onnx file.  "
+            "Default: output/onnx/denoiser_step.onnx"
+        ),
+    )
+    denParser.add_argument(
+        "--batch-size", type=int, default=1, metavar="N"
+    )
+    denParser.add_argument(
+        "--frames", type=int, default=32, metavar="N"
+    )
+    denParser.add_argument(
+        "--text-len", type=int, default=16, metavar="N"
+    )
+    return parser
+
+
+def _exportEncoder(args: argparse.Namespace) -> None:
+    """Load an encoder artifact and export it to ONNX.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed CLI arguments for the ``encoder`` sub-command.
+    """
+    from ainimator.text.artifact import loadEncoderArtifact
+    from ainimator.text.custom_text_encoder import CustomTextEncoder
+    from ainimator.export.onnx import exportEncoder
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(message)s",
+    )
+    encoder, _tokenizer = loadEncoderArtifact(args.encoder_artifact)
+    if not isinstance(encoder, CustomTextEncoder):
+        raise TypeError(
+            "export_onnx encoder only supports CustomTextEncoder; "
+            f"got {type(encoder).__name__}."
+        )
+    encoder.eval()
+    exportEncoder(
+        encoder=encoder,
+        outputPath=args.output,
+        batchSize=args.batch_size,
+        textLen=args.text_len,
+    )
+    print(f"Encoder exported to {args.output}")
+
+
+def _exportDenoiser(args: argparse.Namespace) -> None:
+    """Load a checkpoint and export one denoiser step to ONNX.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed CLI arguments for the ``denoiser`` sub-command.
+    """
+    from ainimator.training.training_v2 import loadCheckpointV2
+    from ainimator.export.onnx import exportDenoiser
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(message)s",
+    )
+    _tokenizer, _encoder, denoiser, _schedule, _normalizer, _meta = (
+        loadCheckpointV2(args.checkpoint, device="cpu")
+    )
+    denoiser.eval()
+    exportDenoiser(
+        denoiser=denoiser,
+        outputPath=args.output,
+        batchSize=args.batch_size,
+        frames=args.frames,
+        textLen=args.text_len,
+    )
+    print(f"Denoiser step exported to {args.output}")
+
+
+def main() -> None:
+    """Entry point for ``python -m ainimator.cli.export_onnx``."""
+    parser = _buildParser()
+    args = parser.parse_args()
+
+    if args.command == _ENCODER_COMMAND:
+        _exportEncoder(args)
+    elif args.command == _DENOISER_COMMAND:
+        _exportDenoiser(args)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
