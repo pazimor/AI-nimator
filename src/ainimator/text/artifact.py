@@ -27,6 +27,7 @@ Imports: only ``core`` and ``text`` — no ``model``, ``training``, or
 from __future__ import annotations
 
 import hashlib
+import os
 import tempfile
 from pathlib import Path
 from typing import Union
@@ -87,51 +88,14 @@ def computeWeightsHash(weightsPath: Path) -> str:
 
 
 # =====================================================================
-# Save
+# Save — helpers
 # =====================================================================
 
-def saveEncoderArtifact(
-    encoder: AnyEncoder,
+def _writeConfigFile(
     artifactDir: Path,
-    tokenizer: AnyTokenizer | None = None,
-) -> str:
-    """Persist an encoder artifact to *artifactDir*.
-
-    Creates the directory (and parents) if it does not exist.
-
-    Parameters
-    ----------
-    encoder : AnyEncoder
-        The encoder to persist.  Frozen CLIP tower parameters are
-        excluded from ``weights.pt`` (same policy as A4).
-    artifactDir : Path
-        Target directory.  Created if missing.
-    tokenizer : AnyTokenizer | None
-        Must be provided for ``CustomTextEncoder`` (the BPE tokenizer
-        is saved in ``tokenizer/``).  Ignored for ``ClipTextEncoder``
-        (the CLIP tokenizer is reconstructed from the HF hub).
-
-    Returns
-    -------
-    str
-        SHA-256 hex digest of the saved ``weights.pt``.
-
-    Raises
-    ------
-    ValueError
-        When a custom encoder is provided without a tokenizer.
-    """
-    artifactDir = Path(artifactDir)
-    artifactDir.mkdir(parents=True, exist_ok=True)
-
-    isClip = isinstance(encoder, ClipTextEncoder)
-
-    if not isClip and tokenizer is None:
-        raise ValueError(
-            "saveEncoderArtifact: tokenizer must be provided for "
-            "CustomTextEncoder."
-        )
-
+    encoder: AnyEncoder,
+) -> None:
+    """Serialise encoder config to YAML and write ``encoder_config.yaml``."""
     config = _buildConfigDict(encoder)
     configPath = artifactDir / _CONFIG_FILENAME
     configPath.write_text(
@@ -139,34 +103,103 @@ def saveEncoderArtifact(
         encoding="utf-8",
     )
 
-    if not isClip and isinstance(tokenizer, CustomTokenizer):
+
+def _saveTokenizerIfNeeded(
+    artifactDir: Path,
+    encoder: AnyEncoder,
+    tokenizer: AnyTokenizer | None,
+) -> None:
+    """Save the BPE tokenizer when *encoder* is a CustomTextEncoder."""
+    if isinstance(encoder, ClipTextEncoder):
+        return
+    if tokenizer is None:
+        raise ValueError(
+            "saveEncoderArtifact: tokenizer must be provided for "
+            "CustomTextEncoder."
+        )
+    if isinstance(tokenizer, CustomTokenizer):
         tokenizer.save(artifactDir / _TOKENIZER_SUBDIR)
 
-    state = _trainableState(encoder)
-    weightsPath = artifactDir / _WEIGHTS_FILENAME
-    _saveTensorsDeterministically(state, weightsPath)
 
+def _writeHashFile(artifactDir: Path, weightsPath: Path) -> str:
+    """Compute the weights hash and write ``hash.txt``; return digest."""
     digest = computeWeightsHash(weightsPath)
-    (artifactDir / _HASH_FILENAME).write_text(digest + "\n", encoding="utf-8")
-
+    (artifactDir / _HASH_FILENAME).write_text(
+        digest + "\n", encoding="utf-8"
+    )
     return digest
 
 
-def _buildConfigDict(encoder: AnyEncoder) -> dict[str, object]:
-    """Serialise encoder config to a plain Python dict."""
-    if isinstance(encoder, ClipTextEncoder):
-        cfg = encoder.config
-        return {
-            _KEY_ENCODER_TYPE: _ENCODER_TYPE_CLIP,
-            "modelName": cfg.modelName,
-            "maxLength": cfg.maxLength,
-            "outputDim": cfg.outputDim,
-            "clipHiddenDim": cfg.clipHiddenDim,
-            "dropout": cfg.dropout,
-            "useNullEmbedding": cfg.useNullEmbedding,
-            "l2NormalizeOutput": cfg.l2NormalizeOutput,
-        }
-    cfg = encoder.config  # type: ignore[union-attr]
+def _doAtomicWrite(
+    fd: int,
+    tmpPath: Path,
+    destPath: Path,
+    state: dict[str, torch.Tensor],
+) -> None:
+    """Write *state* via *fd* / *tmpPath* and atomically rename to *destPath*.
+
+    Cleans up *tmpPath* on failure.
+    """
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            torch.save(state, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmpPath, destPath)
+    except Exception:
+        try:
+            tmpPath.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+# =====================================================================
+# Save — public API
+# =====================================================================
+
+def saveEncoderArtifact(
+    encoder: AnyEncoder,
+    artifactDir: Path,
+    tokenizer: AnyTokenizer | None = None,
+) -> str:
+    """Persist an encoder artifact; return SHA-256 of weights.pt.
+
+    *tokenizer* is required for CustomTextEncoder and ignored for
+    ClipTextEncoder (reconstructed from HF hub on load).
+    """
+    artifactDir = Path(artifactDir)
+    artifactDir.mkdir(parents=True, exist_ok=True)
+    _saveTokenizerIfNeeded(artifactDir, encoder, tokenizer)
+    _writeConfigFile(artifactDir, encoder)
+    state = _trainableState(encoder)
+    weightsPath = artifactDir / _WEIGHTS_FILENAME
+    _saveTensorsDeterministically(state, weightsPath)
+    return _writeHashFile(artifactDir, weightsPath)
+
+
+def _buildClipConfigDict(
+    encoder: ClipTextEncoder,
+) -> dict[str, object]:
+    """Serialise a ClipTextEncoder config to a plain Python dict."""
+    cfg = encoder.config
+    return {
+        _KEY_ENCODER_TYPE: _ENCODER_TYPE_CLIP,
+        "modelName": cfg.modelName,
+        "maxLength": cfg.maxLength,
+        "outputDim": cfg.outputDim,
+        "clipHiddenDim": cfg.clipHiddenDim,
+        "dropout": cfg.dropout,
+        "useNullEmbedding": cfg.useNullEmbedding,
+        "l2NormalizeOutput": cfg.l2NormalizeOutput,
+    }
+
+
+def _buildCustomConfigDict(
+    encoder: CustomTextEncoder,
+) -> dict[str, object]:
+    """Serialise a CustomTextEncoder config to a plain Python dict."""
+    cfg = encoder.config
     return {
         _KEY_ENCODER_TYPE: _ENCODER_TYPE_CUSTOM,
         "vocabSize": cfg.vocabSize,
@@ -181,6 +214,13 @@ def _buildConfigDict(encoder: AnyEncoder) -> dict[str, object]:
         "useNullEmbedding": cfg.useNullEmbedding,
         "l2NormalizeOutput": cfg.l2NormalizeOutput,
     }
+
+
+def _buildConfigDict(encoder: AnyEncoder) -> dict[str, object]:
+    """Serialise encoder config to a plain Python dict."""
+    if isinstance(encoder, ClipTextEncoder):
+        return _buildClipConfigDict(encoder)
+    return _buildCustomConfigDict(encoder)  # type: ignore[arg-type]
 
 
 def _trainableState(
@@ -204,72 +244,12 @@ def _saveTensorsDeterministically(
     fd, tmpRaw = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
-    import os
-    tmpPath = Path(tmpRaw)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            torch.save(state, handle)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmpPath, path)
-    except Exception:
-        try:
-            tmpPath.unlink()
-        except FileNotFoundError:
-            pass
-        raise
+    _doAtomicWrite(fd, Path(tmpRaw), path, state)
 
 
 # =====================================================================
-# Load
+# Load — helpers
 # =====================================================================
-
-def loadEncoderArtifact(
-    artifactDir: Path,
-    device: torch.device | str = "cpu",
-) -> tuple[AnyEncoder, AnyTokenizer]:
-    """Load an encoder artifact from *artifactDir*.
-
-    Parameters
-    ----------
-    artifactDir : Path
-        Directory produced by :func:`saveEncoderArtifact`.
-    device : torch.device | str
-        Device to place the encoder on.
-
-    Returns
-    -------
-    tuple[AnyEncoder, AnyTokenizer]
-        ``(encoder, tokenizer)`` fully constructed and placed on
-        *device*.
-
-    Raises
-    ------
-    FileNotFoundError
-        When the artifact directory or required files are missing.
-    ValueError
-        When the hash in ``hash.txt`` does not match the loaded
-        ``weights.pt`` (file corruption guard).
-    """
-    artifactDir = Path(artifactDir)
-    _assertArtifactExists(artifactDir)
-
-    configPath = artifactDir / _CONFIG_FILENAME
-    config = yaml.safe_load(configPath.read_text(encoding="utf-8"))
-
-    weightsPath = artifactDir / _WEIGHTS_FILENAME
-    _assertHashMatches(artifactDir, weightsPath)
-
-    targetDevice = torch.device(device)
-    state: dict[str, torch.Tensor] = torch.load(
-        weightsPath, map_location=targetDevice, weights_only=True
-    )
-
-    encoderType = config.get(_KEY_ENCODER_TYPE, _ENCODER_TYPE_CUSTOM)
-    if encoderType == _ENCODER_TYPE_CLIP:
-        return _loadClipArtifact(config, state, targetDevice)
-    return _loadCustomArtifact(artifactDir, config, state, targetDevice)
-
 
 def _assertArtifactExists(artifactDir: Path) -> None:
     """Raise FileNotFoundError when required artifact files are missing."""
@@ -299,6 +279,70 @@ def _assertHashMatches(
         )
 
 
+def _loadConfigAndState(
+    artifactDir: Path,
+    device: torch.device,
+) -> tuple[dict[str, object], dict[str, torch.Tensor]]:
+    """Read and validate the config YAML + weights.pt from *artifactDir*."""
+    configPath = artifactDir / _CONFIG_FILENAME
+    config: dict[str, object] = yaml.safe_load(
+        configPath.read_text(encoding="utf-8")
+    )
+    weightsPath = artifactDir / _WEIGHTS_FILENAME
+    _assertHashMatches(artifactDir, weightsPath)
+    state: dict[str, torch.Tensor] = torch.load(
+        weightsPath, map_location=device, weights_only=True
+    )
+    return config, state
+
+
+# =====================================================================
+# Load — public API
+# =====================================================================
+
+def loadEncoderArtifact(
+    artifactDir: Path,
+    device: torch.device | str = "cpu",
+) -> tuple[AnyEncoder, AnyTokenizer]:
+    """Load and return ``(encoder, tokenizer)`` from *artifactDir*.
+
+    Raises ``FileNotFoundError`` when required files are absent and
+    ``ValueError`` on SHA-256 hash mismatch (corruption guard).
+    """
+    artifactDir = Path(artifactDir)
+    _assertArtifactExists(artifactDir)
+    targetDevice = torch.device(device)
+    config, state = _loadConfigAndState(artifactDir, targetDevice)
+    encoderType = config.get(_KEY_ENCODER_TYPE, _ENCODER_TYPE_CUSTOM)
+    if encoderType == _ENCODER_TYPE_CLIP:
+        return _loadClipArtifact(config, state, targetDevice)
+    return _loadCustomArtifact(
+        artifactDir, config, state, targetDevice
+    )
+
+
+def _buildCustomEncoderConfig(
+    config: dict[str, object],
+) -> CustomTextEncoderConfig:
+    """Build a CustomTextEncoderConfig from a loaded YAML config dict."""
+    outputDimRaw = config.get("outputDim", 0)
+    # type: ignore[arg-type] needed: YAML values are untyped objects.
+    return CustomTextEncoderConfig(
+        vocabSize=int(config["vocabSize"]),  # type: ignore[arg-type]
+        maxLength=int(config["maxLength"]),  # type: ignore[arg-type]
+        hiddenDim=int(config.get("hiddenDim", 256)),  # type: ignore[arg-type]
+        numLayers=int(config.get("numLayers", 4)),  # type: ignore[arg-type]
+        numHeads=int(config.get("numHeads", 8)),  # type: ignore[arg-type]
+        ffnDim=int(config.get("ffnDim", 0)),  # type: ignore[arg-type]
+        dropout=float(config.get("dropout", 0.1)),  # type: ignore[arg-type]
+        padTokenId=int(config.get("padTokenId", 0)),  # type: ignore[arg-type]
+        # type: ignore[arg-type]
+        outputDim=int(outputDimRaw) if outputDimRaw else 0,
+        useNullEmbedding=bool(config.get("useNullEmbedding", True)),
+        l2NormalizeOutput=bool(config.get("l2NormalizeOutput", True)),
+    )
+
+
 def _loadCustomArtifact(
     artifactDir: Path,
     config: dict[str, object],
@@ -312,20 +356,7 @@ def _loadCustomArtifact(
             f"Custom encoder artifact missing tokenizer/: {tokenizerDir}"
         )
     tokenizer = CustomTokenizer.load(tokenizerDir)
-    outputDimRaw = config.get("outputDim", 0)
-    encoderCfg = CustomTextEncoderConfig(
-        vocabSize=int(config["vocabSize"]),  # type: ignore[arg-type]
-        maxLength=int(config["maxLength"]),  # type: ignore[arg-type]
-        hiddenDim=int(config.get("hiddenDim", 256)),  # type: ignore[arg-type]
-        numLayers=int(config.get("numLayers", 4)),  # type: ignore[arg-type]
-        numHeads=int(config.get("numHeads", 8)),  # type: ignore[arg-type]
-        ffnDim=int(config.get("ffnDim", 0)),  # type: ignore[arg-type]
-        dropout=float(config.get("dropout", 0.1)),  # type: ignore[arg-type]
-        padTokenId=int(config.get("padTokenId", 0)),  # type: ignore[arg-type]
-        outputDim=int(outputDimRaw) if outputDimRaw else 0,  # type: ignore[arg-type]
-        useNullEmbedding=bool(config.get("useNullEmbedding", True)),
-        l2NormalizeOutput=bool(config.get("l2NormalizeOutput", True)),
-    )
+    encoderCfg = _buildCustomEncoderConfig(config)
     encoder = CustomTextEncoder(encoderCfg).to(device)
     encoder.load_state_dict(state, strict=True)
     return encoder, tokenizer
@@ -343,7 +374,8 @@ def _loadClipArtifact(
         modelName=modelName,
         maxLength=maxLength,
         outputDim=int(config.get("outputDim", 384)),  # type: ignore[arg-type]
-        clipHiddenDim=int(config.get("clipHiddenDim", 512)),  # type: ignore[arg-type]
+        # type: ignore[arg-type]
+        clipHiddenDim=int(config.get("clipHiddenDim", 512)),
         dropout=float(config.get("dropout", 0.0)),  # type: ignore[arg-type]
         useNullEmbedding=bool(config.get("useNullEmbedding", True)),
         l2NormalizeOutput=bool(config.get("l2NormalizeOutput", True)),

@@ -74,6 +74,56 @@ def _buildParser() -> argparse.ArgumentParser:
     return parser
 
 
+def _addSaveCommonArgs(
+    sub: argparse.ArgumentParser,
+) -> None:
+    """Register artifact-dir, encoder-type and output-dim arguments."""
+    sub.add_argument(
+        "--artifactDir", type=Path, required=True,
+        help="Output directory for the encoder artifact.",
+    )
+    sub.add_argument(
+        "--encoderType", choices=["custom", "clip"], default="custom",
+        help="Encoder type: 'custom' (BPE) or 'clip' (frozen CLIP).",
+    )
+    sub.add_argument(
+        "--outputDim", type=int, default=_DEFAULT_OUTPUT_DIM,
+        help="Encoder output dim (should match denoiser embedDim).",
+    )
+
+
+def _addSaveCustomArgs(sub: argparse.ArgumentParser) -> None:
+    """Register custom-encoder-specific arguments."""
+    sub.add_argument(
+        "--tokenizerDir", type=Path, default=None,
+        help="CustomTokenizer dir (required for --encoderType=custom).",
+    )
+    sub.add_argument(
+        "--hiddenDim", type=int, default=_DEFAULT_HIDDEN_DIM,
+        help="Custom encoder hidden dim (ignored for clip).",
+    )
+    sub.add_argument(
+        "--numLayers", type=int, default=_DEFAULT_NUM_LAYERS,
+        help="Custom encoder num layers (ignored for clip).",
+    )
+    sub.add_argument(
+        "--numHeads", type=int, default=_DEFAULT_NUM_HEADS,
+        help="Custom encoder num heads (ignored for clip).",
+    )
+
+
+def _addSaveClipArgs(sub: argparse.ArgumentParser) -> None:
+    """Register CLIP-specific arguments."""
+    sub.add_argument(
+        "--clipModelName", default=_DEFAULT_CLIP_MODEL,
+        help="HuggingFace CLIP model id (for --encoderType=clip).",
+    )
+    sub.add_argument(
+        "--clipMaxLength", type=int, default=_DEFAULT_CLIP_MAX_LENGTH,
+        help="Max token length for CLIP tokenizer (1-77).",
+    )
+
+
 def _addSaveSubcommand(
     subparsers: argparse._SubParsersAction,  # type: ignore[type-arg]
 ) -> None:
@@ -85,62 +135,9 @@ def _addSaveSubcommand(
             "artifact.  Weights are at init (no training)."
         ),
     )
-    sub.add_argument(
-        "--artifactDir",
-        type=Path,
-        required=True,
-        help="Output directory for the encoder artifact.",
-    )
-    sub.add_argument(
-        "--encoderType",
-        choices=["custom", "clip"],
-        default="custom",
-        help="Encoder type: 'custom' (BPE) or 'clip' (frozen CLIP).",
-    )
-    sub.add_argument(
-        "--tokenizerDir",
-        type=Path,
-        default=None,
-        help=(
-            "Directory of a saved CustomTokenizer (required for "
-            "--encoderType=custom)."
-        ),
-    )
-    sub.add_argument(
-        "--outputDim",
-        type=int,
-        default=_DEFAULT_OUTPUT_DIM,
-        help="Encoder output dimension (should match denoiser embedDim).",
-    )
-    sub.add_argument(
-        "--hiddenDim",
-        type=int,
-        default=_DEFAULT_HIDDEN_DIM,
-        help="Custom encoder hidden dim (ignored for clip).",
-    )
-    sub.add_argument(
-        "--numLayers",
-        type=int,
-        default=_DEFAULT_NUM_LAYERS,
-        help="Custom encoder num layers (ignored for clip).",
-    )
-    sub.add_argument(
-        "--numHeads",
-        type=int,
-        default=_DEFAULT_NUM_HEADS,
-        help="Custom encoder num heads (ignored for clip).",
-    )
-    sub.add_argument(
-        "--clipModelName",
-        default=_DEFAULT_CLIP_MODEL,
-        help="HuggingFace CLIP model id (only for --encoderType=clip).",
-    )
-    sub.add_argument(
-        "--clipMaxLength",
-        type=int,
-        default=_DEFAULT_CLIP_MAX_LENGTH,
-        help="Max token length for CLIP tokenizer (1-77).",
-    )
+    _addSaveCommonArgs(sub)
+    _addSaveCustomArgs(sub)
+    _addSaveClipArgs(sub)
 
 
 def _addInfoSubcommand(
@@ -159,66 +156,78 @@ def _addInfoSubcommand(
     )
 
 
-def _runSave(args: argparse.Namespace) -> int:
-    """Execute the ``save`` sub-command.
-
-    Parameters
-    ----------
-    args : argparse.Namespace
-        Parsed CLI arguments.
-
-    Returns
-    -------
-    int
-        Exit code (0 = success).
-    """
-    artifactDir: Path = args.artifactDir
-
-    if args.encoderType == "custom":
-        if args.tokenizerDir is None:
-            LOGGER.error(
-                "--tokenizerDir is required for --encoderType=custom."
-            )
-            return 1
-        tokenizer = CustomTokenizer.load(args.tokenizerDir)
-        encoder = CustomTextEncoder(
-            CustomTextEncoderConfig(
-                vocabSize=tokenizer.vocabSize,
-                maxLength=tokenizer.config.maxLength,
-                hiddenDim=args.hiddenDim,
-                numLayers=args.numLayers,
-                numHeads=args.numHeads,
-                outputDim=args.outputDim,
-                padTokenId=tokenizer.padTokenId,
-                useNullEmbedding=True,
-                l2NormalizeOutput=True,
-            )
+def _buildCustomEncoder(
+    args: argparse.Namespace,
+    tokenizer: CustomTokenizer,
+) -> CustomTextEncoder:
+    """Instantiate a CustomTextEncoder from CLI *args* + *tokenizer*."""
+    return CustomTextEncoder(
+        CustomTextEncoderConfig(
+            vocabSize=tokenizer.vocabSize,
+            maxLength=tokenizer.config.maxLength,
+            hiddenDim=args.hiddenDim,
+            numLayers=args.numLayers,
+            numHeads=args.numHeads,
+            outputDim=args.outputDim,
+            padTokenId=tokenizer.padTokenId,
+            useNullEmbedding=True,
+            l2NormalizeOutput=True,
         )
-        digest = saveEncoderArtifact(
-            encoder=encoder,
-            artifactDir=artifactDir,
-            tokenizer=tokenizer,
+    )
+
+
+def _saveCustomArtifact(
+    args: argparse.Namespace,
+    artifactDir: Path,
+) -> str | int:
+    """Build a custom encoder and save; return digest or exit code 1."""
+    if args.tokenizerDir is None:
+        LOGGER.error(
+            "--tokenizerDir is required for --encoderType=custom."
         )
-    else:
-        tokenizer_clip = ClipTokenizer(
+        return 1
+    tokenizer = CustomTokenizer.load(args.tokenizerDir)
+    encoder = _buildCustomEncoder(args, tokenizer)
+    return saveEncoderArtifact(
+        encoder=encoder, artifactDir=artifactDir, tokenizer=tokenizer
+    )
+
+
+def _saveClipArtifact(
+    args: argparse.Namespace,
+    artifactDir: Path,
+) -> str:
+    """Build a CLIP encoder and save its artifact; return the digest."""
+    tokenizer_clip = ClipTokenizer(
+        modelName=args.clipModelName,
+        maxLength=args.clipMaxLength,
+    )
+    encoder_clip = ClipTextEncoder(
+        ClipTextEncoderConfig(
             modelName=args.clipModelName,
             maxLength=args.clipMaxLength,
+            outputDim=args.outputDim,
+            useNullEmbedding=True,
+            l2NormalizeOutput=True,
         )
-        encoder_clip = ClipTextEncoder(
-            ClipTextEncoderConfig(
-                modelName=args.clipModelName,
-                maxLength=args.clipMaxLength,
-                outputDim=args.outputDim,
-                useNullEmbedding=True,
-                l2NormalizeOutput=True,
-            )
-        )
-        digest = saveEncoderArtifact(
-            encoder=encoder_clip,
-            artifactDir=artifactDir,
-            tokenizer=tokenizer_clip,
-        )
+    )
+    return saveEncoderArtifact(
+        encoder=encoder_clip,
+        artifactDir=artifactDir,
+        tokenizer=tokenizer_clip,
+    )
 
+
+def _runSave(args: argparse.Namespace) -> int:
+    """Execute the ``save`` sub-command; return exit code."""
+    artifactDir: Path = args.artifactDir
+    if args.encoderType == "custom":
+        result = _saveCustomArtifact(args, artifactDir)
+        if isinstance(result, int):
+            return result
+        digest = result
+    else:
+        digest = _saveClipArtifact(args, artifactDir)
     LOGGER.info(
         "Encoder artifact saved to %s (hash=%s…).",
         artifactDir,

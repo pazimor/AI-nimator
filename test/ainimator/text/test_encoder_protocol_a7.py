@@ -15,9 +15,10 @@ AC2 : ``test_swap_encoder_type_by_config_only``
 
 AC3 : ``test_loss_parity_unchanged_with_artifact``
     The pinned deterministic loss value (0.02388053) is unchanged when
-    the encoder is loaded from an artifact (encoderTrainable=True, so
-    behavior is identical to inline construction).  The artifact loading
-    path does NOT change any numerical behavior.
+    the encoder is loaded from an artifact (encoderTrainable=True).
+    Exercises the full artifact path: build encoder with
+    torch.manual_seed(0), save artifact, load via
+    buildFullTrainingComponents, run trainStepBatch, assert pinned loss.
 
 AC4 : ``test_artifact_round_trip_save_load``
     save encoder → load → identical outputs on fixed input; hash is
@@ -54,6 +55,12 @@ from ainimator.text.artifact import (
 from ainimator.text.clip_text_encoder import (
     ClipTextEncoder,
     ClipTextEncoderConfig,
+)
+from ainimator.core.types.batch import V2Batch
+from ainimator.training.full_training_v2 import (
+    V2FullTrainingConfig,
+    buildFullTrainingComponents,
+    trainStepBatch,
 )
 from ainimator.training.training_v2 import (
     LoadedSample,
@@ -351,77 +358,115 @@ def test_swap_encoder_type_by_config_only() -> None:
 
 
 # -----------------------------------------------------------------------
-# AC3 — Loss parity unchanged (pinned value 0.02388053)
+# AC3 — Loss parity via artifact path (pinned value 0.02388053)
 # -----------------------------------------------------------------------
 
-def test_loss_parity_unchanged_with_artifact() -> None:
-    """Loss parity pin is unchanged when the encoder is loaded from an
-    artifact (encoderTrainable=True, joint-training path).
+def _buildArtifactConfig(
+    tmpDir: Path,
+    tokenizerDir: Path,
+    artifactDir: Path,
+) -> V2FullTrainingConfig:
+    """Return a V2FullTrainingConfig pointing at *artifactDir*.
 
-    The artifact round-trip must preserve init weights exactly (same
-    torch.manual_seed(0) → same init → same state-dict → same loss).
-    This proves that the artifact-loading path does not change any
-    numerical behavior.
+    All flags are set to match the overfit-1-sample inline path so
+    encoder + denoiser are initialised with the same RNG sequence and
+    the same architecture (dropout=0, no alignment heads, filmInitStd=0.02).
+    """
+    return V2FullTrainingConfig(
+        datasetRoot=tmpDir,
+        tokenizerDir=tokenizerDir,
+        outputDir=tmpDir / "out",
+        epochs=1,
+        batchSize=1,
+        gradientAccumulation=1,
+        learningRate=1e-3,
+        weightDecay=0.0,
+        device="cpu",
+        encoderArtifactPath=artifactDir,
+        encoderTrainable=True,
+        textEncoderType="custom",
+        denoiserEmbedDim=32,
+        denoiserNumLayers=1,
+        denoiserNumHeads=4,
+        encoderHiddenDim=32,
+        encoderNumLayers=1,
+        encoderNumHeads=4,
+        diffusionStepsTraining=50,
+        scheduleType="cosine",
+        predictionMode="v",
+        maxFrames=8,
+        minSnrGamma=5.0,
+        condMaskProb=0.0,
+        # Disable extra heads and set dropout=0 to match inline path.
+        clipGuidanceWeight=0.0,
+        auxPoolContrastiveWeight=0.0,
+        x0ContrastiveWeight=0.0,
+        filmInitStd=0.02,
+        useSelfConditioning=False,
+        selfConditioningProb=0.0,
+        dropout=0.0,
+    )
+
+
+def test_loss_parity_unchanged_with_artifact() -> None:
+    """Artifact-loaded encoder + trainStepBatch produce the pinned loss.
+
+    Proof of AC3: the artifact-loading path (buildFullTrainingComponents
+    + trainStepBatch) is numerically identical to the inline path when
+    the encoder weights are the same.
+
+    Setup
+    -----
+    1. Build a custom encoder with torch.manual_seed(0); save artifact.
+    2. Build full-training components with encoderArtifactPath pointing
+       at that artifact (torch.manual_seed(0) again so denoiser sees the
+       same RNG state as the inline overfit path — loadEncoderArtifact
+       internally recreates the encoder, consuming identical RNG).
+    3. Run one trainStepBatch on the same fixed inputs as the inline pin.
+    4. Assert loss_total == 0.02388053 within 1e-5.
     """
     with tempfile.TemporaryDirectory() as tmp:
         tmpDir = Path(tmp)
         tokenizerDir = tmpDir / "tokenizer"
         tokenizer = _buildTokenizer(tokenizerDir)
 
-        # Build a tiny V2TrainingConfig matching test_loss_parity_v2.py.
-        config = V2TrainingConfig(
-            datasetRoot=tmpDir,
-            tokenizerDir=tokenizerDir,
-            outputDir=tmpDir / "out",
-            sampleLinkIndex=0,
-            epochs=1,
-            learningRate=1e-3,
-            weightDecay=0.0,
-            minSnrGamma=5.0,
-            velocityXyzWeight=0.0,
-            diffusionStepsTraining=50,
-            scheduleType="cosine",
-            predictionMode="v",
-            encoderHiddenDim=32,
-            encoderNumLayers=1,
-            encoderNumHeads=4,
-            denoiserEmbedDim=32,
-            denoiserNumLayers=1,
-            denoiserNumHeads=4,
-            maxFrames=8,
-            framesPerStep=0,
-            seed=0,
-            logEvery=10,
-            device="cpu",
-        )
-
-        # Use the same seed as the pinned test — init must be identical.
+        # Step 1: build encoder with seed=0 and save artifact.
         torch.manual_seed(0)
-        components = buildTrainingComponents(
-            config,
-            normalizationSamples=None,
+        sourceEncoder = _buildCustomEncoder(tokenizer, outputDim=32)
+        artifactDir = tmpDir / "artifact"
+        saveEncoderArtifact(
+            encoder=sourceEncoder,
+            artifactDir=artifactDir,
+            tokenizer=tokenizer,
         )
 
+        # Step 2: build full components from artifact with seed=0.
+        # loadEncoderArtifact creates a fresh CustomTextEncoder (which
+        # consumes the same RNG as the inline path) and then overwrites
+        # its weights from disk — so the denoiser sees the same RNG.
+        torch.manual_seed(0)
+        cfg = _buildArtifactConfig(tmpDir, tokenizerDir, artifactDir)
+        components = buildFullTrainingComponents(cfg)
+
+        # Step 3: run one deterministic training step on fixed inputs.
         motion = torch.zeros(_FRAMES, _BONES, 6)
         motion[..., 0] = 1.0
-        sample = LoadedSample(
-            rotation6d=motion,
-            rootTranslation=torch.zeros(_FRAMES, 3),
-            rawText="a person walks.",
-            metadata={},
-            sampleId=0,
-            textId=0,
+        batch = V2Batch(
+            rotation6d=motion.unsqueeze(0),
+            rootTranslation=torch.zeros(1, _FRAMES, 3),
+            motionMask=torch.ones(1, _FRAMES, dtype=torch.bool),
+            rawTexts=("a person walks.",),
         )
-
         generators = TrainingRandomState.fromSeed(
             seed=0, device=components.device
         )
-        metrics = trainStep(components, sample, config, generators)
+        metrics = trainStepBatch(components, batch, cfg, generators)
 
         assert abs(
             metrics["loss_total"] - _PINNED_LOSS_TOTAL
         ) < _PINNED_TOLERANCE, (
-            f"Loss parity broken: got {metrics['loss_total']:.8f}, "
+            f"Loss parity broken (artifact path): "
+            f"got {metrics['loss_total']:.8f}, "
             f"expected {_PINNED_LOSS_TOTAL:.8f} "
             f"(tolerance {_PINNED_TOLERANCE})."
         )
