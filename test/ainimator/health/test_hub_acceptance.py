@@ -7,6 +7,10 @@ AC5: Injecting shuffled text with no effect on the loss asserts
      WARNING on the conditioning_sensitivity contract.
 
 AC6: Wall-clock overhead < 5% at everySteps=50 (micro-benchmark).
+
+A6-probe-attach: Real model attach via named-mapping dict — probes
+  fire and produce non-null effective_rank, intra_batch_sim,
+  update_ratio; no probe logs an attach failure.
 """
 
 from __future__ import annotations
@@ -326,4 +330,170 @@ def test_jsonl_contains_contract_verdicts() -> None:
         ]
         assert len(verdictKeys) >= 3, (
             f"Expected >= 3 verdict keys, found {verdictKeys}"
+        )
+
+
+# ------------------------------------------------------------------
+# A6 probe-attach: real model + named-mapping dict → metrics populate
+# ------------------------------------------------------------------
+
+class _DenoiserWithBlocks(nn.Module):
+    """Minimal MotionDenoiserV2-shaped model for attach testing.
+
+    Exposes ``blocks`` (ModuleList) and ``outputProjection`` (Linear)
+    so the production health.yaml paths resolve correctly.
+    """
+
+    def __init__(self, dim: int = 32, numBlocks: int = 2) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            nn.Linear(dim, dim) for _ in range(numBlocks)
+        ])
+        self.outputProjection = nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
+        return self.outputProjection(x)
+
+
+class _EncoderModule(nn.Module):
+    """Minimal encoder-shaped module for attach testing."""
+
+    def __init__(self, dim: int = 32) -> None:
+        super().__init__()
+        self.projection = nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.projection(x)
+
+
+def test_real_model_probe_attach_populates_metrics() -> None:
+    """Named-mapping attach produces non-null probe metrics.
+
+    This is the empirical attach test that was missing in A3:
+    - Builds real module shapes matching MotionDenoiserV2/encoder.
+    - Attaches the hub via ``{"denoiser": ..., "encoder": ...}``.
+    - Runs several forward passes and asserts that
+      ``effective_rank``, ``intra_batch_sim``, and ``update_ratio``
+      appear in the JSONL with non-null values.
+    - Asserts no probe logged an attach failure (i.e. none produced
+      a ``None`` snapshot at step 1).
+
+    Rationale: the A6 review found all probes produced UNKNOWN
+    because ``hub.attach(components.denoiser)`` resolved paths like
+    ``"denoiser"`` against the bare denoiser (AttributeError:
+    MotionDenoiserV2 has no attribute 'denoiser').
+    """
+    import json
+    import logging
+
+    DIM = 32
+    BATCH = 4
+
+    denoiser = _DenoiserWithBlocks(dim=DIM, numBlocks=2)
+    encoder = _EncoderModule(dim=DIM)
+
+    with tempfile.TemporaryDirectory() as tmpDir:
+        # Build probes that match the production health.yaml paths.
+        probeBlocks = Probe(
+            name="denoiser_blocks",
+            modulePath="denoiser.blocks[-1]",
+            capture=["mean", "std", "norm", "effective_rank",
+                     "intra_batch_sim"],
+            hookType="forward",
+        )
+        probeEncoder = Probe(
+            name="text_encoder_pool",
+            modulePath="encoder",
+            capture=["mean", "std", "norm"],
+            hookType="forward",
+        )
+        probeHead = Probe(
+            name="output_head",
+            modulePath="denoiser.outputProjection",
+            capture=["mean", "std", "norm", "update_ratio"],
+            hookType="forward_and_backward",
+        )
+
+        # Collect attach-failure warnings.
+        attachWarnings: list[str] = []
+
+        class _CapturingHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                msg = self.format(record)
+                if "could not attach probe" in msg:
+                    attachWarnings.append(msg)
+
+        hubLogger = logging.getLogger("ainimator.health.hub")
+        handler = _CapturingHandler()
+        hubLogger.addHandler(handler)
+
+        try:
+            hub = HealthHub(
+                outputDir=Path(tmpDir),
+                contracts=[],
+                probes=[probeBlocks, probeEncoder, probeHead],
+                everySteps=1,
+            )
+            # Use the named-mapping form.
+            hub.attach({
+                "denoiser": denoiser,
+                "encoder": encoder,
+            })
+
+            # Several forward+backward passes.
+            for _ in range(3):
+                x = torch.randn(BATCH, DIM)
+                out = denoiser(x)
+                loss = out.sum()
+                loss.backward()
+
+            hub.step(globalStep=1)
+            hub.detach()
+            hub.close()
+        finally:
+            hubLogger.removeHandler(handler)
+
+        assert not attachWarnings, (
+            f"Probe attach failures detected:\n"
+            + "\n".join(attachWarnings)
+        )
+
+        jsonlPath = Path(tmpDir) / "health" / "health.jsonl"
+        assert jsonlPath.exists(), "JSONL not written"
+        records = [
+            json.loads(line)
+            for line in jsonlPath.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        ]
+        assert records, "No JSONL records"
+        record = records[0]
+
+        assert "denoiser_blocks.effective_rank" in record, (
+            f"effective_rank missing from JSONL. Keys: "
+            f"{list(record.keys())}"
+        )
+        assert "denoiser_blocks.intra_batch_sim" in record, (
+            f"intra_batch_sim missing from JSONL. Keys: "
+            f"{list(record.keys())}"
+        )
+        assert "output_head.update_ratio" in record, (
+            f"update_ratio missing from JSONL. Keys: "
+            f"{list(record.keys())}"
+        )
+        # Values must be non-null floats.
+        assert isinstance(
+            record["denoiser_blocks.effective_rank"], float
+        )
+        assert isinstance(
+            record["denoiser_blocks.intra_batch_sim"], float
+        )
+        # update_ratio may be None on first call (no prev weight norm).
+        # After 3 passes it must be a float.
+        assert isinstance(record["output_head.update_ratio"], float), (
+            f"update_ratio should be float after 3 passes, "
+            f"got {record.get('output_head.update_ratio')!r}"
         )

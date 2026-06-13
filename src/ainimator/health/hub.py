@@ -233,20 +233,36 @@ class HealthHub:
     # ------------------------------------------------------------------
     # Attachment
     # ------------------------------------------------------------------
-    def attach(self, rootModel: nn.Module) -> None:
+    def attach(
+        self,
+        rootModules: nn.Module | dict[str, nn.Module],
+    ) -> None:
         """Attach all probes to the model.
 
         Parameters
         ----------
-        rootModel : nn.Module
-            The model to instrument (usually the denoiser or a wrapper
-            that exposes both encoder and denoiser attributes).
+        rootModules : nn.Module or dict[str, nn.Module]
+            When a plain ``nn.Module``, probe paths are resolved
+            directly against it (legacy behaviour).
+
+            When a ``dict`` mapping strings to modules (e.g.
+            ``{"denoiser": denoiser_module, "encoder": enc_module}``),
+            each probe's path is matched against the dict keys: if the
+            path starts with a known key followed by ``"."`` (or equals
+            the key exactly), that module becomes the root and the
+            leading ``"<key>."`` prefix is stripped before resolving
+            the remaining path.  This is the canonical usage for the
+            v2 training loops where encoder and denoiser are separate
+            ``nn.Module`` instances.
         """
         if self._attached:
             return
         for probe in self._probes:
+            root, overridePath = _resolveProbeRoot(
+                probe.modulePath, rootModules
+            )
             try:
-                probe.attach(rootModel)
+                probe.attach(root, overridePath=overridePath)
             except AttributeError as exc:
                 LOGGER.warning(
                     "HealthHub: could not attach probe '%s' "
@@ -1011,6 +1027,61 @@ def _formatSheet(
         )
     lines.append("")
     return "\n".join(lines)
+
+
+# ------------------------------------------------------------------
+# Root resolution for named-mapping attach
+# ------------------------------------------------------------------
+def _resolveProbeRoot(
+    modulePath: str,
+    rootModules: nn.Module | dict[str, nn.Module],
+) -> tuple[nn.Module, str | None]:
+    """Return (rootModule, overridePath) for a probe path.
+
+    When ``rootModules`` is a plain ``nn.Module``, returns
+    ``(rootModules, None)`` — the probe resolves its full path against
+    that single root (legacy behaviour).
+
+    When ``rootModules`` is a dict, the probe's path is matched
+    against dict keys.  The longest matching prefix wins:
+    - ``"denoiser.blocks[-1]"`` with key ``"denoiser"`` →
+      root is ``rootModules["denoiser"]``,
+      overridePath is ``"blocks[-1]"``.
+    - ``"encoder"`` with key ``"encoder"`` →
+      root is ``rootModules["encoder"]``,
+      overridePath is ``""`` (resolves to root itself — attach
+      to the top-level module).
+
+    Parameters
+    ----------
+    modulePath : str
+        Probe's ``modulePath`` attribute.
+    rootModules : nn.Module or dict[str, nn.Module]
+
+    Returns
+    -------
+    tuple[nn.Module, str | None]
+        ``(root, overridePath)`` — overridePath is ``None`` when no
+        dict prefix was matched (passes straight through to probe).
+    """
+    if not isinstance(rootModules, dict):
+        return rootModules, None
+    # Try longest-prefix match among dict keys.
+    bestKey: str | None = None
+    for key in rootModules:
+        if modulePath == key or modulePath.startswith(key + "."):
+            if bestKey is None or len(key) > len(bestKey):
+                bestKey = key
+    if bestKey is None:
+        # No key matches — fall back to the first value (legacy).
+        firstModule = next(iter(rootModules.values()))
+        return firstModule, None
+    root = rootModules[bestKey]
+    if modulePath == bestKey:
+        remainder = ""
+    else:
+        remainder = modulePath[len(bestKey) + 1:]
+    return root, remainder
 
 
 # ------------------------------------------------------------------

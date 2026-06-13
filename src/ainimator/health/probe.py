@@ -217,20 +217,43 @@ class Probe:
     # ------------------------------------------------------------------
     # Attachment
     # ------------------------------------------------------------------
-    def attach(self, rootModel: nn.Module) -> None:
+    def attach(
+        self,
+        rootModel: nn.Module,
+        overridePath: str | None = None,
+    ) -> None:
         """Resolve module path and register hooks.
 
         Parameters
         ----------
         rootModel : nn.Module
             The top-level model that contains the target sub-module.
+        overridePath : str, optional
+            When supplied, use this dot-path instead of
+            ``self.modulePath`` to resolve the module relative to
+            ``rootModel``.  Used by :class:`HealthHub` when a named
+            root mapping is provided (e.g. the original path is
+            ``"denoiser.blocks[-1]"`` but ``rootModel`` is already
+            the bare denoiser; the hub strips the leading
+            ``"denoiser."`` prefix and passes ``"blocks[-1]"``).
 
         Raises
         ------
         AttributeError
-            If ``modulePath`` does not resolve to a sub-module.
+            If the path does not resolve to a sub-module.
         """
-        module = self._resolveModule(rootModel)
+        originalPath = self.modulePath
+        if overridePath is not None:
+            self.modulePath = overridePath
+        try:
+            if self.modulePath == "":
+                module: nn.Module = rootModel
+            else:
+                module = self._resolveModule(rootModel)
+        except (AttributeError, KeyError, IndexError) as exc:
+            self.modulePath = originalPath
+            raise AttributeError(str(exc)) from exc
+        self.modulePath = originalPath
         if self.hookType in ("forward", "forward_and_backward"):
             handle = module.register_forward_hook(self._forwardHook)
             self._handles.append(handle)
@@ -317,10 +340,36 @@ class Probe:
     # Helpers
     # ------------------------------------------------------------------
     def _resolveModule(self, rootModel: nn.Module) -> nn.Module:
-        """Walk the dot-path to find the target sub-module."""
+        """Walk the dot-path to find the target sub-module.
+
+        Supports integer indexing on ``nn.ModuleList`` /
+        ``nn.Sequential`` via bracket notation, e.g. ``blocks[-1]``
+        or ``blocks[2]``.
+
+        Parameters
+        ----------
+        rootModel : nn.Module
+            The root to resolve the path against.
+
+        Returns
+        -------
+        nn.Module
+            The resolved sub-module.
+
+        Raises
+        ------
+        AttributeError
+            If any path segment does not resolve.
+        """
         module: nn.Module = rootModel
         for part in self.modulePath.split("."):
-            module = getattr(module, part)
+            if "[" in part and part.endswith("]"):
+                attrName, _, idxStr = part.partition("[")
+                idxStr = idxStr.rstrip("]")
+                parent = getattr(module, attrName)
+                module = parent[int(idxStr)]
+            elif part != "":
+                module = getattr(module, part)
         return module
 
     @staticmethod

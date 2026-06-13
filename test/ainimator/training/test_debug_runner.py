@@ -298,3 +298,86 @@ def test_run_debug_health_jsonl_path_returned(
         f"healthJsonlPath {result.healthJsonlPath} is not inside "
         f"{healthDir}."
     )
+
+
+def test_run_debug_health_verdicts_not_all_unknown(
+    tmp_path: Path,
+) -> None:
+    """Debug run JSONL must contain non-UNKNOWN verdicts.
+
+    A3 probe-attachment bug caused all 5 contracts to evaluate as
+    UNKNOWN (probes never fired → no metric data).  After the A6
+    fix the probe-derived contracts (update_ratio, loss_decomposition)
+    must produce real verdicts (OK / WARNING / CRITICAL).
+
+    Specifically asserts that:
+    - ``verdict.update_ratio`` is NOT UNKNOWN (probe attached to
+      denoiser.outputProjection and fired).
+    - ``verdict.loss_decomposition`` is NOT UNKNOWN (loss_share
+      is computed by trainStep and passed to hub.step).
+    - ``verdict.post_norm_stats`` is NOT UNKNOWN (computed in
+      runOverfit and passed to hub.step).
+    """
+    _buildSyntheticDataset(tmp_path / "data")
+    tokenizerDir = _buildTokenizerDir(tmp_path / "tok")
+    outputDir = tmp_path / "out"
+
+    debug = DebugTrainingConfig(
+        datasetRoot=tmp_path / "data",
+        tokenizerDir=tokenizerDir,
+        outputDir=outputDir,
+        device="cpu",
+    )
+    runDebug(debug)
+
+    healthDir = outputDir / "health"
+    jsonlFiles = sorted(healthDir.glob("*.jsonl"))
+    assert jsonlFiles, "No health JSONL files"
+
+    # Collect all records.
+    records = []
+    for jsonlFile in jsonlFiles:
+        for line in jsonlFile.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+
+    assert records, "No records in JSONL files"
+
+    # Check the LAST record (most likely to have all metrics populated).
+    lastRecord = records[-1]
+
+    # --- Probe-derived verdict: update_ratio -----------------------
+    # Requires the output_head probe to attach to
+    # denoiser.outputProjection (not the non-existent denoiser.outputProj).
+    updateRatioVerdict = lastRecord.get("verdict.update_ratio")
+    assert updateRatioVerdict is not None, (
+        "verdict.update_ratio missing from JSONL — contract not evaluated"
+    )
+    assert updateRatioVerdict != "UNKNOWN", (
+        f"verdict.update_ratio is UNKNOWN — "
+        f"probe likely failed to attach or produced no data. "
+        f"Record keys: {list(lastRecord.keys())}"
+    )
+
+    # --- Loss-share verdict: loss_decomposition --------------------
+    lossVerdict = lastRecord.get("verdict.loss_decomposition")
+    assert lossVerdict is not None, (
+        "verdict.loss_decomposition missing from JSONL"
+    )
+    assert lossVerdict != "UNKNOWN", (
+        f"verdict.loss_decomposition is UNKNOWN — "
+        f"loss_share not passed to hub.step. "
+        f"Record keys: {list(lastRecord.keys())}"
+    )
+
+    # --- Post-norm verdict: post_norm_stats ------------------------
+    postNormVerdict = lastRecord.get("verdict.post_norm_stats")
+    assert postNormVerdict is not None, (
+        "verdict.post_norm_stats missing from JSONL"
+    )
+    assert postNormVerdict != "UNKNOWN", (
+        f"verdict.post_norm_stats is UNKNOWN — "
+        f"post_norm_stats not wired into overfit loop. "
+        f"Record keys: {list(lastRecord.keys())}"
+    )

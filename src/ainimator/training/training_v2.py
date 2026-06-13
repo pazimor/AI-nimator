@@ -814,6 +814,134 @@ def _addLossShares(
 
 
 # =====================================================================
+# Health metric helpers — overfit loop
+# =====================================================================
+
+def _computeOverfitConditioningSensitivity(
+    components: V2TrainingComponents,
+    sample: "LoadedSample",
+    config: V2TrainingConfig,
+    generators: TrainingRandomState,
+) -> float:
+    """Estimate conditioning sensitivity for a single-sample overfit.
+
+    Runs two no-grad denoiser passes from the same noisy input: one
+    with the real prompt, one with the empty prompt (unconditional).
+    Returns ``|loss_empty - loss_real| / max(loss_real, 1e-8)``.
+
+    Because the overfit loop has only one sample (no batch to shuffle),
+    the comparison is real-prompt vs. empty-prompt rather than the
+    full-training shuffled-batch approach.  The signal is equivalent:
+    if the model ignores the prompt, both losses will be equal.
+
+    Parameters
+    ----------
+    components : V2TrainingComponents
+    sample : LoadedSample
+    config : V2TrainingConfig
+    generators : TrainingRandomState
+
+    Returns
+    -------
+    float
+        Relative delta; near 0 → model ignores prompt (WARNING).
+    """
+    device = components.device
+    schedule = components.schedule
+
+    rotationRaw = sample.rotation6d.unsqueeze(0).to(device)
+    rootRaw = sample.rootTranslation.unsqueeze(0).to(device)
+    maxF = min(rotationRaw.shape[1], config.maxFrames)
+    rotNorm = components.normalizer.normalizeBone(rotationRaw[:, :maxF])
+    rootNorm = components.normalizer.normalizeGlobal(rootRaw[:, :maxF])
+
+    with torch.no_grad():
+        timesteps = torch.randint(
+            0, schedule.numSteps, (1,),
+            generator=generators.cpuGenerator,
+            device=torch.device("cpu"),
+        ).to(device)
+        noiseRot = generators.sampleNormal(rotNorm.shape, device=device)
+        noiseRoot = generators.sampleNormal(rootNorm.shape, device=device)
+        xtRot, _ = schedule.qSample(rotNorm, timesteps, noise=noiseRot)
+        xtRoot, _ = schedule.qSample(
+            rootNorm, timesteps, noise=noiseRoot
+        )
+        targetRot = schedule.predictionTarget(
+            rotNorm, noiseRot, timesteps, config.predictionMode
+        )
+
+        realEnc = components.tokenizer.encode(sample.rawText)
+        realOut = components.encoder(
+            realEnc.inputIds.to(device),
+            realEnc.attentionMask.to(device),
+        )
+        emptyEnc = components.tokenizer.encode(EMPTY_PROMPT)
+        emptyOut = components.encoder(
+            emptyEnc.inputIds.to(device),
+            emptyEnc.attentionMask.to(device),
+        )
+
+        realResult = components.denoiser(
+            noisyMotion=xtRot,
+            timesteps=timesteps,
+            textHiddenStates=realOut.hiddenStates,
+            textKeyPaddingMask=realOut.keyPaddingMask,
+            noisyGlobalFeatures=xtRoot,
+        )
+        emptyResult = components.denoiser(
+            noisyMotion=xtRot,
+            timesteps=timesteps,
+            textHiddenStates=emptyOut.hiddenStates,
+            textKeyPaddingMask=emptyOut.keyPaddingMask,
+            noisyGlobalFeatures=xtRoot,
+        )
+
+        realLoss = float(
+            diffusionLossV2(
+                prediction=realResult.boneOutput,
+                target=targetRot,
+                timesteps=timesteps,
+                alphasCumprod=schedule.alphasCumprod,
+                predictionMode=config.predictionMode,
+                gamma=config.minSnrGamma,
+            ).item()
+        )
+        emptyLoss = float(
+            diffusionLossV2(
+                prediction=emptyResult.boneOutput,
+                target=targetRot,
+                timesteps=timesteps,
+                alphasCumprod=schedule.alphasCumprod,
+                predictionMode=config.predictionMode,
+                gamma=config.minSnrGamma,
+            ).item()
+        )
+    denom = max(abs(realLoss), 1e-8)
+    return abs(emptyLoss - realLoss) / denom
+
+
+
+def _computeOverfitPostNormStats(
+    components: V2TrainingComponents,
+    sample: "LoadedSample",
+    config: V2TrainingConfig,
+) -> float:
+    """Compute |mean| of normalized bone motion (z-norm sanity check).
+
+    Returns
+    -------
+    float
+        ``|mean_of_normalized_bone_tensor|``.  Near 0 is healthy.
+    """
+    device = components.device
+    rotRaw = sample.rotation6d.unsqueeze(0).to(device)
+    maxF = min(rotRaw.shape[1], config.maxFrames)
+    normRot = components.normalizer.normalizeBone(rotRaw[:, :maxF])
+    return float(normRot.detach().float().cpu().mean().abs().item())
+
+
+# =====================================================================
 # Top-level training loop
 # =====================================================================
 def runOverfit(
@@ -876,15 +1004,37 @@ def runOverfit(
     if config.healthEnabled:
         healthHub = buildHealthHub(config.outputDir)
         healthHub.everySteps = config.healthEverySteps
-        healthHub.attach(components.denoiser)
+        healthHub.attach({
+            "denoiser": components.denoiser,
+            "encoder": components.encoder,
+        })
+
+    # Compute post_norm_stats once before the loop (z-norm sanity).
+    try:
+        postNormStats: float | None = _computeOverfitPostNormStats(
+            components, sample, config
+        )
+    except Exception:  # noqa: BLE001
+        postNormStats = None
 
     history: list[dict[str, float]] = []
     startTime = time.time()
     for epoch in range(1, config.epochs + 1):
         metrics = trainStep(components, sample, config, generators)
         metrics["epoch"] = float(epoch)
+        if postNormStats is not None:
+            metrics["post_norm_stats"] = postNormStats
         history.append(metrics)
         if healthHub is not None:
+            if epoch % healthHub.everySteps == 0:
+                try:
+                    metrics["conditioning_sensitivity"] = (
+                        _computeOverfitConditioningSensitivity(
+                            components, sample, config, generators
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
             healthHub.step(globalStep=epoch, metrics=metrics)
         if epoch == 1 or epoch % config.logEvery == 0 or epoch == config.epochs:
             elapsed = time.time() - startTime

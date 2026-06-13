@@ -2083,7 +2083,10 @@ def runFullTraining(
     # --- Health hub (A3) ----------------------------------------
     healthHub = _buildHealthHub(config) if config.healthEnabled else None
     if healthHub is not None:
-        healthHub.attach(components.denoiser)
+        healthHub.attach({
+            "denoiser": components.denoiser,
+            "encoder": components.encoder,
+        })
 
     if startEpoch > config.epochs:
         LOGGER.warning(

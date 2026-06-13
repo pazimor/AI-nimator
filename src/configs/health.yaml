@@ -19,8 +19,12 @@ health:
 # Probes — scalar stats captured via PyTorch hooks
 # -----------------------------------------------------------------------
 probes:
+  # denoiser.blocks[-1] = last DenoiserBlock hidden states (B, F, D).
+  # Probing the last block gives the most differentiated representation
+  # (all cross-attn + FiLM layers have fired); early collapse shows here
+  # first as rank ≈ 1 / intra_batch_sim → 1.  (ROADMAP §3.5 §3.3)
   - name: denoiser_blocks
-    module_path: "denoiser"
+    module_path: "denoiser.blocks[-1]"
     capture:
       - mean          # activation mean
       - std           # activation std (dead-layer proxy)
@@ -29,6 +33,8 @@ probes:
       - intra_batch_sim # cosine sim intra-batch (collapse Phase E)
     hook_type: forward
 
+  # encoder root (CustomTextEncoder) — hooks the pooled hidden states
+  # output tensor; encoder_cond_uncond_sim is set externally by hub.
   - name: text_encoder_pool
     module_path: "encoder"
     capture:
@@ -38,8 +44,10 @@ probes:
       - encoder_cond_uncond_sim  # pool sim cond vs null (BOS-collapse)
     hook_type: forward
 
+  # denoiser.outputProjection = final nn.Linear (D → totalOutputDim).
+  # update_ratio here measures whether the output head is learning.
   - name: output_head
-    module_path: "denoiser.outputProj"
+    module_path: "denoiser.outputProjection"
     capture:
       - mean
       - std
