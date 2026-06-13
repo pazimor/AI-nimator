@@ -1263,10 +1263,106 @@ def trainStepBatch(
 
     (total * backwardScale).backward()
 
-    return {
-        "loss_total": float(total.detach().item()),
-        "loss_bone": float(boneLoss.detach().item()),
-        "loss_global": float(globalLoss.detach().item()),
+    totalValue = float(total.detach().item())
+    return _buildStepMetrics(
+        config=config,
+        clipWeight=clipWeight,
+        totalValue=totalValue,
+        boneLoss=boneLoss,
+        globalLoss=globalLoss,
+        velLossValue=velLossValue,
+        jointPositionLossValue=jointPositionLossValue,
+        footContactLossValue=footContactLossValue,
+        clipGuidanceLossValue=clipGuidanceLossValue,
+        auxPoolLossValue=auxPoolLossValue,
+        x0ContrastiveValue=x0ContrastiveValue,
+    )
+
+
+def _weightedComponents(
+    config: "V2FullTrainingConfig",
+    clipWeight: float | None,
+    boneValue: float,
+    globalValue: float,
+    velLossValue: float,
+    jointPositionLossValue: float,
+    footContactLossValue: float,
+    clipGuidanceLossValue: float,
+    auxPoolLossValue: float,
+    x0ContrastiveValue: float,
+) -> list[tuple[str, float, float]]:
+    """Return (name, unweighted_value, weight) for each loss component."""
+    effectiveClip = (
+        clipWeight if clipWeight is not None
+        else config.clipGuidanceWeight
+    )
+    return [
+        ("bone", boneValue, 1.0),
+        ("global", globalValue, 1.0),
+        ("vel_xyz", velLossValue, config.velocityXyzWeight),
+        ("joint_xyz", jointPositionLossValue,
+         config.jointPositionWeight),
+        ("foot_contact", footContactLossValue,
+         config.footContactWeight),
+        ("clip_guidance", clipGuidanceLossValue, effectiveClip),
+        ("clip_aux_pool", auxPoolLossValue,
+         config.auxPoolContrastiveWeight),
+        ("x0_contrastive", x0ContrastiveValue,
+         config.x0ContrastiveWeight),
+    ]
+
+
+def _addShareMetrics(
+    metrics: dict[str, float],
+    totalValue: float,
+    components: list[tuple[str, float, float]],
+) -> None:
+    """Populate loss_share and per-component share keys in-place.
+
+    ``loss_share`` = minimum weighted share among active components.
+    """
+    shares: list[float] = []
+    for name, raw, weight in components:
+        if weight <= 0.0:
+            continue
+        share = (raw * weight) / totalValue
+        metrics[f"loss_share.{name}"] = share
+        shares.append(share)
+    if shares:
+        metrics["loss_share"] = min(shares)
+
+
+def _buildStepMetrics(
+    config: "V2FullTrainingConfig",
+    clipWeight: float | None,
+    totalValue: float,
+    boneLoss: "torch.Tensor",
+    globalLoss: "torch.Tensor",
+    velLossValue: float,
+    jointPositionLossValue: float,
+    footContactLossValue: float,
+    clipGuidanceLossValue: float,
+    auxPoolLossValue: float,
+    x0ContrastiveValue: float,
+) -> dict[str, float]:
+    """Build the step-metrics dict with weighted loss shares.
+
+    ``loss_share`` = minimum fractional contribution among active
+    components.  Dead component (share≈0) makes contract CRITICAL.
+    Per-component shares written as ``loss_share.<name>`` for JSONL.
+    """
+    boneValue = float(boneLoss.detach().item())
+    globalValue = float(globalLoss.detach().item())
+    comps = _weightedComponents(
+        config, clipWeight, boneValue, globalValue,
+        velLossValue, jointPositionLossValue,
+        footContactLossValue, clipGuidanceLossValue,
+        auxPoolLossValue, x0ContrastiveValue,
+    )
+    metrics: dict[str, float] = {
+        "loss_total": totalValue,
+        "loss_bone": boneValue,
+        "loss_global": globalValue,
         "loss_vel_xyz": velLossValue,
         "loss_joint_xyz": jointPositionLossValue,
         "loss_foot_contact": footContactLossValue,
@@ -1274,6 +1370,165 @@ def trainStepBatch(
         "loss_clip_aux_pool": auxPoolLossValue,
         "loss_x0_contrastive": x0ContrastiveValue,
     }
+    if totalValue > 0.0:
+        _addShareMetrics(metrics, totalValue, comps)
+    return metrics
+
+
+def _computeConditioningSensitivity(
+    components: V2FullTrainingComponents,
+    batch: "V2Batch",
+    config: "V2FullTrainingConfig",
+    generators: TrainingRandomState,
+) -> float:
+    """Estimate conditioning sensitivity on the current batch.
+
+    Runs two no-grad diffusion forward passes — one with real text
+    embeddings and one with shuffled text (random permutation) — and
+    returns ``|loss_shuffled - loss_real| / max(loss_real, 1e-8)``.
+
+    A near-zero value means the model ignores the text condition.
+    This is gated by the caller to fire only on health steps so the
+    overhead stays within the <5% budget.
+
+    Parameters
+    ----------
+    components : V2FullTrainingComponents
+    batch : V2Batch
+    config : V2FullTrainingConfig
+    generators : TrainingRandomState
+
+    Returns
+    -------
+    float
+        Relative loss delta in [0, ∞).  Healthy: clearly > 0.
+    """
+    components.encoder.eval()
+    components.denoiser.eval()
+    try:
+        return _sensitivityForwardPass(
+            components, batch, config, generators
+        )
+    finally:
+        components.encoder.train()
+        components.denoiser.train()
+
+
+def _sensitivityNoisyInputs(
+    components: V2FullTrainingComponents,
+    batch: "V2Batch",
+    config: "V2FullTrainingConfig",
+    generators: TrainingRandomState,
+) -> tuple[
+    "torch.Tensor",
+    "torch.Tensor",
+    "torch.Tensor",
+    "torch.Tensor",
+    "torch.Tensor",
+]:
+    """Prepare normalised + noised tensors for sensitivity pass.
+
+    Returns
+    -------
+    tuple of (xtRot, xtGlob, targetRot, motionMask, timesteps)
+    """
+    rotation = components.normalizer.normalizeBone(batch.rotation6d)
+    rootTranslation = components.normalizer.normalizeGlobal(
+        batch.rootTranslation
+    )
+    schedule = components.schedule
+    batchSize = rotation.shape[0]
+    timesteps = torch.randint(
+        0, schedule.numSteps, (batchSize,),
+        generator=generators.cpuGenerator,
+        device=torch.device("cpu"),
+    ).to(components.device)
+    noiseRot = generators.sampleNormal(
+        rotation.shape, device=components.device
+    )
+    noiseGlob = generators.sampleNormal(
+        rootTranslation.shape, device=components.device
+    )
+    xtRot, _ = schedule.qSample(rotation, timesteps, noiseRot)
+    xtGlob, _ = schedule.qSample(
+        rootTranslation, timesteps, noiseGlob
+    )
+    targetRot = schedule.predictionTarget(
+        rotation, noiseRot, timesteps, config.predictionMode
+    )
+    return xtRot, xtGlob, targetRot, batch.motionMask, timesteps
+
+
+def _sensitivityBoneLoss(
+    components: V2FullTrainingComponents,
+    config: "V2FullTrainingConfig",
+    textOut: TextEncoderOutput,
+    xtRot: "torch.Tensor",
+    xtGlob: "torch.Tensor",
+    targetRot: "torch.Tensor",
+    motionMask: "torch.Tensor",
+    timesteps: "torch.Tensor",
+) -> float:
+    """Run one denoiser forward and return the bone diffusion loss."""
+    pred = components.denoiser(
+        noisyMotion=xtRot,
+        timesteps=timesteps,
+        textHiddenStates=textOut.hiddenStates,
+        textKeyPaddingMask=textOut.keyPaddingMask,
+        noisyGlobalFeatures=xtGlob,
+        motionKeyPaddingMask=~motionMask,
+    )
+    return float(
+        diffusionLossV2(
+            prediction=pred.boneOutput,
+            target=targetRot,
+            timesteps=timesteps,
+            alphasCumprod=components.schedule.alphasCumprod,
+            predictionMode=config.predictionMode,
+            gamma=config.minSnrGamma,
+            motionMask=motionMask,
+        ).item()
+    )
+
+
+def _sensitivityForwardPass(
+    components: V2FullTrainingComponents,
+    batch: "V2Batch",
+    config: "V2FullTrainingConfig",
+    generators: TrainingRandomState,
+) -> float:
+    """Inner no-grad pass for conditioning sensitivity estimate."""
+    with torch.no_grad():
+        xtRot, xtGlob, targetRot, motionMask, timesteps = (
+            _sensitivityNoisyInputs(
+                components, batch, config, generators
+            )
+        )
+        realEnc = components.tokenizer.encode(list(batch.rawTexts))
+        realOut = components.encoder(
+            realEnc.inputIds.to(components.device),
+            realEnc.attentionMask.to(components.device),
+        )
+        batchSize = len(batch.rawTexts)
+        perm = torch.randperm(
+            batchSize, generator=generators.cpuGenerator
+        ).tolist()
+        shuffledTexts = [batch.rawTexts[i] for i in perm]
+        shuffEnc = components.tokenizer.encode(shuffledTexts)
+        shuffOut = components.encoder(
+            shuffEnc.inputIds.to(components.device),
+            shuffEnc.attentionMask.to(components.device),
+        )
+        lossReal = _sensitivityBoneLoss(
+            components, config, realOut,
+            xtRot, xtGlob, targetRot, motionMask, timesteps,
+        )
+        lossShuf = _sensitivityBoneLoss(
+            components, config, shuffOut,
+            xtRot, xtGlob, targetRot, motionMask, timesteps,
+        )
+        denom = max(abs(lossReal), 1e-8)
+        return abs(lossShuf - lossReal) / denom
 
 
 def _x0ContrastiveLoss(
@@ -1913,6 +2168,18 @@ def runFullTraining(
                     )
                 completedSteps += 1
                 if healthHub is not None:
+                    if (
+                        completedSteps
+                        % healthHub.everySteps == 0
+                    ):
+                        metrics["conditioning_sensitivity"] = (
+                            _computeConditioningSensitivity(
+                                components=components,
+                                batch=batch,
+                                config=config,
+                                generators=generators,
+                            )
+                        )
                     healthHub.step(
                         globalStep=completedSteps,
                         metrics=metrics,
@@ -2437,5 +2704,5 @@ def _buildHealthHub(config: "V2FullTrainingConfig") -> HealthHub:
     HealthHub
     """
     hub = buildHealthHub(config.outputDir)
-    hub._everySteps = config.healthEverySteps
+    hub.everySteps = config.healthEverySteps
     return hub

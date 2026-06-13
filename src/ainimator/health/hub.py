@@ -218,6 +218,19 @@ class HealthHub:
         self._stepMetrics: dict[str, float | None] = {}
 
     # ------------------------------------------------------------------
+    # Public properties
+    # ------------------------------------------------------------------
+    @property
+    def everySteps(self) -> int:
+        """Number of optimiser steps between health captures."""
+        return self._everySteps
+
+    @everySteps.setter
+    def everySteps(self, value: int) -> None:
+        """Set the number of steps between health captures."""
+        self._everySteps = value
+
+    # ------------------------------------------------------------------
     # Attachment
     # ------------------------------------------------------------------
     def attach(self, rootModel: nn.Module) -> None:
@@ -342,13 +355,13 @@ class HealthHub:
     def _exposeAggregateMetrics(
         self, metrics: dict[str, float | None]
     ) -> None:
-        """Promote probe sub-metrics to top-level contract keys."""
-        # cfg_sim → denoiser_blocks.intra_batch_sim if present
-        if "cfg_sim" not in metrics:
-            val = metrics.get("denoiser_blocks.intra_batch_sim")
-            if val is not None:
-                metrics["cfg_sim"] = val
+        """Promote probe sub-metrics to top-level contract keys.
 
+        ``cfg_sim`` is NOT derived from ``intra_batch_sim`` here.
+        True cond-vs-uncond similarity is only available from
+        ``hub.diagnose()``, not from live training hooks.  Leaving it
+        absent (UNKNOWN) is correct during training.
+        """
         # intra_batch_sim top-level
         if "intra_batch_sim" not in metrics:
             val = metrics.get("denoiser_blocks.intra_batch_sim")
@@ -464,7 +477,7 @@ class HealthHub:
         device: Any,
         prompt: str = "a person walks forward",
         seeds: tuple[int, ...] = (0, 42, 123),
-        cfgScales: tuple[float, ...] = (1.0, 2.5, 3.5),
+        cfgScales: tuple[float, ...] = (1.0, 4.0, 6.0),
         frames: int = 120,
         numSteps: int = 100,
         emptyPrompt: str = "",
@@ -730,7 +743,8 @@ def _normalizerStats(normalizer: Any) -> dict[str, float]:
         )
         stats["bone_mean"] = boneMean
         stats["bone_std"] = boneStd
-        stats["post_norm_mean_deviation"] = abs(boneMean)
+        # Canonical key matches SCORE_REFERENCE and _verdictForMetric.
+        stats["post_norm_stats"] = abs(boneMean)
         stats["post_norm_std_deviation"] = abs(boneStd - 1.0)
     except AttributeError:
         pass
@@ -909,7 +923,7 @@ def _verdictForMetric(
         "cross_prompt_sim": (0.80, 0.95),
         "distinctness": (0.50, 0.80),
         "intra_batch_sim": (0.50, 0.90),
-        "post_norm_mean_deviation": (0.10, 0.30),
+        "post_norm_stats": (0.10, 0.30),
     }
     if metric in lower:
         warn, crit = lower[metric]

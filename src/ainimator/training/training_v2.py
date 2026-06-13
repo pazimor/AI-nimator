@@ -747,13 +747,67 @@ def trainStep(
     )
     components.optimizer.step()
 
-    return {
-        "loss_total": float(total.detach().item()),
-        "loss_bone": float(boneLoss.detach().item()),
-        "loss_global": float(globalLoss.detach().item()),
+    totalValue = float(total.detach().item())
+    boneValue = float(boneLoss.detach().item())
+    globalValue = float(globalLoss.detach().item())
+    metrics: dict[str, float] = {
+        "loss_total": totalValue,
+        "loss_bone": boneValue,
+        "loss_global": globalValue,
         "loss_vel_xyz": velLossValue,
         "timestep": int(timesteps.item()),
     }
+    if totalValue > 0.0:
+        _addLossShares(
+            metrics,
+            totalValue,
+            boneValue,
+            globalValue,
+            velLossValue,
+            config.velocityXyzWeight,
+        )
+    return metrics
+
+
+def _addLossShares(
+    metrics: dict[str, float],
+    totalValue: float,
+    boneValue: float,
+    globalValue: float,
+    velLossValue: float,
+    velWeight: float,
+) -> None:
+    """Populate ``loss_share`` and per-component share keys.
+
+    ``loss_share`` = minimum weighted fractional contribution among
+    active components.  A dead component (share near 0) pushes the
+    minimum toward CRITICAL in the ``loss_decomposition`` contract.
+
+    Parameters
+    ----------
+    metrics : dict
+        Mutated in-place.
+    totalValue : float
+        Total loss scalar (must be > 0).
+    boneValue, globalValue, velLossValue : float
+        Unweighted component scalars.
+    velWeight : float
+        Config weight for velocity-xyz component.
+    """
+    components_list = [
+        ("bone", boneValue, 1.0),
+        ("global", globalValue, 1.0),
+        ("vel_xyz", velLossValue, velWeight),
+    ]
+    shares: list[float] = []
+    for name, raw, weight in components_list:
+        if weight <= 0.0:
+            continue
+        share = (raw * weight) / totalValue
+        metrics[f"loss_share.{name}"] = share
+        shares.append(share)
+    if shares:
+        metrics["loss_share"] = min(shares)
 
 
 # =====================================================================
@@ -818,7 +872,7 @@ def runOverfit(
     healthHub: HealthHub | None = None
     if config.healthEnabled:
         healthHub = buildHealthHub(config.outputDir)
-        healthHub._everySteps = config.healthEverySteps
+        healthHub.everySteps = config.healthEverySteps
         healthHub.attach(components.denoiser)
 
     history: list[dict[str, float]] = []
