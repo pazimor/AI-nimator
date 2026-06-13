@@ -109,7 +109,7 @@ contracts:
   # WARNING: < 0.3  |  CRITICAL: beyond (z-norm broken)
   # Incident: Bug z-normalization v2
   - name: post_norm_stats
-    metric: post_norm_mean_deviation
+    metric: post_norm_stats
     direction: lower_is_better
     ok_threshold: 0.1
     warning_threshold: 0.3

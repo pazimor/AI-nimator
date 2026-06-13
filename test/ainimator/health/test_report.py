@@ -39,7 +39,7 @@ def test_report_contains_16_metrics_markdown() -> None:
             "intra_batch_sim": 0.30,
             "update_ratio": 5e-4,
             "loss_share": 0.20,
-            "post_norm_mean_deviation": 0.05,
+            "post_norm_stats": 0.05,
             "nan_inf": 0,
             "val_gap": 0.10,
             "epoch_time": 1.1,
@@ -111,3 +111,45 @@ def test_report_missing_metric_shows_unknown() -> None:
 
         # Sheet renders without crashing and contains N/A markers.
         assert "N/A" in sheet
+
+
+def test_post_norm_stats_key_resolves_in_report() -> None:
+    """JSONL key 'post_norm_stats' yields a non-N/A row in the report.
+
+    Regression test for Issue 4: the old code wrote 'post_norm_mean_deviation'
+    to JSONL but SCORE_REFERENCE looked up 'post_norm_stats', causing the
+    row to always show N/A even when the normalizer audit ran.
+
+    After the fix all three sites (SCORE_REFERENCE, _normalizerStats,
+    _verdictForMetric) use the canonical key 'post_norm_stats'.
+    """
+    with tempfile.TemporaryDirectory() as tmpDir:
+        tmpPath = Path(tmpDir)
+        healthDir = tmpPath / "health"
+        healthDir.mkdir()
+        # Canonical key: post_norm_stats
+        (healthDir / "health.jsonl").write_text(
+            json.dumps({"step": 1, "post_norm_stats": 0.05}) + "\n",
+            encoding="utf-8",
+        )
+
+        hub = buildHealthHub(tmpPath)
+        sheet = hub.report(runDir=tmpPath, outputFormat="json")
+        hub.close()
+
+        rows = json.loads(sheet)
+        norm_row = next(
+            (r for r in rows if r["metric"] == "post_norm_stats"), None
+        )
+        assert norm_row is not None, (
+            "post_norm_stats row not found in report"
+        )
+        # Value must be resolved (not N/A) and verdict must be a real one.
+        assert norm_row["value"] is not None, (
+            "post_norm_stats value is None — key mismatch between "
+            "SCORE_REFERENCE and JSONL"
+        )
+        assert norm_row["verdict"] in ("OK", "WARNING", "CRITICAL"), (
+            f"Unexpected verdict: {norm_row['verdict']} "
+            f"(expected OK/WARNING/CRITICAL, not UNKNOWN)"
+        )
