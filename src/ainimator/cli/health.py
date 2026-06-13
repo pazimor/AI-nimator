@@ -259,7 +259,7 @@ def _buildParser() -> argparse.ArgumentParser:
     )
     diagP.add_argument("--seeds", default="0,42,123")
     diagP.add_argument("--cfg-scales", dest="cfg_scales",
-                       default="1.0,2.5,3.5")
+                       default="1.0,4.0,6.0")
     diagP.add_argument("--frames", type=int, default=120)
     diagP.add_argument("--num-steps", dest="num_steps", type=int,
                        default=100)
