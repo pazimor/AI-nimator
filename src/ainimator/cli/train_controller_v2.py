@@ -16,6 +16,7 @@ import argparse
 import logging
 from pathlib import Path
 
+from ainimator.core.config_loader import defaultPreprocessedDatasetRoot
 from ainimator.core.constants.controller import PhaseMode
 from ainimator.model.losses_controller_v2 import ControllerLossWeights
 from ainimator.training.controller_training_v2 import (
@@ -28,7 +29,13 @@ from ainimator.training.training_v2 import loadDatasetSample
 def _parseArgs() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Goal C controller train.")
-    parser.add_argument("--dataset-root", type=Path, required=True)
+    parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=None,
+        help="Preprocessed dataset root. Defaults to output-root from "
+        "src/configs/preprocess_dataset.yaml when omitted.",
+    )
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--epochs", type=int, default=300)
@@ -46,11 +53,26 @@ def _parseArgs() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolveDatasetRoot(explicit: Path | None) -> Path:
+    """Return the explicit dataset root or the preprocess.yaml default."""
+    if explicit is not None:
+        return explicit
+    fallback = defaultPreprocessedDatasetRoot()
+    if fallback is None:
+        raise SystemExit(
+            "--dataset-root not given and no output-root found in "
+            "src/configs/preprocess_dataset.yaml."
+        )
+    logging.info("Using default dataset root: %s", fallback)
+    return fallback
+
+
 def main() -> None:
     """Run the controller overfit on one dataset sample."""
     logging.basicConfig(level=logging.INFO)
     args = _parseArgs()
-    sample = loadDatasetSample(args.dataset_root, args.sample_index)
+    datasetRoot = _resolveDatasetRoot(args.dataset_root)
+    sample = loadDatasetSample(datasetRoot, args.sample_index)
     config = ControllerTrainingConfig(
         outputDir=args.output_dir,
         epochs=args.epochs,

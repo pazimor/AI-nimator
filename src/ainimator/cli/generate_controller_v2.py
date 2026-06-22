@@ -20,6 +20,7 @@ from pathlib import Path
 
 import torch
 
+from ainimator.core.config_loader import defaultPreprocessedDatasetRoot
 from ainimator.data.controller_sequences import (
     ControllerSequenceConfig,
     buildControllerSequences,
@@ -36,11 +37,31 @@ def _parseArgs() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Goal C controller roll.")
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--dataset-root", type=Path, required=True)
+    parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=None,
+        help="Preprocessed dataset root. Defaults to output-root from "
+        "src/configs/preprocess_dataset.yaml when omitted.",
+    )
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", type=str, default="auto")
     return parser.parse_args()
+
+
+def _resolveDatasetRoot(explicit: Path | None) -> Path:
+    """Return the explicit dataset root or the preprocess.yaml default."""
+    if explicit is not None:
+        return explicit
+    fallback = defaultPreprocessedDatasetRoot()
+    if fallback is None:
+        raise SystemExit(
+            "--dataset-root not given and no output-root found in "
+            "src/configs/preprocess_dataset.yaml."
+        )
+    logging.info("Using default dataset root: %s", fallback)
+    return fallback
 
 
 def main() -> None:
@@ -55,7 +76,8 @@ def main() -> None:
     stateNorm = stateNorm.to(device)
     deltaNorm = deltaNorm.to(device)
 
-    sample = loadDatasetSample(args.dataset_root, args.sample_index)
+    datasetRoot = _resolveDatasetRoot(args.dataset_root)
+    sample = loadDatasetSample(datasetRoot, args.sample_index)
     sequenceConfig = ControllerSequenceConfig(
         contextFrames=model.config.contextFrames,
         useAimDirection=model.config.useAimDirection,

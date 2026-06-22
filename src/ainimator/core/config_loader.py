@@ -56,6 +56,37 @@ PREPROCESS_DEFAULT_TEXT_BATCH_SIZE = 64
 LOGGER = logging.getLogger("shared.config.network")
 
 DEFAULT_NETWORK_CONFIG_PATH = Path("src/configs/network.yaml")
+DEFAULT_PREPROCESS_CONFIG_PATH = Path("src/configs/preprocess_dataset.yaml")
+
+
+def defaultPreprocessedDatasetRoot(
+    configPath: Path = DEFAULT_PREPROCESS_CONFIG_PATH,
+) -> Optional[Path]:
+    """Read the preprocessed dataset ``output-root`` without side effects.
+
+    Lightweight counterpart to :func:`loadPreprocessConfig` used to
+    resolve a CLI default: it only reads ``paths.output-root`` and does
+    **not** create the directory.
+
+    Parameters
+    ----------
+    configPath : Path
+        Path to ``preprocess_dataset.yaml``.
+
+    Returns
+    -------
+    Optional[Path]
+        The resolved output root, or ``None`` when the config or key is
+        missing.
+    """
+    resolved = configPath.expanduser()
+    if not resolved.exists():
+        return None
+    payload = yaml.safe_load(resolved.read_text(encoding="utf-8")) or {}
+    rawValue = (payload.get("paths") or {}).get("output-root")
+    if not rawValue:
+        return None
+    return Path(str(rawValue)).expanduser()
 
 
 def loadNetworkConfig(

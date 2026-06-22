@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from ainimator.core.config_loader import loadNetworkConfig
 
 
@@ -41,3 +43,38 @@ def test_load_network_config_parses_bone_data(tmp_path) -> None:
     assert config.generation.boneData.rootVelocity is True
     assert config.generation.boneData.jointXyz is True
     assert config.generation.boneData.pelvisHeight is False
+
+
+# ---------------------------------------------------------------------
+# defaultPreprocessedDatasetRoot (Goal C controller CLIs)
+# ---------------------------------------------------------------------
+def test_default_preprocessed_root_reads_output_root(tmp_path) -> None:
+    from ainimator.core.config_loader import defaultPreprocessedDatasetRoot
+
+    configPath = tmp_path / "preprocess_dataset.yaml"
+    configPath.write_text(
+        "paths:\n  input-root: /in\n  output-root: /data/prep\n",
+        encoding="utf-8",
+    )
+    assert defaultPreprocessedDatasetRoot(configPath) == Path("/data/prep")
+
+
+def test_default_preprocessed_root_missing_config_returns_none(
+    tmp_path,
+) -> None:
+    from ainimator.core.config_loader import defaultPreprocessedDatasetRoot
+
+    assert defaultPreprocessedDatasetRoot(tmp_path / "absent.yaml") is None
+
+
+def test_default_preprocessed_root_no_side_effect(tmp_path) -> None:
+    """The helper must NOT create the output-root directory."""
+    from ainimator.core.config_loader import defaultPreprocessedDatasetRoot
+
+    target = tmp_path / "prep_out"
+    configPath = tmp_path / "preprocess_dataset.yaml"
+    configPath.write_text(
+        f"paths:\n  output-root: {target}\n", encoding="utf-8"
+    )
+    defaultPreprocessedDatasetRoot(configPath)
+    assert not target.exists()
