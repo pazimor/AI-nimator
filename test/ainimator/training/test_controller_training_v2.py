@@ -13,7 +13,9 @@ from pathlib import Path
 
 import torch
 
+from ainimator.core.constants.controller import PhaseMode
 from ainimator.health.contract import Verdict
+from ainimator.model.losses_controller_v2 import ControllerLossWeights
 from ainimator.training.controller_training_v2 import (
     ControllerTrainingConfig,
     loadControllerCheckpoint,
@@ -90,3 +92,41 @@ def test_checkpoint_round_trips(tmp_path: Path) -> None:
     assert out.boneDelta.shape == (2, 22, 6)
     assert controlMean.shape[-1] == model.config.controlChannels
     assert controlStd.shape[-1] == model.config.controlChannels
+
+
+# ---------------------------------------------------------------------
+# C2 — explicit phase + rich control + foot contact
+# ---------------------------------------------------------------------
+def _c2Config(outputDir: Path) -> ControllerTrainingConfig:
+    return ControllerTrainingConfig(
+        outputDir=outputDir,
+        epochs=250,
+        device="cpu",
+        embedDim=128,
+        numHeads=4,
+        numLayers=3,
+        logEvery=120,
+        seed=0,
+        phaseMode=PhaseMode.EXPLICIT,
+        useAimDirection=True,
+        lossWeights=ControllerLossWeights(
+            velocity=1.0, geodesic=1.0, footContact=0.5
+        ),
+    )
+
+
+def test_c2_phase_and_rich_control_trains_and_reproduces(
+    tmp_path: Path,
+) -> None:
+    rotation6d, rootTranslation = _syntheticClip()
+    result = runControllerOverfit(
+        rotation6d, rootTranslation, _c2Config(tmp_path)
+    )
+    # Still overfits + reproduces with phase + aim + foot-contact wired.
+    assert result.verdicts["rollout_drift"] is Verdict.OK
+    assert result.verdicts["post_norm_stats"] is Verdict.OK
+    # Rich control (velocity + aim) keeps the control signal informative:
+    # control_sensitivity must stay strictly positive.
+    assert result.metrics["control_sensitivity"] > 0.0
+    # mean_collapse SAIN is a varied-control (multi-clip) gate, NOT a
+    # single-overfit-clip property — see ROADMAP_DETERMINIST C2.

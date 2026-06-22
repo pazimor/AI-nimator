@@ -116,46 +116,48 @@ def geodesicRotationLoss(
     return maskedMean(angle, motionMask)
 
 
-def footContactLossController(
-    predictedRotation6d: torch.Tensor,
-    contactLabels: torch.Tensor,
-    motionMask: torch.Tensor | None = None,
+def footContactStepLoss(
+    predictedNextRotation6d: torch.Tensor,
+    lastRotation6d: torch.Tensor,
+    predictedGlobalDelta: torch.Tensor,
+    contactTarget: torch.Tensor,
 ) -> torch.Tensor:
-    """Anti-skating loss: foot velocity under ground-contact frames.
+    """Per-step world-frame anti-skating loss (phase C2).
 
-    Penalises horizontal foot motion on frames the ground truth marks as
-    in contact (phase C2).  Operates on a *sequence* of reconstructed
-    rotations so a temporal velocity is defined.
+    For each predicted transition, penalises the **world** planar
+    velocity of a foot that the ground truth marks as in contact at the
+    target frame.  World velocity combines the local foot displacement
+    (from FK of the rotations) with the predicted root planar delta, so a
+    planted foot is penalised for sliding even as the pelvis advances over
+    it — the failure mode a rotation-only loss misses.
 
     Parameters
     ----------
-    predictedRotation6d : torch.Tensor
-        Reconstructed absolute rotations, shape ``(B, F, numBones, 6)``.
-    contactLabels : torch.Tensor
-        Per-frame foot-contact mask, shape ``(B, F, numFeet)`` with the
-        feet ordered as ``(leftFoot, rightFoot)`` channel-last.
-    motionMask : torch.Tensor or None
-        Optional validity mask, shape ``(B, F)``.
+    predictedNextRotation6d : torch.Tensor
+        Reconstructed absolute next-frame rotations, ``(N, numBones, 6)``.
+    lastRotation6d : torch.Tensor
+        Last-window absolute rotations, ``(N, numBones, 6)``.
+    predictedGlobalDelta : torch.Tensor
+        Predicted root translation delta, ``(N, 3)``.
+    contactTarget : torch.Tensor
+        Foot-contact mask at the target frame, ``(N, numFeet)`` ordered
+        ``(leftFoot, rightFoot)``.
 
     Returns
     -------
     torch.Tensor
-        Scalar mean of the contact-weighted squared foot velocity.
+        Scalar mean of the contact-weighted squared world foot velocity.
     """
-    if predictedRotation6d.ndim != 4:
-        raise ValueError(
-            "footContactLossController expects (B, F, bones, 6); got "
-            f"{tuple(predictedRotation6d.shape)}."
-        )
-    jointXyz = rot6dToJointXYZ(predictedRotation6d)
     footIndices = _footJointIndices()
-    footXyz = jointXyz[:, :, footIndices, :]
-    velocity = footXyz[:, 1:, :, :] - footXyz[:, :-1, :, :]
-    planar = velocity[..., _GROUND_PLANE_AXES]
-    contact = contactLabels[:, 1:, :].unsqueeze(-1)
-    weighted = (planar ** 2) * contact
-    frameMask = None if motionMask is None else motionMask[:, 1:]
-    return maskedMean(weighted, frameMask)
+    nextXyz = rot6dToJointXYZ(predictedNextRotation6d.unsqueeze(1))
+    lastXyz = rot6dToJointXYZ(lastRotation6d.unsqueeze(1))
+    footNext = nextXyz.squeeze(1)[:, footIndices, :]
+    footLast = lastXyz.squeeze(1)[:, footIndices, :]
+    localVelocity = (footNext - footLast)[..., _GROUND_PLANE_AXES]
+    rootPlanar = predictedGlobalDelta[:, _GROUND_PLANE_AXES].unsqueeze(1)
+    worldVelocity = localVelocity + rootPlanar
+    weighted = (worldVelocity ** 2) * contactTarget.unsqueeze(-1)
+    return weighted.mean()
 
 
 def _footJointIndices() -> list[int]:

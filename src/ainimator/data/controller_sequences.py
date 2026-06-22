@@ -24,6 +24,7 @@ Conventions
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -31,9 +32,22 @@ import torch
 from ainimator.core.constants.controller import (
     CONTROL_PLANAR_VELOCITY_CHANNELS,
 )
+from ainimator.geometry.components.ops import rot6dToJointXYZ
 
 # Ground-plane axes of the SMPL Y-up convention (x, z).
 _GROUND_PLANE_AXES = (0, 2)
+# Vertical axis of the SMPL Y-up convention.
+_VERTICAL_AXIS = 1
+# SMPL-22 foot joint indices (leftFoot, rightFoot).
+_FOOT_JOINT_INDICES = (10, 11)
+# Default contact thresholds: a foot is "in contact" when it sits below
+# ``heightThreshold`` (meters) AND moves slower than ``speedThreshold``
+# (meters/frame) on the ground plane.  Conservative defaults; tuned per
+# dataset during C2 validation.
+_DEFAULT_CONTACT_HEIGHT = 0.05
+_DEFAULT_CONTACT_SPEED = 0.01
+# Half a gait cycle advances the phase by π (one foot strike).
+_HALF_CYCLE = math.pi
 
 
 @dataclass(frozen=True)
@@ -46,10 +60,24 @@ class ControllerSequenceConfig:
         Window length ``K`` (frames seen per forward).
     useAimDirection : bool
         Append the aim-direction control channels (C2 rich control).
+    emitPhase : bool
+        Derive a foot-contact gait phase and emit it per transition (C2).
+    emitContacts : bool
+        Derive foot-contact labels and emit them per transition (C2,
+        consumed by the anti-skating loss).
+    contactHeight : float
+        Vertical threshold (m) below which a foot may be in contact.
+    contactSpeed : float
+        Planar speed threshold (m/frame) below which a foot may be in
+        contact.
     """
 
     contextFrames: int = 1
     useAimDirection: bool = False
+    emitPhase: bool = False
+    emitContacts: bool = False
+    contactHeight: float = _DEFAULT_CONTACT_HEIGHT
+    contactSpeed: float = _DEFAULT_CONTACT_SPEED
 
     def __post_init__(self) -> None:
         if self.contextFrames < 1:
@@ -78,6 +106,12 @@ class ControllerSequenceBatch:
         ``(N, 3)`` next-frame root_translation delta.
     control : torch.Tensor
         ``(N, controlChannels)`` GT-derived control signal.
+    phase : torch.Tensor or None
+        ``(N, 2)`` gait phase ``(cos φ, sin φ)`` at the target frame
+        (C2), or ``None`` when phase emission is off.
+    contactTarget : torch.Tensor or None
+        ``(N, 2)`` foot-contact labels ``(left, right)`` at the target
+        frame (C2), or ``None`` when contact emission is off.
     """
 
     boneWindow: torch.Tensor
@@ -86,6 +120,8 @@ class ControllerSequenceBatch:
     targetBoneDelta: torch.Tensor
     targetGlobalDelta: torch.Tensor
     control: torch.Tensor
+    phase: torch.Tensor | None = None
+    contactTarget: torch.Tensor | None = None
 
     @property
     def numTransitions(self) -> int:
@@ -138,6 +174,9 @@ def buildControllerSequences(
     targetGlobalDelta = rootTranslation[nextFrame] - rootTranslation[lastFrame]
 
     control = _deriveControl(targetGlobalDelta, config)
+    phase, contactTarget = _derivePhaseAndContacts(
+        rotation6d, rootTranslation, nextFrame, config
+    )
     return ControllerSequenceBatch(
         boneWindow=boneWindow,
         globalWindow=globalWindow,
@@ -145,7 +184,110 @@ def buildControllerSequences(
         targetBoneDelta=targetBoneDelta,
         targetGlobalDelta=targetGlobalDelta,
         control=control,
+        phase=phase,
+        contactTarget=contactTarget,
     )
+
+
+def _derivePhaseAndContacts(
+    rotation6d: torch.Tensor,
+    rootTranslation: torch.Tensor,
+    nextFrame: torch.Tensor,
+    config: ControllerSequenceConfig,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Derive per-transition gait phase and contact labels (C2)."""
+    if not (config.emitPhase or config.emitContacts):
+        return None, None
+    contacts = deriveFootContacts(
+        rotation6d, rootTranslation, config.contactHeight, config.contactSpeed
+    )
+    phase: torch.Tensor | None = None
+    if config.emitPhase:
+        phase = deriveGaitPhase(contacts)[nextFrame]
+    contactTarget = contacts[nextFrame] if config.emitContacts else None
+    return phase, contactTarget
+
+
+def deriveFootContacts(
+    rotation6d: torch.Tensor,
+    rootTranslation: torch.Tensor,
+    heightThreshold: float = _DEFAULT_CONTACT_HEIGHT,
+    speedThreshold: float = _DEFAULT_CONTACT_SPEED,
+) -> torch.Tensor:
+    """Derive per-frame foot-contact labels from the ground truth.
+
+    A foot is "in contact" when its world height sits below
+    ``heightThreshold`` and its planar speed is below ``speedThreshold``.
+
+    Parameters
+    ----------
+    rotation6d : torch.Tensor
+        ``(F, numBones, 6)`` ground-truth rotations.
+    rootTranslation : torch.Tensor
+        ``(F, 3)`` ground-truth root translation.
+    heightThreshold, speedThreshold : float
+        Contact thresholds (meters / meters-per-frame).
+
+    Returns
+    -------
+    torch.Tensor
+        ``(F, 2)`` float contact labels ``(leftFoot, rightFoot)``.
+    """
+    jointXyz = rot6dToJointXYZ(rotation6d.unsqueeze(0)).squeeze(0)
+    footXyz = jointXyz[:, _FOOT_JOINT_INDICES, :]
+    worldFoot = footXyz + rootTranslation.unsqueeze(1)
+    height = worldFoot[..., _VERTICAL_AXIS]
+    planar = worldFoot[..., _GROUND_PLANE_AXES]
+    velocity = torch.zeros_like(planar)
+    velocity[1:] = planar[1:] - planar[:-1]
+    speed = velocity.norm(dim=-1)
+    contact = (height < heightThreshold) & (speed < speedThreshold)
+    return contact.to(rotation6d.dtype)
+
+
+def deriveGaitPhase(contacts: torch.Tensor) -> torch.Tensor:
+    """Derive a continuous gait phase from foot-contact onsets (PFNN).
+
+    Each new foot strike (a 0→1 contact transition on either foot)
+    advances the phase by π; the phase is linearly interpolated between
+    consecutive strikes.  Frames before the first strike (or clips with
+    fewer than two strikes) hold phase 0.
+
+    Parameters
+    ----------
+    contacts : torch.Tensor
+        ``(F, 2)`` foot-contact labels.
+
+    Returns
+    -------
+    torch.Tensor
+        ``(F, 2)`` phase encoded as ``(cos φ, sin φ)``.
+    """
+    onsets = _contactOnsets(contacts)
+    device = contacts.device
+    phase = torch.zeros(
+        contacts.shape[0], dtype=contacts.dtype, device=device
+    )
+    for index in range(len(onsets) - 1):
+        start, end = onsets[index], onsets[index + 1]
+        ramp = torch.linspace(
+            index * _HALF_CYCLE,
+            (index + 1) * _HALF_CYCLE,
+            end - start + 1,
+            device=device,
+            dtype=contacts.dtype,
+        )
+        phase[start:end] = ramp[:-1]
+    if onsets:
+        phase[onsets[-1]:] = float((len(onsets) - 1) * _HALF_CYCLE)
+    return torch.stack([torch.cos(phase), torch.sin(phase)], dim=-1)
+
+
+def _contactOnsets(contacts: torch.Tensor) -> list[int]:
+    """Return frame indices where any foot transitions to contact."""
+    rising = (contacts[1:] > 0.5) & (contacts[:-1] <= 0.5)
+    onsetFrames = torch.nonzero(rising.any(dim=-1), as_tuple=False) + 1
+    return [int(frame) for frame in onsetFrames.flatten().tolist()]
 
 
 def _deriveControl(

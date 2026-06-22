@@ -17,6 +17,7 @@ import logging
 from pathlib import Path
 
 from ainimator.core.constants.controller import PhaseMode
+from ainimator.model.losses_controller_v2 import ControllerLossWeights
 from ainimator.training.controller_training_v2 import (
     ControllerTrainingConfig,
     runControllerOverfit,
@@ -38,6 +39,7 @@ def _parseArgs() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--phase", type=str, default="none")
     parser.add_argument("--aim-direction", action="store_true")
+    parser.add_argument("--foot-contact-weight", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto")
     return parser.parse_args()
@@ -60,6 +62,11 @@ def main() -> None:
         useAimDirection=args.aim_direction,
         seed=args.seed,
         device=args.device,
+        lossWeights=ControllerLossWeights(
+            velocity=1.0,
+            geodesic=1.0,
+            footContact=args.foot_contact_weight,
+        ),
     )
     result = runControllerOverfit(
         sample.rotation6d, sample.rootTranslation, config

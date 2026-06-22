@@ -47,6 +47,7 @@ from ainimator.model.losses_controller_v2 import (
     ControllerLossResult,
     ControllerLossWeights,
     combinedControllerLoss,
+    footContactStepLoss,
     geodesicRotationLoss,
     velocityDeltaLoss,
 )
@@ -216,16 +217,41 @@ def _forwardLosses(
         tensors["normBoneWindow"],
         controlNorm,
         globalWindow=tensors["normGlobalWindow"],
+        phase=batch.phase,
     )
     velocity = velocityDeltaLoss(
         output.boneDelta, tensors["normBoneDelta"]
     ) + velocityDeltaLoss(output.globalDelta, tensors["normGlobalDelta"])
-    rawBoneDelta, _ = denormalizeStepDelta(
-        deltaNormalizer, output.boneDelta, None
+    rawBoneDelta, rawGlobalDelta = denormalizeStepDelta(
+        deltaNormalizer, output.boneDelta, output.globalDelta
     )
     predictedNextBone = batch.boneWindow[:, -1, :, :] + rawBoneDelta
     geodesic = geodesicRotationLoss(predictedNextBone, batch.targetBoneNext)
-    return combinedControllerLoss(velocity, geodesic, weights)
+    footContact = _footContactTerm(
+        batch, predictedNextBone, rawGlobalDelta, weights
+    )
+    return combinedControllerLoss(
+        velocity, geodesic, weights, footContact=footContact
+    )
+
+
+def _footContactTerm(
+    batch: ControllerSequenceBatch,
+    predictedNextBone: torch.Tensor,
+    rawGlobalDelta: torch.Tensor | None,
+    weights: ControllerLossWeights,
+) -> torch.Tensor | None:
+    """Compute the anti-skating loss when enabled and data is present."""
+    if weights.footContact <= 0.0 or batch.contactTarget is None:
+        return None
+    if rawGlobalDelta is None:
+        return None
+    return footContactStepLoss(
+        predictedNextBone,
+        batch.boneWindow[:, -1, :, :],
+        rawGlobalDelta,
+        batch.contactTarget,
+    )
 
 
 def _trainLoop(
@@ -291,6 +317,9 @@ def _rolloutFromClip(
     seedBone = batch.boneWindow[:1]
     seedGlobal = batch.globalWindow[:1]
     controlSequence = controlNorm.unsqueeze(0)
+    phaseSequence = (
+        None if batch.phase is None else batch.phase.unsqueeze(0)
+    )
     return rolloutController(
         model,
         stateNormalizer,
@@ -298,6 +327,7 @@ def _rolloutFromClip(
         seedBone,
         seedGlobal,
         controlSequence,
+        phaseSequence=phaseSequence,
     )
 
 
@@ -330,6 +360,7 @@ def _evaluate(
         tensors["normBoneWindow"],
         controlNorm,
         globalWindow=tensors["normGlobalWindow"],
+        phase=batch.phase,
     )
     rank, sim = meanCollapse(output)
     sensitivity = controlSensitivity(
@@ -337,6 +368,7 @@ def _evaluate(
         tensors["normBoneWindow"],
         controlNorm,
         globalWindow=tensors["normGlobalWindow"],
+        phase=batch.phase,
     )
     rollout = _rolloutFromClip(
         model, batch, stateNormalizer, deltaNormalizer, controlNorm
@@ -387,6 +419,8 @@ def runControllerOverfit(
     sequenceConfig = ControllerSequenceConfig(
         contextFrames=config.contextFrames,
         useAimDirection=config.useAimDirection,
+        emitPhase=config.phaseMode is not PhaseMode.NONE,
+        emitContacts=config.lossWeights.footContact > 0.0,
     )
     batch = buildControllerSequences(
         clipRotation6d.to(device),

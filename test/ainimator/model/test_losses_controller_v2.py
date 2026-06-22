@@ -10,6 +10,7 @@ import torch
 from ainimator.model.losses_controller_v2 import (
     ControllerLossWeights,
     combinedControllerLoss,
+    footContactStepLoss,
     geodesicRotationLoss,
     velocityDeltaLoss,
 )
@@ -58,6 +59,24 @@ def test_combined_loss_weights_applied() -> None:
     result = combinedControllerLoss(velocity, geodesic, weights)
     assert float(result.total) == pytest.approx(0.5 * 2.0 + 2.0 * 3.0)
     assert set(result.components) == {"loss_velocity", "loss_geodesic"}
+
+
+def test_foot_contact_step_zero_without_contact() -> None:
+    predNext = torch.randn(4, 22, 6)
+    last = torch.randn(4, 22, 6)
+    globalDelta = torch.randn(4, 3)
+    contact = torch.zeros(4, 2)  # no foot in contact
+    loss = footContactStepLoss(predNext, last, globalDelta, contact)
+    assert float(loss) == pytest.approx(0.0)
+
+
+def test_foot_contact_step_positive_under_contact_and_motion() -> None:
+    last = torch.randn(4, 22, 6)
+    predNext = last + 0.5  # moved rotations -> foot moves
+    globalDelta = torch.ones(4, 3) * 0.2
+    contact = torch.ones(4, 2)  # both feet in contact
+    loss = footContactStepLoss(predNext, last, globalDelta, contact)
+    assert float(loss) > 0.0
 
 
 def test_combined_loss_includes_foot_contact_when_weighted() -> None:

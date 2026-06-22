@@ -70,6 +70,8 @@ def controlSensitivity(
 
     Mirrors the diffusion conditioning-sensitivity probe.  Requires a
     batch of at least two samples so the shuffle is a real permutation.
+    The phase (when present) is held fixed so the measured change is
+    attributable to the control alone.
 
     Returns
     -------
