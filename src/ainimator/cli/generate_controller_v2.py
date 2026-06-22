@@ -46,6 +46,14 @@ def _parseArgs() -> argparse.Namespace:
     )
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--dae",
+        type=Path,
+        default=None,
+        help="Optional .dae (Collada) path. When set, the rollout is "
+        "also exported as an animation viewable in Blender.",
+    )
+    parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--device", type=str, default="auto")
     return parser.parse_args()
 
@@ -106,6 +114,34 @@ def main() -> None:
         args.output,
     )
     logging.info("rollout saved to %s", args.output)
+    if args.dae is not None:
+        _exportRolloutDae(rollout, args.dae, args.fps)
+
+
+def _exportRolloutDae(rollout: object, daePath: Path, fps: int) -> None:
+    """Export a single-clip rollout to a Blender-viewable .dae file.
+
+    Reuses the v2 rotation6d → Collada converter so the deterministic
+    rollout renders with the exact same skeleton/axis conventions as the
+    diffusion exporter.
+    """
+    from ainimator.cli.generate_animation_v2 import (
+        _buildAnimationSampleV2,
+        _buildRebuilder,
+    )
+
+    rotation6d = rollout.rotation6d[0].detach().cpu()  # (F, 22, 6)
+    rootTranslation = rollout.rootTranslation[0].detach().cpu()  # (F, 3)
+    sample = _buildAnimationSampleV2(
+        boneRotation6d=rotation6d,
+        rootTranslation=rootTranslation,
+        fps=fps,
+        outputPath=daePath,
+        extras={"engine": "controller_v2"},
+    )
+    daePath.parent.mkdir(parents=True, exist_ok=True)
+    _buildRebuilder(daePath).exportCollada(sample, daePath)
+    logging.info("rollout .dae exported to %s", daePath)
 
 
 if __name__ == "__main__":
