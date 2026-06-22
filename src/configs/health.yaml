@@ -122,3 +122,55 @@ contracts:
     ok_threshold: 0.1
     warning_threshold: 0.3
     critical_above: 0.3
+
+  # =====================================================================
+  # Goal C — deterministic controller (ROADMAP_DETERMINIST §4)
+  # =====================================================================
+  # These metrics are produced ONLY by the controller engine; diffusion
+  # runs leave them UNKNOWN (harmless).  effective_rank / intra_batch_sim
+  # are the SAME probes as above, only reinterpreted: collapse here means
+  # the controller ignores the control / regresses to the mean.
+
+  # Metric: control_sensitivity
+  # Direction: ↑ > 0 (output change when control is shuffled)
+  # Healthy: > 0.05  |  WARNING: 0.005–0.05  |  CRITICAL: < 0.005
+  # Detects: the controller ignores the control signal.
+  - name: control_sensitivity
+    metric: control_sensitivity
+    direction: higher_is_better
+    ok_threshold: 0.05
+    warning_threshold: 0.005
+    critical_below: 0.005
+
+  # Metric: mean_collapse_rank (normalized effective_rank in [0,1])
+  # Direction: ↑ (rank high = varied outputs under varied control)
+  # Healthy: > 0.5  |  WARNING: 0.1–0.5  |  CRITICAL: < 0.1
+  # Detects: regression toward the mean motion.
+  - name: mean_collapse_rank
+    metric: mean_collapse_rank
+    direction: higher_is_better
+    ok_threshold: 0.5
+    warning_threshold: 0.1
+    critical_below: 0.1
+
+  # Metric: mean_collapse_sim (intra-batch cosine of outputs)
+  # Direction: ↓ towards 0
+  # Healthy: < 0.5  |  WARNING: 0.5–0.9  |  CRITICAL: > 0.9
+  # Detects: regression toward the mean motion.
+  - name: mean_collapse_sim
+    metric: mean_collapse_sim
+    direction: lower_is_better
+    ok_threshold: 0.5
+    warning_threshold: 0.9
+    critical_above: 0.9
+
+  # Metric: rollout_drift
+  # Direction: ↓ (bounded error over the rollout horizon)
+  # Healthy: < 0.05  |  WARNING: 0.05–0.5  |  CRITICAL: > 0.5
+  # Detects: exposure bias (drift / freeze / explosion).
+  - name: rollout_drift
+    metric: rollout_drift
+    direction: lower_is_better
+    ok_threshold: 0.05
+    warning_threshold: 0.5
+    critical_above: 0.5

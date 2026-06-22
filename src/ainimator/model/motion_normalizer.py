@@ -322,3 +322,59 @@ class MotionNormalizer(nn.Module):
             motionChannels=int(payload["motionChannels"]),
             globalChannels=int(payload["globalChannels"]),
         )
+
+
+# ---------------------------------------------------------------------
+# Single-frame delta helpers (Goal C controller)
+# ---------------------------------------------------------------------
+# The controller works with per-step deltas of shape ``(B, numBones, C)``
+# (bone) and ``(B, C)`` (global) — i.e. *frame-less*.  The normalizer
+# buffers are 4-D / 3-D and treat a frame-less bone tensor as
+# ``(F, B, C)``, broadcasting in a phantom leading axis.  These helpers
+# add a singleton frame axis around the call so single-frame deltas
+# round-trip with the same statistics as the state.
+
+
+def normalizeStepDelta(
+    normalizer: MotionNormalizer,
+    boneDelta: torch.Tensor,
+    globalDelta: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Z-normalize frame-less bone/global deltas.
+
+    Parameters
+    ----------
+    normalizer : MotionNormalizer
+        A normalizer fitted on delta statistics.
+    boneDelta : torch.Tensor
+        Bone delta, shape ``(..., numBones, motionChannels)``.
+    globalDelta : torch.Tensor or None
+        Global delta, shape ``(..., globalChannels)``, or ``None``.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor | None]
+        Normalized ``(boneDelta, globalDelta)``.
+    """
+    normBone = normalizer.normalizeBone(boneDelta.unsqueeze(1)).squeeze(1)
+    normGlobal: torch.Tensor | None = None
+    if globalDelta is not None and normalizer.hasGlobalBranch:
+        normGlobal = normalizer.normalizeGlobal(
+            globalDelta.unsqueeze(1)
+        ).squeeze(1)
+    return normBone, normGlobal
+
+
+def denormalizeStepDelta(
+    normalizer: MotionNormalizer,
+    boneDelta: torch.Tensor,
+    globalDelta: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Inverse of :func:`normalizeStepDelta`."""
+    rawBone = normalizer.denormalizeBone(boneDelta.unsqueeze(1)).squeeze(1)
+    rawGlobal: torch.Tensor | None = None
+    if globalDelta is not None and normalizer.hasGlobalBranch:
+        rawGlobal = normalizer.denormalizeGlobal(
+            globalDelta.unsqueeze(1)
+        ).squeeze(1)
+    return rawBone, rawGlobal

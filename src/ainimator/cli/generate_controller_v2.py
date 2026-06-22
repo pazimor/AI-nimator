@@ -1,0 +1,90 @@
+"""CLI entry point — Goal C controller rollout / generation (phase C1).
+
+Zero logic: load a trained controller checkpoint, derive the
+ground-truth control for a dataset sample, roll the controller forward
+under that control and save the trajectory.
+
+Example
+-------
+``python -m ainimator.cli.generate_controller_v2 \\
+    --checkpoint output/controller_overfit/checkpoints/...pt \\
+    --dataset-root <preprocessed> --sample-index 0 \\
+    --output output/controller_rollout.pt``
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+from pathlib import Path
+
+import torch
+
+from ainimator.data.controller_sequences import (
+    ControllerSequenceConfig,
+    buildControllerSequences,
+)
+from ainimator.model.controller_rollout import rolloutController
+from ainimator.training.controller_training_v2 import (
+    loadControllerCheckpoint,
+    resolveControllerDevice,
+)
+from ainimator.training.training_v2 import loadDatasetSample
+
+
+def _parseArgs() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Goal C controller roll.")
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--dataset-root", type=Path, required=True)
+    parser.add_argument("--sample-index", type=int, default=0)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--device", type=str, default="auto")
+    return parser.parse_args()
+
+
+def main() -> None:
+    """Roll the controller forward under a sample's GT control."""
+    logging.basicConfig(level=logging.INFO)
+    args = _parseArgs()
+    device = resolveControllerDevice(args.device)
+    model, stateNorm, deltaNorm, controlMean, controlStd = (
+        loadControllerCheckpoint(args.checkpoint, device)
+    )
+    model = model.to(device).eval()
+    stateNorm = stateNorm.to(device)
+    deltaNorm = deltaNorm.to(device)
+
+    sample = loadDatasetSample(args.dataset_root, args.sample_index)
+    sequenceConfig = ControllerSequenceConfig(
+        contextFrames=model.config.contextFrames,
+        useAimDirection=model.config.useAimDirection,
+    )
+    batch = buildControllerSequences(
+        sample.rotation6d.to(device),
+        sample.rootTranslation.to(device),
+        sequenceConfig,
+    )
+    controlNorm = (batch.control - controlMean.to(device)) / controlStd.to(
+        device
+    )
+    rollout = rolloutController(
+        model,
+        stateNorm,
+        deltaNorm,
+        batch.boneWindow[:1],
+        batch.globalWindow[:1],
+        controlNorm.unsqueeze(0),
+    )
+    torch.save(
+        {
+            "rotation6d": rollout.rotation6d.detach().cpu(),
+            "rootTranslation": rollout.rootTranslation.detach().cpu(),
+        },
+        args.output,
+    )
+    logging.info("rollout saved to %s", args.output)
+
+
+if __name__ == "__main__":
+    main()
