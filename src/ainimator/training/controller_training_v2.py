@@ -37,6 +37,7 @@ from ainimator.health.controller_metrics import (
     meanCollapse,
     postNormStats,
     rolloutDrift,
+    rolloutDriftCurve,
 )
 from ainimator.model.controller_rollout import (
     RolloutResult,
@@ -55,6 +56,10 @@ from ainimator.model.motion_normalizer import (
     MotionNormalizer,
     denormalizeStepDelta,
     normalizeStepDelta,
+)
+from ainimator.training.controller_scheduled_sampling import (
+    scheduledSamplingProbability,
+    scheduledSamplingStep,
 )
 
 LOGGER = logging.getLogger("ainimator.training.controller")
@@ -95,6 +100,10 @@ class ControllerTrainingConfig:
         Log a loss line every N epochs.
     lossWeights : ControllerLossWeights
         Loss term weights.
+    scheduledSampling : float
+        Target scheduled-sampling probability (C4).  ``0`` keeps the fast
+        parallel teacher-forced loop; ``> 0`` enables the sequential
+        scheduled-sampling loop with a linear ramp ``0 → target``.
     """
 
     outputDir: Path
@@ -113,6 +122,7 @@ class ControllerTrainingConfig:
     lossWeights: ControllerLossWeights = field(
         default_factory=ControllerLossWeights
     )
+    scheduledSampling: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -127,6 +137,8 @@ class ControllerOverfitResult:
         Controller health metrics.
     verdicts : dict[str, Verdict]
         Contract verdicts keyed by contract name.
+    driftCurve : dict[int, float]
+        Rollout drift vs horizon (C4 "drift vs length" curve).
     checkpointPath : Path
         Saved checkpoint location.
     rolloutPath : Path
@@ -136,6 +148,7 @@ class ControllerOverfitResult:
     finalLoss: float
     metrics: dict[str, float]
     verdicts: dict[str, Verdict]
+    driftCurve: dict[int, float]
     checkpointPath: Path
     rolloutPath: Path
 
@@ -259,10 +272,16 @@ def _trainLoop(
     batch: ControllerSequenceBatch,
     tensors: dict[str, torch.Tensor],
     controlNorm: torch.Tensor,
+    stateNormalizer: MotionNormalizer,
     deltaNormalizer: MotionNormalizer,
     config: ControllerTrainingConfig,
 ) -> float:
-    """Full-batch overfit loop; return the final total loss."""
+    """Overfit loop; return the final total loss.
+
+    Uses the fast parallel teacher-forced step by default; when
+    ``config.scheduledSampling > 0`` it runs the sequential
+    scheduled-sampling step with a per-epoch ramped probability (C4).
+    """
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.learningRate,
@@ -272,9 +291,9 @@ def _trainLoop(
     model.train()
     for epoch in range(config.epochs):
         optimizer.zero_grad()
-        result = _forwardLosses(
-            model, batch, tensors, controlNorm, deltaNormalizer,
-            config.lossWeights,
+        result = _trainStep(
+            model, batch, tensors, controlNorm, stateNormalizer,
+            deltaNormalizer, config, epoch,
         )
         result.total.backward()
         optimizer.step()
@@ -282,6 +301,31 @@ def _trainLoop(
         if epoch % config.logEvery == 0 or epoch == config.epochs - 1:
             LOGGER.info("epoch %d — loss %.6f", epoch, lastLoss)
     return lastLoss
+
+
+def _trainStep(
+    model: MotionController,
+    batch: ControllerSequenceBatch,
+    tensors: dict[str, torch.Tensor],
+    controlNorm: torch.Tensor,
+    stateNormalizer: MotionNormalizer,
+    deltaNormalizer: MotionNormalizer,
+    config: ControllerTrainingConfig,
+    epoch: int,
+) -> ControllerLossResult:
+    """Dispatch to the teacher-forced or scheduled-sampling step."""
+    if config.scheduledSampling <= 0.0:
+        return _forwardLosses(
+            model, batch, tensors, controlNorm, deltaNormalizer,
+            config.lossWeights,
+        )
+    probability = scheduledSamplingProbability(
+        epoch, config.epochs, config.scheduledSampling
+    )
+    return scheduledSamplingStep(
+        model, batch, stateNormalizer, deltaNormalizer, controlNorm,
+        tensors, probability, config.lossWeights,
+    )
 
 
 def _normalizeTensors(
@@ -353,7 +397,9 @@ def _evaluate(
     stateNormalizer: MotionNormalizer,
     deltaNormalizer: MotionNormalizer,
     healthPath: Path,
-) -> tuple[dict[str, float], dict[str, Verdict], RolloutResult]:
+) -> tuple[
+    dict[str, float], dict[str, Verdict], dict[int, float], RolloutResult
+]:
     """Compute controller metrics, evaluate contracts, run a rollout."""
     model.eval()
     output = model(
@@ -375,6 +421,9 @@ def _evaluate(
     )
     gtBone, gtRoot = _groundTruthTrajectory(batch)
     drift = rolloutDrift(rollout, gtBone, gtRoot)
+    driftCurve = rolloutDriftCurve(
+        rollout, gtBone, gtRoot, _driftHorizons(rollout.rotation6d.shape[1])
+    )
     postNorm = max(
         postNormStats(tensors["normBoneWindow"]),
         postNormStats(tensors["normBoneDelta"]),
@@ -387,7 +436,14 @@ def _evaluate(
         "post_norm_stats": postNorm,
     }
     verdicts = _evaluateContracts(metrics, healthPath)
-    return metrics, verdicts, rollout
+    return metrics, verdicts, driftCurve, rollout
+
+
+def _driftHorizons(totalFrames: int) -> list[int]:
+    """Quartile horizons for the drift-vs-length curve (C4 health report)."""
+    quarters = [totalFrames // 4, totalFrames // 2,
+                (3 * totalFrames) // 4, totalFrames]
+    return sorted({max(1, horizon) for horizon in quarters})
 
 
 def _evaluateContracts(
@@ -438,11 +494,12 @@ def runControllerOverfit(
     tensors = _normalizeTensors(batch, stateNormalizer, deltaNormalizer)
 
     finalLoss = _trainLoop(
-        model, batch, tensors, controlNorm, deltaNormalizer, config
+        model, batch, tensors, controlNorm, stateNormalizer,
+        deltaNormalizer, config,
     )
 
     config.outputDir.mkdir(parents=True, exist_ok=True)
-    metrics, verdicts, rollout = _evaluate(
+    metrics, verdicts, driftCurve, rollout = _evaluate(
         model,
         batch,
         tensors,
@@ -465,6 +522,7 @@ def runControllerOverfit(
         finalLoss=finalLoss,
         metrics=metrics,
         verdicts=verdicts,
+        driftCurve=driftCurve,
         checkpointPath=checkpointPath,
         rolloutPath=rolloutPath,
     )

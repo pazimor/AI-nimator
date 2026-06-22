@@ -40,6 +40,7 @@ def _parseArgs() -> argparse.Namespace:
     parser.add_argument("--phase", type=str, default="none")
     parser.add_argument("--aim-direction", action="store_true")
     parser.add_argument("--foot-contact-weight", type=float, default=0.0)
+    parser.add_argument("--scheduled-sampling", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto")
     return parser.parse_args()
@@ -67,6 +68,7 @@ def main() -> None:
             geodesic=1.0,
             footContact=args.foot_contact_weight,
         ),
+        scheduledSampling=args.scheduled_sampling,
     )
     result = runControllerOverfit(
         sample.rotation6d, sample.rootTranslation, config

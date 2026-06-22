@@ -136,6 +136,50 @@ def rolloutDrift(
     return float((rotError + rootError).item())
 
 
+def rolloutDriftCurve(
+    rollout: RolloutResult,
+    groundTruthRotation6d: torch.Tensor,
+    groundTruthRootTranslation: torch.Tensor,
+    horizons: Iterable[int],
+) -> dict[int, float]:
+    """Cumulative rollout drift at increasing horizons (C4).
+
+    Produces the "drift vs rollout length" curve recorded in the health
+    report (ROADMAP_DETERMINIST C4): for each horizon ``h`` it measures
+    the trajectory error over the first ``h`` frames.  A healthy
+    long-horizon controller keeps this curve bounded (no freeze /
+    explosion).
+
+    Parameters
+    ----------
+    rollout : RolloutResult
+        The rolled-out trajectory.
+    groundTruthRotation6d, groundTruthRootTranslation : torch.Tensor
+        Reference trajectory aligned with the rollout frames.
+    horizons : Iterable[int]
+        Frame counts at which to evaluate the drift.
+
+    Returns
+    -------
+    dict[int, float]
+        Maps each (clamped) horizon to its drift value.
+    """
+    totalFrames = rollout.rotation6d.shape[1]
+    curve: dict[int, float] = {}
+    for horizon in horizons:
+        clamped = max(1, min(int(horizon), totalFrames))
+        truncated = RolloutResult(
+            rotation6d=rollout.rotation6d[:, :clamped],
+            rootTranslation=rollout.rootTranslation[:, :clamped],
+        )
+        curve[clamped] = rolloutDrift(
+            truncated,
+            groundTruthRotation6d[:, :clamped],
+            groundTruthRootTranslation[:, :clamped],
+        )
+    return curve
+
+
 def postNormStats(normalized: torch.Tensor) -> float:
     """Worst-case deviation of a normalized tensor from ``N(0, 1)``.
 
