@@ -55,6 +55,13 @@ def _parseArgs() -> argparse.Namespace:
         "also exported as an animation viewable in Blender.",
     )
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="Loop the GT-derived control (and phase) this many times to "
+        "drive a longer rollout — tests long-horizon stability.",
+    )
     parser.add_argument("--device", type=str, default="auto")
     return parser.parse_args()
 
@@ -101,8 +108,12 @@ def main() -> None:
     controlNorm = (batch.control - controlMean.to(device)) / controlStd.to(
         device
     )
+    repeat = max(1, int(args.repeat))
+    controlSequence = controlNorm.repeat(repeat, 1).unsqueeze(0)
     phaseSequence = (
-        None if batch.phase is None else batch.phase.unsqueeze(0)
+        None
+        if batch.phase is None
+        else batch.phase.repeat(repeat, 1).unsqueeze(0)
     )
     rollout = rolloutController(
         model,
@@ -110,7 +121,7 @@ def main() -> None:
         deltaNorm,
         batch.boneWindow[:1],
         batch.globalWindow[:1],
-        controlNorm.unsqueeze(0),
+        controlSequence,
         phaseSequence=phaseSequence,
     )
     torch.save(
