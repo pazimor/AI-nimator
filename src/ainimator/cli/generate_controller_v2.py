@@ -21,6 +21,7 @@ from pathlib import Path
 import torch
 
 from ainimator.core.config_loader import defaultPreprocessedDatasetRoot
+from ainimator.core.constants.controller import PhaseMode
 from ainimator.data.controller_sequences import (
     ControllerSequenceConfig,
     buildControllerSequences,
@@ -86,9 +87,11 @@ def main() -> None:
 
     datasetRoot = _resolveDatasetRoot(args.dataset_root)
     sample = loadDatasetSample(datasetRoot, args.sample_index)
+    needPhase = model.config.phaseMode is not PhaseMode.NONE
     sequenceConfig = ControllerSequenceConfig(
         contextFrames=model.config.contextFrames,
         useAimDirection=model.config.useAimDirection,
+        emitPhase=needPhase,
     )
     batch = buildControllerSequences(
         sample.rotation6d.to(device),
@@ -98,6 +101,9 @@ def main() -> None:
     controlNorm = (batch.control - controlMean.to(device)) / controlStd.to(
         device
     )
+    phaseSequence = (
+        None if batch.phase is None else batch.phase.unsqueeze(0)
+    )
     rollout = rolloutController(
         model,
         stateNorm,
@@ -105,6 +111,7 @@ def main() -> None:
         batch.boneWindow[:1],
         batch.globalWindow[:1],
         controlNorm.unsqueeze(0),
+        phaseSequence=phaseSequence,
     )
     torch.save(
         {
