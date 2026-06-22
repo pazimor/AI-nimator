@@ -23,7 +23,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal, Optional, Tuple
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # =====================================================================
@@ -279,6 +279,134 @@ class RegularisationConfigSchema(BaseModel, extra="forbid"):
     emaDecay: float = 0.0
     emaUseWarmup: bool = True
     weightDecay: float = 3e-4
+
+
+# =====================================================================
+# Goal C — deterministic controller schemas (ROADMAP_DETERMINIST §3.2)
+# =====================================================================
+
+_PHASE_MODES = Literal["none", "explicit", "learned"]
+_MODEL_TYPES = Literal["diffusion", "controller"]
+
+
+class ControllerLossesSchema(BaseModel, extra="forbid", populate_by_name=True):
+    """Loss toggles for the controller (kebab-case in YAML).
+
+    Attributes
+    ----------
+    velocityLoss : bool
+        L2 loss on regressed velocities (flag shared with v2).
+    footContactLoss : bool
+        FK foot-contact supervision (anti-skating).
+    geodesicRotation : bool
+        Geodesic loss on the 6D rotations.
+    """
+
+    velocityLoss: bool = Field(True, alias="velocity-loss")
+    footContactLoss: bool = Field(True, alias="foot-contact-loss")
+    geodesicRotation: bool = Field(True, alias="geodesic-rotation")
+
+
+class ControllerTrainingSchema(BaseModel, extra="forbid", populate_by_name=True):
+    """Controller training knobs (kebab-case in YAML).
+
+    Attributes
+    ----------
+    scheduledSampling : float
+        Scheduled-sampling target probability (ramped 0 → target in
+        C4).  Stays ``0.0`` until short-rollout validation passes.
+    """
+
+    scheduledSampling: float = Field(0.0, alias="scheduled-sampling")
+
+    @field_validator("scheduledSampling")
+    @classmethod
+    def _checkScheduledSampling(cls, value: float) -> float:
+        """Scheduled-sampling probability must be a valid probability."""
+        if not (0.0 <= value <= 1.0):
+            raise ValueError("scheduled-sampling must be in [0, 1].")
+        return value
+
+
+class ControllerConfigSchema(BaseModel, extra="forbid", populate_by_name=True):
+    """Strict schema for the ``v2.generation.controller`` YAML block.
+
+    ``extra="forbid"`` makes any unknown key raise a ``ValidationError``
+    that names the offending field — the C0 acceptance guard.
+
+    Attributes
+    ----------
+    autoregressive : bool
+        Whether the controller runs autoregressively (always ``True``).
+    phase : str
+        Locomotor phase regime (``none`` | ``explicit`` | ``learned``).
+    styleLatent : bool
+        DEFERRED (C3) — inject a style latent.  Must stay ``False``
+        until a style-labelled dataset exists.
+    contextFrames : int
+        Number of past frames seen per forward (C1 → 1).
+    losses : ControllerLossesSchema
+        Loss toggles.
+    training : ControllerTrainingSchema
+        Training knobs.
+    """
+
+    autoregressive: bool = True
+    phase: _PHASE_MODES = "explicit"
+    styleLatent: bool = Field(False, alias="style-latent")
+    contextFrames: int = Field(1, alias="context-frames")
+    losses: ControllerLossesSchema = ControllerLossesSchema()
+    training: ControllerTrainingSchema = ControllerTrainingSchema()
+
+    @field_validator("contextFrames")
+    @classmethod
+    def _checkContextFrames(cls, value: int) -> int:
+        """Context window must be at least one frame."""
+        if value < 1:
+            raise ValueError("context-frames must be >= 1.")
+        return value
+
+    @model_validator(mode="after")
+    def _checkStyleDeferred(self) -> "ControllerConfigSchema":
+        """Guard against enabling style latents before C3 ships."""
+        if self.styleLatent:
+            raise ValueError(
+                "style-latent must stay false: the current dataset has "
+                "no style labels (ROADMAP_DETERMINIST §1/§7). Enabling "
+                "it would train a style lever on data that cannot carry "
+                "it. Phase C3 wires this once a labelled dataset exists."
+            )
+        return self
+
+
+class GenerationModelSelectorSchema(
+    BaseModel, extra="forbid", populate_by_name=True
+):
+    """Engine selector read from ``v2.generation`` (§3.2).
+
+    Only the two Goal C fields are validated here; the diffusion
+    ``generation`` keys are parsed elsewhere and intentionally ignored.
+
+    Attributes
+    ----------
+    modelType : str
+        ``diffusion`` (default) or ``controller``.
+    controller : Optional[ControllerConfigSchema]
+        Controller block; required when ``modelType == "controller"``.
+    """
+
+    modelType: _MODEL_TYPES = Field("diffusion", alias="model-type")
+    controller: Optional[ControllerConfigSchema] = None
+
+    @model_validator(mode="after")
+    def _requireControllerBlock(self) -> "GenerationModelSelectorSchema":
+        """A controller run must carry a controller block."""
+        if self.modelType == "controller" and self.controller is None:
+            raise ValueError(
+                "model-type=controller requires a 'controller' block "
+                "under v2.generation."
+            )
+        return self
 
 
 # =====================================================================

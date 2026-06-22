@@ -30,6 +30,9 @@ from ainimator.core.types.network import (
     LearningRateHyperparameters,
     NetworkConfig,
 )
+from ainimator.core.config_schema import GenerationModelSelectorSchema
+from ainimator.core.constants.controller import PhaseMode
+from ainimator.core.types.controller import ControllerV2Config
 
 # Generation default values
 GENERATION_DEFAULT_BATCH_SIZE = 8
@@ -142,6 +145,88 @@ def _parseNetworkConfig(section: Dict[str, Any]) -> NetworkConfig:
             ),
             boneData=_parseBoneDataConfig(boneDataSection),
         ),
+    )
+
+
+def loadGenerationModelSelector(
+    configPath: Optional[Path] = None,
+    profile: str = "v2",
+) -> GenerationModelSelectorSchema:
+    """Load and validate the Goal C engine selector from network.yaml.
+
+    Reads only ``model-type`` and ``controller`` from
+    ``<profile>.generation``; the diffusion ``generation`` keys are left
+    untouched (validated elsewhere).  Unknown keys inside the
+    ``controller`` block raise a ``pydantic.ValidationError`` naming the
+    field (ROADMAP_DETERMINIST C0 acceptance).
+
+    Parameters
+    ----------
+    configPath : Optional[Path]
+        Path to network.yaml (defaults to the canonical location).
+    profile : str
+        Top-level profile name (``"v2"``).
+
+    Returns
+    -------
+    GenerationModelSelectorSchema
+        The validated selector (``modelType`` + optional controller).
+    """
+    resolved = (configPath or DEFAULT_NETWORK_CONFIG_PATH)
+    resolved = resolved.expanduser().resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(f"Network config missing: {resolved}")
+
+    payload = yaml.safe_load(resolved.read_text(encoding="utf-8")) or {}
+    section = payload.get(profile, {}) or {}
+    generationSection = section.get("generation", {}) or {}
+
+    selectorPayload: Dict[str, Any] = {}
+    if "model-type" in generationSection:
+        selectorPayload["model-type"] = generationSection["model-type"]
+    if "controller" in generationSection:
+        selectorPayload["controller"] = generationSection["controller"]
+    return GenerationModelSelectorSchema.model_validate(selectorPayload)
+
+
+def buildControllerV2Config(
+    selector: GenerationModelSelectorSchema,
+    embedDim: int,
+    numHeads: int,
+    numLayers: int,
+    numBones: int = 22,
+) -> ControllerV2Config:
+    """Map a validated selector onto a :class:`ControllerV2Config`.
+
+    Architecture dims come from the caller (CLI defaults / generation
+    block) the same way the denoiser dims do; the controller flags come
+    from the validated ``controller`` block.
+
+    Parameters
+    ----------
+    selector : GenerationModelSelectorSchema
+        A selector whose ``controller`` block is populated.
+    embedDim, numHeads, numLayers, numBones : int
+        Transformer dims (mirrors the denoiser wiring).
+
+    Returns
+    -------
+    ControllerV2Config
+    """
+    if selector.controller is None:
+        raise ValueError(
+            "buildControllerV2Config requires a populated controller "
+            "block (model-type=controller)."
+        )
+    controller = selector.controller
+    return ControllerV2Config(
+        embedDim=embedDim,
+        numHeads=numHeads,
+        numLayers=numLayers,
+        numBones=numBones,
+        contextFrames=controller.contextFrames,
+        phaseMode=PhaseMode(controller.phase),
+        styleLatentEnabled=controller.styleLatent,
     )
 
 

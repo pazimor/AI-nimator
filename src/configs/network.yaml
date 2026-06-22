@@ -47,11 +47,48 @@ v2:
       pelvis-height: false
 
   generation:
+    # ============================================================
+    # Goal C — engine selector (ROADMAP_DETERMINIST §3.2)
+    # ============================================================
+    # "diffusion" = canonical behaviour (default, nothing changes).
+    # "controller" = Goal C deterministic autoregressive engine.
+    # The training CLI reads this field; defaults keep diffusion.
+    model-type: diffusion          # diffusion | controller
+
+    controller:
+      autoregressive: true
+      phase: explicit              # none | explicit | learned
+      # DEFERRED: the current dataset (AMASS + HumanML3D/KIT captions)
+      # has no style labels (§1/§7).  Must stay false until C3.
+      style-latent: false
+      # Autoregressive context window (frames seen per forward).
+      context-frames: 1            # extended in C4 (long robustness)
+      losses:
+        velocity-loss: true        # flag already present in v2
+        foot-contact-loss: true
+        geodesic-rotation: true
+      training:
+        # Scheduled-sampling ramp 0 → target (fixes exposure bias).
+        # Stays 0 until short-rollout validation passes (C4).
+        scheduled-sampling: 0.0
+
     # MotionDenoiserV2 (Phase F): compact stack, cross-attn + FiLM +
     # per-block AdaLN.
-    embed-dim: 384
+    #
+    # B1-bis frozen recipe (2026-06-13) — the validated 640d/8L denoiser
+    # that solves N=1000 (retrieval 5/5 at cfg=6, LOG.md 2026-06-12).
+    # Capacity↔N law: params ≈ ∝ N (640/8 ≈ 90M holds N=1000).
+    #
+    # ⚠ NOTE: the v2 TRAINING path does NOT read this block.
+    # ``loadNetworkConfig`` (core/config_loader.py) is wired only into
+    # ``preprocess_dataset`` (feature toggles / bone-data).  The denoiser
+    # dims actually used come from the CLI defaults / V2FullTrainingConfig
+    # dataclass (currently 384/4/8) or explicit flags.  The AUTHORITATIVE
+    # B1-bis run config lives in ``scripts/consolidate_n1000_v2.py``.
+    # This block is kept in sync as canonical documentation.
+    embed-dim: 640
     num-heads: 8
-    num-layers: 4
+    num-layers: 8
     num-bones: 22
     diffusion-steps: 1000
     # No spatial/spatio-temporal pre-blocks in v2 — removed from

@@ -6,6 +6,12 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .batch import V2Batch
+from .controller import (
+    ControlSignal,
+    ControllerState,
+    ControllerV2Config,
+    StylePreset,
+)
 from .datasets import (
     DatasetBuildOptions,
     DatasetBuildReport,
@@ -118,4 +124,9 @@ __all__ = [
     "LearningRateHyperparameters",
     "NetworkConfig",
     "V2Batch",
+    # Goal C — deterministic controller types
+    "ControlSignal",
+    "ControllerState",
+    "ControllerV2Config",
+    "StylePreset",
 ]
