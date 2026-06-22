@@ -49,6 +49,7 @@ from ainimator.model.denoiser_v2 import (
     DenoiserOutput,
     MotionDenoiserV2,
 )
+from ainimator.model.controller_v2 import MotionController
 
 logger = logging.getLogger(__name__)
 
@@ -362,6 +363,44 @@ class _DenoiserStepWrapper(nn.Module):
 
 
 # -----------------------------------------------------------------------
+# Controller wrapper — one frame (Goal C, phase C5)
+# -----------------------------------------------------------------------
+class _ControllerStepWrapper(nn.Module):
+    """Thin wrapper for exporting a single controller forward via ONNX.
+
+    The autoregressive rollout loop stays in the engine; only this one
+    frame-to-delta forward — the graph the NPU accelerates — is exported
+    (ROADMAP_DETERMINIST §2.1 truth #10).  The :class:`ControllerOutput`
+    dataclass is flattened to plain tensors.
+
+    The ``phase`` input is included only when the model uses phase
+    conditioning (``phaseChannels > 0``); ``style`` is excluded (deferred
+    C3).
+    """
+
+    def __init__(self, controller: MotionController) -> None:
+        super().__init__()
+        self.controller = controller
+
+    def forward(
+        self,
+        boneWindow: torch.Tensor,
+        control: torch.Tensor,
+        globalWindow: torch.Tensor,
+        phase: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one forward; return ``(boneDelta, globalDelta)``."""
+        out = self.controller(
+            boneWindow, control, globalWindow=globalWindow, phase=phase
+        )
+        assert out.globalDelta is not None, (
+            "Controller returned None globalDelta; "
+            "rebuild with globalChannels > 0."
+        )
+        return out.boneDelta, out.globalDelta
+
+
+# -----------------------------------------------------------------------
 # Public export functions
 # -----------------------------------------------------------------------
 def exportEncoder(
@@ -532,6 +571,77 @@ def exportDenoiser(
     logger.info(
         "Denoiser step exported and verified: %s", outputPath
     )
+    return outputPath
+
+
+def exportController(
+    controller: MotionController,
+    outputPath: Path,
+    batchSize: int = 1,
+    opsetVersion: int = ONNX_OPSET_VERSION,
+) -> Path:
+    """Export a single controller forward to ONNX (Goal C, phase C5).
+
+    The rollout loop stays in Python/the engine; only one frame-to-delta
+    forward is exported.  A deep copy with all ``nn.MultiheadAttention``
+    replaced by :class:`_OnnxMHAReplace` is used so the original model is
+    never mutated.  Dynamic axes: batch and the context-window length.
+
+    Parameters
+    ----------
+    controller : MotionController
+        Model to export (eval mode is set; weights unchanged).
+    outputPath : Path
+        Destination ``.onnx`` file path.
+    batchSize : int
+        Concrete batch size for the tracing example.
+    opsetVersion : int
+        ONNX opset version.
+
+    Returns
+    -------
+    Path
+        The written ``.onnx`` file path.
+    """
+    outputPath.parent.mkdir(parents=True, exist_ok=True)
+    exportReady = _replaceAllMHA(copy.deepcopy(controller))
+    wrapper = _ControllerStepWrapper(exportReady)  # type: ignore[arg-type]
+    wrapper.eval()
+
+    config = controller.config
+    window = config.contextFrames
+    boneWindow = torch.randn(
+        batchSize, window, config.numBones, config.motionChannels
+    )
+    control = torch.randn(batchSize, config.controlChannels)
+    globalWindow = torch.randn(batchSize, window, config.globalChannels)
+
+    inputNames = ["bone_window", "control", "global_window"]
+    dynamicAxes: dict[str, dict[int, str]] = {
+        "bone_window": {0: "batch", 1: "context"},
+        "control": {0: "batch"},
+        "global_window": {0: "batch", 1: "context"},
+        "bone_delta": {0: "batch"},
+        "global_delta": {0: "batch"},
+    }
+    exampleInputs: tuple[Any, ...] = (boneWindow, control, globalWindow)
+    if config.phaseChannels > 0:
+        phase = torch.randn(batchSize, config.phaseChannels)
+        exampleInputs = (boneWindow, control, globalWindow, phase)
+        inputNames.append("phase")
+        dynamicAxes["phase"] = {0: "batch"}
+
+    _runExport(
+        wrapper=wrapper,
+        exampleInputs=exampleInputs,
+        outputPath=outputPath,
+        inputNames=inputNames,
+        outputNames=["bone_delta", "global_delta"],
+        dynamicAxes=dynamicAxes,
+        opsetVersion=opsetVersion,
+    )
+    _verifyModel(outputPath)
+    logger.info("Controller forward exported and verified: %s", outputPath)
     return outputPath
 
 

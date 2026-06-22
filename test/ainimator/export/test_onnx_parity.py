@@ -532,3 +532,121 @@ class TestDenoiserOnnxParity:
                 _BATCH, newFrames, _NUM_BONES, _MOTION_CH
             )
             assert ortGlobal.shape == (_BATCH, newFrames, _GLOBAL_CH)
+
+
+# ---------------------------------------------------------------------------
+# Controller parity (Goal C, phase C5)
+# ---------------------------------------------------------------------------
+from ainimator.core.constants.controller import PhaseMode  # noqa: E402
+from ainimator.core.types.controller import (  # noqa: E402
+    ControllerV2Config,
+)
+from ainimator.model.controller_v2 import MotionController  # noqa: E402
+from ainimator.export.onnx import exportController  # noqa: E402
+
+_CONTEXT = 1
+
+
+def _makeController(phaseMode: PhaseMode = PhaseMode.NONE) -> MotionController:
+    """Build a minimal controller for export tests."""
+    config = ControllerV2Config(
+        embedDim=_EMBED_DIM,
+        numHeads=_NUM_HEADS,
+        numLayers=_NUM_LAYERS,
+        numBones=_NUM_BONES,
+        motionChannels=_MOTION_CH,
+        globalChannels=_GLOBAL_CH,
+        contextFrames=_CONTEXT,
+        phaseMode=phaseMode,
+        dropout=0.0,
+    )
+    model = MotionController(config)
+    model.eval()
+    return model
+
+
+class TestControllerOnnxParity:
+    """Export controller → run ORT → compare to PyTorch (CI §2.10)."""
+
+    def test_controller_export_produces_valid_onnx(self) -> None:
+        """onnx.checker must pass on the exported controller graph."""
+        import onnx
+
+        controller = _makeController()
+        with tempfile.TemporaryDirectory() as tmpDir:
+            outPath = Path(tmpDir) / "controller.onnx"
+            exportController(controller, outPath, batchSize=_BATCH)
+            assert outPath.exists()
+            onnx.checker.check_model(onnx.load(str(outPath)))
+
+    def test_controller_ort_vs_torch(self) -> None:
+        """ORT delta outputs must match PyTorch within tolerance."""
+        controller = _makeController()
+        bone = torch.randn(_BATCH, _CONTEXT, _NUM_BONES, _MOTION_CH)
+        control = torch.randn(_BATCH, controller.config.controlChannels)
+        glob = torch.randn(_BATCH, _CONTEXT, _GLOBAL_CH)
+        with torch.no_grad():
+            out = controller(bone, control, globalWindow=glob)
+
+        with tempfile.TemporaryDirectory() as tmpDir:
+            outPath = Path(tmpDir) / "controller.onnx"
+            exportController(controller, outPath, batchSize=_BATCH)
+            session = _ortSession(outPath)
+            feeds = {
+                "bone_window": bone.numpy(),
+                "control": control.numpy(),
+                "global_window": glob.numpy(),
+            }
+            ortBone, ortGlobal = session.run(None, feeds)
+
+        assert _maxAbsDiff(out.boneDelta, ortBone) <= ONNX_PARITY_TOLERANCE
+        assert out.globalDelta is not None
+        assert (
+            _maxAbsDiff(out.globalDelta, ortGlobal) <= ONNX_PARITY_TOLERANCE
+        )
+
+    def test_controller_dynamic_batch(self) -> None:
+        """Exported controller runs with a different batch size."""
+        controller = _makeController()
+        with tempfile.TemporaryDirectory() as tmpDir:
+            outPath = Path(tmpDir) / "controller.onnx"
+            exportController(controller, outPath, batchSize=_BATCH)
+            session = _ortSession(outPath)
+            newBatch = 5
+            feeds = {
+                "bone_window": torch.randn(
+                    newBatch, _CONTEXT, _NUM_BONES, _MOTION_CH
+                ).numpy(),
+                "control": torch.randn(
+                    newBatch, controller.config.controlChannels
+                ).numpy(),
+                "global_window": torch.randn(
+                    newBatch, _CONTEXT, _GLOBAL_CH
+                ).numpy(),
+            }
+            ortBone, ortGlobal = session.run(None, feeds)
+            assert ortBone.shape == (newBatch, _NUM_BONES, _MOTION_CH)
+            assert ortGlobal.shape == (newBatch, _GLOBAL_CH)
+
+    def test_controller_with_explicit_phase_exports(self) -> None:
+        """A phase-conditioned controller exports and matches PyTorch."""
+        controller = _makeController(PhaseMode.EXPLICIT)
+        bone = torch.randn(_BATCH, _CONTEXT, _NUM_BONES, _MOTION_CH)
+        control = torch.randn(_BATCH, controller.config.controlChannels)
+        glob = torch.randn(_BATCH, _CONTEXT, _GLOBAL_CH)
+        phase = torch.randn(_BATCH, controller.config.phaseChannels)
+        with torch.no_grad():
+            out = controller(bone, control, globalWindow=glob, phase=phase)
+
+        with tempfile.TemporaryDirectory() as tmpDir:
+            outPath = Path(tmpDir) / "controller_phase.onnx"
+            exportController(controller, outPath, batchSize=_BATCH)
+            session = _ortSession(outPath)
+            feeds = {
+                "bone_window": bone.numpy(),
+                "control": control.numpy(),
+                "global_window": glob.numpy(),
+                "phase": phase.numpy(),
+            }
+            ortBone, _ortGlobal = session.run(None, feeds)
+        assert _maxAbsDiff(out.boneDelta, ortBone) <= ONNX_PARITY_TOLERANCE

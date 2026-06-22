@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 _ENCODER_COMMAND = "encoder"
 _DENOISER_COMMAND = "denoiser"
+_CONTROLLER_COMMAND = "controller"
 
 
 def _buildParser() -> argparse.ArgumentParser:
@@ -96,6 +97,32 @@ def _buildParser() -> argparse.ArgumentParser:
     denParser.add_argument(
         "--text-len", type=int, default=16, metavar="N"
     )
+
+    # --- controller sub-command (Goal C, phase C5) ---------------------
+    ctrlParser = sub.add_parser(
+        _CONTROLLER_COMMAND,
+        help="Export one controller forward (rollout loop stays in C#/C++).",
+    )
+    ctrlParser.add_argument(
+        "--checkpoint",
+        type=Path,
+        required=True,
+        metavar="FILE",
+        help="Path to a controller checkpoint (.pt).",
+    )
+    ctrlParser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("output/onnx/controller_step.onnx"),
+        metavar="FILE",
+        help=(
+            "Destination .onnx file.  "
+            "Default: output/onnx/controller_step.onnx"
+        ),
+    )
+    ctrlParser.add_argument(
+        "--batch-size", type=int, default=1, metavar="N"
+    )
     return parser
 
 
@@ -160,6 +187,35 @@ def _exportDenoiser(args: argparse.Namespace) -> None:
     print(f"Denoiser step exported to {args.output}")
 
 
+def _exportController(args: argparse.Namespace) -> None:
+    """Load a controller checkpoint and export one forward to ONNX.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed CLI arguments for the ``controller`` sub-command.
+    """
+    from ainimator.training.controller_training_v2 import (
+        loadControllerCheckpoint,
+    )
+    from ainimator.export.onnx import exportController
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(message)s",
+    )
+    model, _stateNorm, _deltaNorm, _mean, _std = loadControllerCheckpoint(
+        args.checkpoint, device=None
+    )
+    model.eval()
+    exportController(
+        controller=model,
+        outputPath=args.output,
+        batchSize=args.batch_size,
+    )
+    print(f"Controller forward exported to {args.output}")
+
+
 def main() -> None:
     """Entry point for ``python -m ainimator.cli.export_onnx``."""
     parser = _buildParser()
@@ -169,6 +225,8 @@ def main() -> None:
         _exportEncoder(args)
     elif args.command == _DENOISER_COMMAND:
         _exportDenoiser(args)
+    elif args.command == _CONTROLLER_COMMAND:
+        _exportController(args)
     else:
         parser.print_help()
         sys.exit(1)

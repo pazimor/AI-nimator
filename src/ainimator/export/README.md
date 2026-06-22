@@ -13,6 +13,32 @@ CoreML Execution Provider.  This document lists what is forbidden in any
 |---|---|---|
 | `CustomTextEncoder` | Full `encode()` path (inputIds → hiddenStates + mask) | `export_onnx encoder` |
 | `MotionDenoiserV2` | **One denoising step** (noisy motion + timestep + text → clean) | `export_onnx denoiser` |
+| `MotionController` (Goal C) | **One frame forward** (state window + control [+ phase] → Δstate) | `export_onnx controller` |
+
+### Controller export (Goal C, phase C5)
+
+The deterministic controller is the engine ONNX export was *designed*
+for (ROADMAP_DETERMINIST §2.1 truth #10): a single forward per frame, no
+internal schedule, no debruitage loop.  The exported graph is exactly one
+`MotionController.forward`:
+
+| Input | Shape | Notes |
+|---|---|---|
+| `bone_window` | `(B, K, 22, 6)` | last `K = contextFrames` rotation6d frames |
+| `control` | `(B, controlChannels)` | planar velocity [+ aim direction] |
+| `global_window` | `(B, K, 3)` | last `K` root_translation frames |
+| `phase` | `(B, phaseChannels)` | present only when `phaseMode != none` |
+
+Outputs `bone_delta (B, 22, 6)` and `global_delta (B, 3)` — the
+**normalized** next-frame deltas.  De/normalization (state + delta
+stats) and the autoregressive accumulation `state += Δ` happen in the
+engine (C#/C++ — Unity Sentis / Unreal NNE), **outside** the graph,
+exactly like the DDIM loop for diffusion.  Foot-lock IK and physics
+blending are post-process, also engine-side.
+
+Dynamic axes: `batch` and `context` (the window length `K`).  The
+positional-encoding buffer is sized to `maxFrames`, so a longer context
+window does not require re-exporting.
 
 The **DDIM sampling loop** stays in Python (`ainimator.model.sampler_v2`).
 It calls the denoiser repeatedly and orchestrates CFG.  It is NOT in the
@@ -115,6 +141,7 @@ Both exports declare dynamic axes so the graph is not shape-locked:
 | `batch` | All batch-size dimensions |
 | `frames` | Motion sequence length (denoiser) |
 | `text_len` | Text token sequence length (both) |
+| `context` | Controller context-window length `K` |
 
 Re-exporting after adding a new input that has a fixed shape will silently
 lock that dimension.  Always check that new inputs appear in the

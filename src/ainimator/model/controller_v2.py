@@ -203,8 +203,11 @@ class MotionController(nn.Module):
             frameInputDim += embedDim
         self.frameProj = nn.Linear(frameInputDim, embedDim)
 
+        # Sized to maxFrames (not contextFrames) so the context-window
+        # axis can stay a dynamic ONNX axis (C5) without resizing the PE
+        # buffer.  The buffer is non-learned, so the cost is negligible.
         self.posEncoder = SinusoidalPositionalEncoding(
-            embedDim, maxLen=max(config.contextFrames, 1)
+            embedDim, maxLen=max(config.maxFrames, config.contextFrames)
         )
         self.embedDropout = nn.Dropout(config.dropout)
 
