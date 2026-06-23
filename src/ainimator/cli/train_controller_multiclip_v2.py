@@ -47,12 +47,15 @@ def _parseArgs() -> argparse.Namespace:
     parser.add_argument("--num-clips", type=int, default=8)
     parser.add_argument("--min-frames", type=int, default=200)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--epochs", type=int, default=400)
+    parser.add_argument("--epochs", type=int, default=1500)
     parser.add_argument("--context-frames", type=int, default=8)
     parser.add_argument("--embed-dim", type=int, default=256)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--num-layers", type=int, default=4)
-    parser.add_argument("--learning-rate", type=float, default=5e-4)
+    # 1e-3 matches the single-clip default; 5e-4 under-optimised the
+    # multi-clip run (debug 2026-06-23: 4 clips lr5e-4/400ep=0.55 vs
+    # lr1e-3/1000ep=0.17).
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--phase", type=str, default="none")
     parser.add_argument("--aim-direction", action="store_true")
     parser.add_argument("--foot-contact-weight", type=float, default=0.0)
