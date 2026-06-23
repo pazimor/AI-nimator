@@ -26,8 +26,13 @@ from ainimator.data.controller_sequences import (
     ControllerSequenceConfig,
     buildControllerSequences,
 )
-from ainimator.model.controller_rollout import rolloutController
+from ainimator.model.controller_rollout import (
+    RolloutResult,
+    rolloutController,
+    rolloutControllerClosedLoop,
+)
 from ainimator.training.controller_training_v2 import (
+    _groundTruthTrajectory,
     loadControllerCheckpoint,
     resolveControllerDevice,
 )
@@ -60,7 +65,21 @@ def _parseArgs() -> argparse.Namespace:
         type=int,
         default=1,
         help="Loop the GT-derived control (and phase) this many times to "
-        "drive a longer rollout — tests long-horizon stability.",
+        "drive a longer rollout.",
+    )
+    parser.add_argument(
+        "--reinject",
+        type=int,
+        default=0,
+        help="Closed-loop: re-inject ground truth every N frames (models "
+        "engine re-grounding). 0 = pure open-loop. Use a small N (e.g. 32) "
+        "to keep a long --repeat animation clean.",
+    )
+    parser.add_argument(
+        "--dae-gt",
+        type=Path,
+        default=None,
+        help="Also export the ground-truth base animation of the sample.",
     )
     parser.add_argument("--device", type=str, default="auto")
     return parser.parse_args()
@@ -115,14 +134,10 @@ def main() -> None:
         if batch.phase is None
         else batch.phase.repeat(repeat, 1).unsqueeze(0)
     )
-    rollout = rolloutController(
-        model,
-        stateNorm,
-        deltaNorm,
-        batch.boneWindow[:1],
-        batch.globalWindow[:1],
-        controlSequence,
-        phaseSequence=phaseSequence,
+    gtBone, gtRoot = _groundTruthTrajectory(batch)
+    rollout = _generate(
+        model, stateNorm, deltaNorm, batch, controlSequence, phaseSequence,
+        gtBone, gtRoot, model.config.contextFrames, repeat, int(args.reinject),
     )
     torch.save(
         {
@@ -134,6 +149,57 @@ def main() -> None:
     logging.info("rollout saved to %s", args.output)
     if args.dae is not None:
         _exportRolloutDae(rollout, args.dae, args.fps)
+    if args.dae_gt is not None:
+        _exportRolloutDae(
+            RolloutResult(rotation6d=gtBone, rootTranslation=gtRoot),
+            args.dae_gt, args.fps,
+        )
+        logging.info("ground-truth base animation -> %s", args.dae_gt)
+
+
+def _generate(
+    model: object,
+    stateNorm: object,
+    deltaNorm: object,
+    batch: object,
+    controlSequence: torch.Tensor,
+    phaseSequence: torch.Tensor | None,
+    gtBone: torch.Tensor,
+    gtRoot: torch.Tensor,
+    contextFrames: int,
+    repeat: int,
+    reinject: int,
+) -> RolloutResult:
+    """Open-loop, or closed-loop (GT re-injection) when ``reinject > 0``."""
+    if reinject <= 0:
+        return rolloutController(
+            model, stateNorm, deltaNorm, batch.boneWindow[:1],  # type: ignore[attr-defined]
+            batch.globalWindow[:1], controlSequence,  # type: ignore[attr-defined]
+            phaseSequence=phaseSequence,
+        )
+    tiledBone, tiledRoot = _tileGroundTruth(
+        gtBone, gtRoot, contextFrames, repeat
+    )
+    return rolloutControllerClosedLoop(
+        model, stateNorm, deltaNorm, tiledBone, tiledRoot, controlSequence,
+        reinject, phaseSequence=phaseSequence,
+    )
+
+
+def _tileGroundTruth(
+    gtBone: torch.Tensor,
+    gtRoot: torch.Tensor,
+    contextFrames: int,
+    repeat: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Repeat the GT targets ``repeat`` times after the seed window."""
+    seedBone, targetBone = gtBone[:, :contextFrames], gtBone[:, contextFrames:]
+    seedRoot, targetRoot = gtRoot[:, :contextFrames], gtRoot[:, contextFrames:]
+    bone = torch.cat(
+        [seedBone, targetBone.repeat(1, repeat, 1, 1)], dim=1
+    )
+    root = torch.cat([seedRoot, targetRoot.repeat(1, repeat, 1)], dim=1)
+    return bone, root
 
 
 def _exportRolloutDae(rollout: object, daePath: Path, fps: int) -> None:
