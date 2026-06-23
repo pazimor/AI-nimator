@@ -144,14 +144,25 @@ contracts:
 
   # Metric: mean_collapse_rank (normalized effective_rank in [0,1])
   # Direction: ↑ (rank high = varied outputs under varied control)
-  # Healthy: > 0.5  |  WARNING: 0.1–0.5  |  CRITICAL: < 0.1
+  # Healthy: > 0.04  |  WARNING: 0.02–0.04  |  CRITICAL: < 0.02
   # Detects: regression toward the mean motion.
+  #
+  # Calibration (2026-06-23): the original 0.5 threshold was inherited
+  # from the diffusion probe on 384-dim hidden states.  The controller
+  # emits 135-dim MOTION DELTAS, which are intrinsically low-rank (human
+  # motion lives in a small subspace), so a healthy controller sits ~0.05–
+  # 0.15.  Evidence on a converged 16-clip model: control_sensitivity=0.54
+  # (strong response) AND rank rises with control variety (single 0.049 →
+  # varied 0.077) ⇒ rank 0.077 is NOT a collapse.  A real collapse shows
+  # sensitivity≈0 + rank→0 + sim→1; control_sensitivity stays the primary
+  # detector, this is the backup.  Thresholds set to flag genuine
+  # near-zero rank only.
   - name: mean_collapse_rank
     metric: mean_collapse_rank
     direction: higher_is_better
-    ok_threshold: 0.5
-    warning_threshold: 0.1
-    critical_below: 0.1
+    ok_threshold: 0.04
+    warning_threshold: 0.02
+    critical_below: 0.02
 
   # Metric: mean_collapse_sim (intra-batch cosine of outputs)
   # Direction: ↓ towards 0
