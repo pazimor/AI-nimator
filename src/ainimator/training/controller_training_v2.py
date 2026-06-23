@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 import torch
 
@@ -104,6 +105,12 @@ class ControllerTrainingConfig:
         Target scheduled-sampling probability (C4).  ``0`` keeps the fast
         parallel teacher-forced loop; ``> 0`` enables the sequential
         scheduled-sampling loop with a linear ramp ``0 → target``.
+    resumeCheckpoint : Optional[Path]
+        Warm-start: load model + normalizers + control stats from this
+        checkpoint instead of building fresh.  The architecture and
+        normalization come from the checkpoint (arch flags are ignored).
+        This is the correct way to apply scheduled sampling — fine-tune a
+        teacher-forced-converged model, not train SS from scratch.
     """
 
     outputDir: Path
@@ -123,6 +130,7 @@ class ControllerTrainingConfig:
         default_factory=ControllerLossWeights
     )
     scheduledSampling: float = 0.0
+    resumeCheckpoint: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -459,6 +467,96 @@ def _evaluateContracts(
 
 
 # ---------------------------------------------------------------------
+# Component preparation (fresh vs warm-start / resume)
+# ---------------------------------------------------------------------
+_PreparedComponents = tuple[
+    MotionController,
+    MotionNormalizer,
+    MotionNormalizer,
+    torch.Tensor,
+    torch.Tensor,
+    ControllerSequenceBatch,
+    torch.Tensor,
+]
+
+
+def _prepareFresh(
+    config: ControllerTrainingConfig,
+    clipRotation6d: torch.Tensor,
+    clipRootTranslation: torch.Tensor,
+    device: torch.device,
+) -> _PreparedComponents:
+    """Build a fresh model + normalizers fitted on the clip."""
+    numBones = int(clipRotation6d.shape[-2])
+    sequenceConfig = ControllerSequenceConfig(
+        contextFrames=config.contextFrames,
+        useAimDirection=config.useAimDirection,
+        emitPhase=config.phaseMode is not PhaseMode.NONE,
+        emitContacts=config.lossWeights.footContact > 0.0,
+    )
+    batch = buildControllerSequences(
+        clipRotation6d.to(device), clipRootTranslation.to(device),
+        sequenceConfig,
+    )
+    stateNormalizer, deltaNormalizer = _fitNormalizers(batch, numBones)
+    model = MotionController(
+        buildControllerModelConfig(config, numBones)
+    ).to(device)
+    controlNorm, controlMean, controlStd = _standardiseControl(batch.control)
+    return (
+        model,
+        stateNormalizer.to(device),
+        deltaNormalizer.to(device),
+        controlMean,
+        controlStd,
+        batch,
+        controlNorm,
+    )
+
+
+def _prepareResumed(
+    config: ControllerTrainingConfig,
+    clipRotation6d: torch.Tensor,
+    clipRootTranslation: torch.Tensor,
+    device: torch.device,
+) -> _PreparedComponents:
+    """Warm-start: load model + normalizers + control stats (C4 fine-tune).
+
+    Architecture and normalization come from the checkpoint, so the
+    fine-tune is numerically consistent with the resumed model.  The
+    sequence layout (context / phase / aim) is derived from the loaded
+    model config, not the training-config arch flags.
+    """
+    assert config.resumeCheckpoint is not None
+    model, stateNormalizer, deltaNormalizer, controlMean, controlStd = (
+        loadControllerCheckpoint(config.resumeCheckpoint, device)
+    )
+    model = model.to(device)
+    sequenceConfig = ControllerSequenceConfig(
+        contextFrames=model.config.contextFrames,
+        useAimDirection=model.config.useAimDirection,
+        emitPhase=model.config.phaseMode is not PhaseMode.NONE,
+        emitContacts=config.lossWeights.footContact > 0.0,
+    )
+    batch = buildControllerSequences(
+        clipRotation6d.to(device), clipRootTranslation.to(device),
+        sequenceConfig,
+    )
+    controlNorm = (
+        batch.control - controlMean.to(device)
+    ) / controlStd.to(device)
+    return (
+        model,
+        stateNormalizer.to(device),
+        deltaNormalizer.to(device),
+        controlMean,
+        controlStd,
+        batch,
+        controlNorm,
+    )
+
+
+# ---------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------
 def runControllerOverfit(
@@ -470,27 +568,23 @@ def runControllerOverfit(
     """Overfit one clip, roll it out, and gate on the C1 contracts."""
     torch.manual_seed(config.seed)
     device = resolveControllerDevice(config.device)
-    numBones = int(clipRotation6d.shape[-2])
-
-    sequenceConfig = ControllerSequenceConfig(
-        contextFrames=config.contextFrames,
-        useAimDirection=config.useAimDirection,
-        emitPhase=config.phaseMode is not PhaseMode.NONE,
-        emitContacts=config.lossWeights.footContact > 0.0,
-    )
-    batch = buildControllerSequences(
-        clipRotation6d.to(device),
-        clipRootTranslation.to(device),
-        sequenceConfig,
-    )
-    stateNormalizer, deltaNormalizer = _fitNormalizers(batch, numBones)
-    stateNormalizer = stateNormalizer.to(device)
-    deltaNormalizer = deltaNormalizer.to(device)
-
-    model = MotionController(
-        buildControllerModelConfig(config, numBones)
-    ).to(device)
-    controlNorm, controlMean, controlStd = _standardiseControl(batch.control)
+    if config.resumeCheckpoint is not None:
+        components = _prepareResumed(
+            config, clipRotation6d, clipRootTranslation, device
+        )
+    else:
+        components = _prepareFresh(
+            config, clipRotation6d, clipRootTranslation, device
+        )
+    (
+        model,
+        stateNormalizer,
+        deltaNormalizer,
+        controlMean,
+        controlStd,
+        batch,
+        controlNorm,
+    ) = components
     tensors = _normalizeTensors(batch, stateNormalizer, deltaNormalizer)
 
     finalLoss = _trainLoop(

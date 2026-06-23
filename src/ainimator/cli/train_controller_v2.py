@@ -48,6 +48,14 @@ def _parseArgs() -> argparse.Namespace:
     parser.add_argument("--aim-direction", action="store_true")
     parser.add_argument("--foot-contact-weight", type=float, default=0.0)
     parser.add_argument("--scheduled-sampling", type=float, default=0.0)
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="Warm-start from a controller checkpoint (.pt). Architecture "
+        "and normalization come from it; arch flags are ignored. Use this "
+        "to fine-tune with --scheduled-sampling instead of from scratch.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto")
     return parser.parse_args()
@@ -91,6 +99,7 @@ def main() -> None:
             footContact=args.foot_contact_weight,
         ),
         scheduledSampling=args.scheduled_sampling,
+        resumeCheckpoint=args.resume,
     )
     result = runControllerOverfit(
         sample.rotation6d, sample.rootTranslation, config

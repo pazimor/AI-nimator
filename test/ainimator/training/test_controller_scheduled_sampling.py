@@ -14,6 +14,7 @@ from ainimator.training.controller_scheduled_sampling import (
 )
 from ainimator.training.controller_training_v2 import (
     ControllerTrainingConfig,
+    loadControllerCheckpoint,
     runControllerOverfit,
 )
 
@@ -81,3 +82,64 @@ def test_scheduled_sampling_trains_and_reports_drift_curve(
     assert horizons[-1] >= horizons[0]
     for value in result.driftCurve.values():
         assert math.isfinite(value)
+
+
+def test_scheduled_sampling_warm_start_from_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """SS fine-tunes a teacher-forced checkpoint (the correct recipe)."""
+    rotation6d, rootTranslation = _syntheticClip()
+    teacherForced = ControllerTrainingConfig(
+        outputDir=tmp_path / "tf",
+        epochs=120,
+        device="cpu",
+        embedDim=64,
+        numHeads=4,
+        numLayers=2,
+        contextFrames=4,
+        logEvery=999,
+        seed=0,
+    )
+    tfResult = runControllerOverfit(
+        rotation6d, rootTranslation, teacherForced
+    )
+    fineTune = ControllerTrainingConfig(
+        outputDir=tmp_path / "ss",
+        epochs=40,
+        device="cpu",
+        logEvery=999,
+        scheduledSampling=0.25,
+        resumeCheckpoint=tfResult.checkpointPath,
+    )
+    ssResult = runControllerOverfit(rotation6d, rootTranslation, fineTune)
+    assert math.isfinite(ssResult.finalLoss)
+    # The resumed model kept the checkpoint architecture (ctx=4), not the
+    # fine-tune config defaults (ctx=1).
+    model, _s, _d, _m, _st = loadControllerCheckpoint(ssResult.checkpointPath)
+    assert model.config.contextFrames == 4
+
+
+def test_resume_preserves_architecture(tmp_path: Path) -> None:
+    rotation6d, rootTranslation = _syntheticClip(frames=48)
+    base = ControllerTrainingConfig(
+        outputDir=tmp_path / "base",
+        epochs=20,
+        device="cpu",
+        embedDim=64,
+        numHeads=4,
+        numLayers=2,
+        contextFrames=3,
+        logEvery=999,
+    )
+    baseResult = runControllerOverfit(rotation6d, rootTranslation, base)
+    resumed = ControllerTrainingConfig(
+        outputDir=tmp_path / "resumed",
+        epochs=10,
+        device="cpu",
+        logEvery=999,
+        resumeCheckpoint=baseResult.checkpointPath,
+    )
+    result = runControllerOverfit(rotation6d, rootTranslation, resumed)
+    model, _s, _d, _m, _st = loadControllerCheckpoint(result.checkpointPath)
+    assert model.config.contextFrames == 3
+    assert model.config.embedDim == 64
