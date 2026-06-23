@@ -101,6 +101,69 @@ def rolloutController(
     )
 
 
+@torch.no_grad()
+def rolloutControllerClosedLoop(
+    model: MotionController,
+    stateNormalizer: MotionNormalizer,
+    deltaNormalizer: MotionNormalizer,
+    groundTruthRotation6d: torch.Tensor,
+    groundTruthRootTranslation: torch.Tensor,
+    controlSequence: torch.Tensor,
+    reinjectEvery: int,
+    phaseSequence: torch.Tensor | None = None,
+) -> RolloutResult:
+    """Roll out with periodic ground-truth state re-injection.
+
+    Models the deployment regime: a game engine re-grounds the character
+    every few frames (foot-lock IK, physics), so the controller does not
+    accumulate error indefinitely.  Every ``reinjectEvery`` steps the
+    working frame is replaced by ground truth; ``reinjectEvery <= 0`` is
+    pure open-loop.
+
+    Parameters
+    ----------
+    model, stateNormalizer, deltaNormalizer : see :func:`rolloutController`.
+    groundTruthRotation6d : torch.Tensor
+        ``(B, K + N, numBones, 6)`` reference frames (seed + targets).
+    groundTruthRootTranslation : torch.Tensor
+        ``(B, K + N, 3)`` reference root translation.
+    controlSequence : torch.Tensor
+        ``(B, N, controlChannels)`` per-frame control.
+    reinjectEvery : int
+        Re-injection period in frames (``<= 0`` → open-loop).
+    phaseSequence : torch.Tensor or None
+        ``(B, N, phaseChannels)`` per-frame phase.
+
+    Returns
+    -------
+    RolloutResult
+    """
+    window = model.config.contextFrames
+    boneHistory = list(groundTruthRotation6d[:, :window].unbind(dim=1))
+    globalHistory = list(groundTruthRootTranslation[:, :window].unbind(dim=1))
+    steps = controlSequence.shape[1]
+
+    for step in range(steps):
+        boneWindow = torch.stack(boneHistory[-window:], dim=1)
+        globalWindow = torch.stack(globalHistory[-window:], dim=1)
+        phase = None if phaseSequence is None else phaseSequence[:, step, :]
+        nextBone, nextGlobal = _stepOnce(
+            model, stateNormalizer, deltaNormalizer, boneWindow,
+            globalWindow, controlSequence[:, step, :], phase,
+        )
+        targetIndex = window + step
+        if reinjectEvery > 0 and (step + 1) % reinjectEvery == 0:
+            nextBone = groundTruthRotation6d[:, targetIndex]
+            nextGlobal = groundTruthRootTranslation[:, targetIndex]
+        boneHistory.append(nextBone)
+        globalHistory.append(nextGlobal)
+
+    return RolloutResult(
+        rotation6d=torch.stack(boneHistory, dim=1),
+        rootTranslation=torch.stack(globalHistory, dim=1),
+    )
+
+
 def _stepOnce(
     model: MotionController,
     stateNormalizer: MotionNormalizer,

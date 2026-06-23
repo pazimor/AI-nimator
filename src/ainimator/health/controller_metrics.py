@@ -33,8 +33,12 @@ from ainimator.health.probe import (
     _computeEffectiveRank,
     _computeIntraBatchSim,
 )
-from ainimator.model.controller_rollout import RolloutResult
+from ainimator.model.controller_rollout import (
+    RolloutResult,
+    rolloutControllerClosedLoop,
+)
 from ainimator.model.controller_v2 import ControllerOutput, MotionController
+from ainimator.model.motion_normalizer import MotionNormalizer
 
 # Names of the contracts owned by the controller engine.  Loaded from
 # the shared health.yaml; diffusion never produces these metrics.
@@ -176,6 +180,42 @@ def rolloutDriftCurve(
             truncated,
             groundTruthRotation6d[:, :clamped],
             groundTruthRootTranslation[:, :clamped],
+        )
+    return curve
+
+
+def closedLoopDriftByPeriod(
+    model: MotionController,
+    stateNormalizer: MotionNormalizer,
+    deltaNormalizer: MotionNormalizer,
+    groundTruthRotation6d: torch.Tensor,
+    groundTruthRootTranslation: torch.Tensor,
+    controlSequence: torch.Tensor,
+    periods: Iterable[int],
+    phaseSequence: torch.Tensor | None = None,
+) -> dict[int, float]:
+    """Rollout drift vs ground-truth re-injection period (deployment proxy).
+
+    ``period <= 0`` is open-loop (the worst case); smaller positive
+    periods model more frequent engine re-grounding.  A controller is
+    deployment-viable if a realistic period (e.g. every 16-64 frames)
+    keeps the drift small even when the open-loop drift is large.
+
+    Returns
+    -------
+    dict[int, float]
+        Maps each period to the trajectory drift under that re-injection
+        rate (``0`` key = open-loop).
+    """
+    curve: dict[int, float] = {}
+    for period in periods:
+        rollout = rolloutControllerClosedLoop(
+            model, stateNormalizer, deltaNormalizer, groundTruthRotation6d,
+            groundTruthRootTranslation, controlSequence, max(int(period), 0),
+            phaseSequence=phaseSequence,
+        )
+        curve[int(period)] = rolloutDrift(
+            rollout, groundTruthRotation6d, groundTruthRootTranslation
         )
     return curve
 

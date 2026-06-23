@@ -7,7 +7,10 @@ import torch
 
 from ainimator.core.constants.controller import PhaseMode
 from ainimator.core.types.controller import ControllerV2Config
-from ainimator.model.controller_rollout import rolloutController
+from ainimator.model.controller_rollout import (
+    rolloutController,
+    rolloutControllerClosedLoop,
+)
 from ainimator.model.controller_v2 import MotionController
 from ainimator.model.motion_normalizer import MotionNormalizer
 
@@ -56,6 +59,30 @@ def test_rollout_with_explicit_phase_runs() -> None:
         phaseSequence=torch.randn(1, steps, model.config.phaseChannels),
     )
     assert result.rotation6d.shape == (1, 1 + steps, 22, 6)
+
+
+def test_closed_loop_reinjection_reduces_drift() -> None:
+    """More frequent GT re-injection must not increase drift."""
+    model = _model(PhaseMode.NONE)
+    stateNorm, deltaNorm = _normalizers()
+    frames, steps = 41, 40
+    gtBone = torch.randn(1, frames, 22, 6)
+    gtRoot = torch.randn(1, frames, 3)
+    control = torch.randn(1, steps, model.config.controlChannels)
+
+    def drift(period: int) -> float:
+        rollout = rolloutControllerClosedLoop(
+            model, stateNorm, deltaNorm, gtBone, gtRoot, control, period
+        )
+        return float(((rollout.rotation6d - gtBone) ** 2).mean())
+
+    openLoop = drift(0)
+    frequent = drift(4)
+    veryFrequent = drift(1)
+    assert frequent <= openLoop
+    assert veryFrequent <= frequent
+    # re-injecting every frame ⇒ trajectory is ground truth ⇒ ~0 drift.
+    assert veryFrequent < 1e-6
 
 
 def test_rollout_explicit_phase_missing_sequence_raises() -> None:
