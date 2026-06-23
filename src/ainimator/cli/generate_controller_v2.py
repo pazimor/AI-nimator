@@ -81,6 +81,14 @@ def _parseArgs() -> argparse.Namespace:
         default=None,
         help="Also export the ground-truth base animation of the sample.",
     )
+    parser.add_argument(
+        "--smooth",
+        type=float,
+        default=0.0,
+        help="Temporal Gaussian smoothing sigma (frames) applied to the "
+        "rollout before export. Softens re-injection snaps / single-frame "
+        "outliers. 0 disables. Try 2-3.",
+    )
     parser.add_argument("--device", type=str, default="auto")
     return parser.parse_args()
 
@@ -139,6 +147,7 @@ def main() -> None:
         model, stateNorm, deltaNorm, batch, controlSequence, phaseSequence,
         gtBone, gtRoot, model.config.contextFrames, repeat, int(args.reinject),
     )
+    rollout = _smoothRollout(rollout, float(args.smooth))
     torch.save(
         {
             "rotation6d": rollout.rotation6d.detach().cpu(),
@@ -155,6 +164,19 @@ def main() -> None:
             args.dae_gt, args.fps,
         )
         logging.info("ground-truth base animation -> %s", args.dae_gt)
+
+
+def _smoothRollout(rollout: RolloutResult, sigma: float) -> RolloutResult:
+    """Temporally Gaussian-smooth the rollout rotations (no-op if sigma<=0)."""
+    if sigma <= 0.0:
+        return rollout
+    from ainimator.model.postprocess_v2 import smoothRotation6dTemporal
+
+    smoothed = smoothRotation6dTemporal(rollout.rotation6d[0], sigma)
+    return RolloutResult(
+        rotation6d=smoothed.unsqueeze(0),
+        rootTranslation=rollout.rootTranslation,
+    )
 
 
 def _generate(
