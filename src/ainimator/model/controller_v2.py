@@ -313,10 +313,14 @@ class MotionController(nn.Module):
             ``(B, phaseChannels)`` locomotor phase signal.
         style : torch.Tensor or None
             ``(B, styleChannels)`` style latent (deferred A3).
+
+        Notes
+        -----
+        Shape validation is intentionally absent from this method so that
+        ``forward()`` remains ONNX-traceable (no data-dependent control
+        flow).  Call :meth:`validateInputs` from the training loop or
+        CLI before the first step (G-ONNX).
         """
-        self._validateInputs(
-            boneWindow, control, globalWindow, promptEmb, phase, style
-        )
         batchSize, window = boneWindow.shape[0], boneWindow.shape[1]
 
         boneTokens = self.boneProj(boneWindow)
@@ -396,7 +400,7 @@ class MotionController(nn.Module):
             globalDelta = flatDelta[..., boneDim:]
         return ControllerOutput(boneDelta=boneDelta, globalDelta=globalDelta)
 
-    def _validateInputs(
+    def validateInputs(
         self,
         boneWindow: torch.Tensor,
         control: torch.Tensor,
@@ -405,7 +409,32 @@ class MotionController(nn.Module):
         phase: torch.Tensor | None,
         style: torch.Tensor | None,
     ) -> None:
-        """Validate input ranks and channel widths."""
+        """Validate input ranks and channel widths.
+
+        Call this from the training loop or CLI **before** the first
+        forward step.  It is deliberately kept outside ``forward()`` so
+        that the ONNX graph remains free of data-dependent control flow
+        (G-ONNX).
+
+        Parameters
+        ----------
+        boneWindow, control, globalWindow, promptEmb, phase, style
+            Same tensors that will be passed to :meth:`forward`.
+
+        Raises
+        ------
+        ValueError
+            On any shape mismatch.
+        """
+        self._validateBoneWindow(boneWindow)
+        self._validateConditioning(
+            control, globalWindow, promptEmb, phase, style
+        )
+
+    def _validateBoneWindow(
+        self, boneWindow: torch.Tensor
+    ) -> None:
+        """Check boneWindow rank and channel widths."""
         if boneWindow.ndim != 4:
             raise ValueError(
                 "boneWindow must be 4-D (B, K, bones, C); got "
@@ -427,9 +456,6 @@ class MotionController(nn.Module):
                 f"boneWindow has {channels} channels; config expects "
                 f"{self._config.motionChannels}."
             )
-        self._validateConditioning(
-            control, globalWindow, promptEmb, phase, style
-        )
 
     def _validateConditioning(
         self,
@@ -440,11 +466,23 @@ class MotionController(nn.Module):
         style: torch.Tensor | None,
     ) -> None:
         """Validate control / global / promptEmb / phase / style widths."""
+        self._validateControlWidth(control)
+        self._validateGlobalWindow(globalWindow)
+        self._validatePromptEmb(promptEmb)
+        self._validatePhaseAndStyle(phase, style)
+
+    def _validateControlWidth(self, control: torch.Tensor) -> None:
+        """Raise ValueError if control channel width is wrong."""
         if control.shape[-1] != self._config.controlChannels:
             raise ValueError(
                 f"control has {control.shape[-1]} channels; config "
                 f"expects {self._config.controlChannels}."
             )
+
+    def _validateGlobalWindow(
+        self, globalWindow: torch.Tensor | None
+    ) -> None:
+        """Raise ValueError if globalWindow channel width is wrong."""
         if globalWindow is not None and (
             globalWindow.shape[-1] != self._config.globalChannels
         ):
@@ -452,6 +490,11 @@ class MotionController(nn.Module):
                 f"globalWindow has {globalWindow.shape[-1]} channels; "
                 f"config expects {self._config.globalChannels}."
             )
+
+    def _validatePromptEmb(
+        self, promptEmb: torch.Tensor | None
+    ) -> None:
+        """Raise ValueError if promptEmb channel width is wrong."""
         if (
             promptEmb is not None
             and self._config.promptEmbChannels > 0
@@ -461,6 +504,13 @@ class MotionController(nn.Module):
                 f"promptEmb has {promptEmb.shape[-1]} channels; config "
                 f"expects {self._config.promptEmbChannels}."
             )
+
+    def _validatePhaseAndStyle(
+        self,
+        phase: torch.Tensor | None,
+        style: torch.Tensor | None,
+    ) -> None:
+        """Raise ValueError if required phase or style tensors are absent."""
         if self._config.phaseChannels > 0 and phase is None:
             raise ValueError(
                 "phase is required when phaseMode is not 'none'."

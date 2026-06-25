@@ -404,7 +404,12 @@ class _ControllerStepWrapper(nn.Module):
         promptEmb: torch.Tensor | None,
         phase: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Shared dispatch; asserts globalDelta is present."""
+        """Shared dispatch; returns (boneDelta, globalDelta).
+
+        The globalDelta guard is enforced by :func:`_makeControllerStepWrapper`
+        before tracing, so no data-dependent branch appears in the graph
+        (G-ONNX).
+        """
         out = self.controller(
             boneWindow,
             control,
@@ -412,11 +417,10 @@ class _ControllerStepWrapper(nn.Module):
             promptEmb=promptEmb,
             phase=phase,
         )
-        assert out.globalDelta is not None, (
-            "Controller returned None globalDelta; "
-            "rebuild with globalChannels > 0."
-        )
-        return out.boneDelta, out.globalDelta
+        # globalDelta is always non-None at this point: the factory
+        # checked globalChannels > 0 before constructing this wrapper.
+        globalDelta: torch.Tensor = out.globalDelta  # type: ignore[assignment]
+        return out.boneDelta, globalDelta
 
 
 class _ControllerWrapperBase(_ControllerStepWrapper):
@@ -474,8 +478,24 @@ class _ControllerWrapperPromptPhase(_ControllerStepWrapper):
 def _makeControllerStepWrapper(
     controller: MotionController,
 ) -> _ControllerStepWrapper:
-    """Pick the concrete wrapper subclass for the controller's config."""
+    """Pick the concrete wrapper subclass for the controller's config.
+
+    Also validates that ``globalChannels > 0`` so the ONNX wrapper can
+    always return a ``globalDelta`` without a data-dependent ``None``
+    check inside ``forward()`` (G-ONNX).
+
+    Raises
+    ------
+    ValueError
+        If the controller was built without a global branch
+        (``globalChannels == 0``), which is not supported for export.
+    """
     cfg = controller.config
+    if cfg.globalChannels == 0:
+        raise ValueError(
+            "exportController requires globalChannels > 0; "
+            "rebuild the controller with a root-local motion branch."
+        )
     has_prompt = cfg.promptEmbChannels > 0
     has_phase = cfg.phaseChannels > 0
     if has_prompt and has_phase:

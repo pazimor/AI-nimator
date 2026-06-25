@@ -48,25 +48,30 @@ def test_forward_with_explicit_phase() -> None:
 
 
 def test_missing_phase_raises_when_required() -> None:
+    """Shape validation via validateInputs() raises for missing phase.
+
+    Validation is intentionally absent from forward() to keep the ONNX
+    graph free of data-dependent control flow (G-ONNX).  Callers invoke
+    validateInputs() before the first step.
+    """
     config = _config(phaseMode=PhaseMode.EXPLICIT)
     model = MotionController(config)
+    bone = torch.randn(2, 1, 22, 6)
+    ctrl = torch.randn(2, config.controlChannels)
+    glob = torch.randn(2, 1, 4)
     with pytest.raises(ValueError, match="phase is required"):
-        model(
-            torch.randn(2, 1, 22, 6),
-            torch.randn(2, config.controlChannels),
-            globalWindow=torch.randn(2, 1, 4),
-        )
+        model.validateInputs(bone, ctrl, glob, None, None, None)
 
 
 def test_wrong_window_length_raises() -> None:
+    """Shape validation via validateInputs() raises for wrong window length."""
     config = _config(contextFrames=2, phaseMode=PhaseMode.NONE)
     model = MotionController(config)
+    bone = torch.randn(2, 1, 22, 6)  # window=1 but config wants 2
+    ctrl = torch.randn(2, config.controlChannels)
+    glob = torch.randn(2, 1, 4)
     with pytest.raises(ValueError, match="contextFrames"):
-        model(
-            torch.randn(2, 1, 22, 6),
-            torch.randn(2, config.controlChannels),
-            globalWindow=torch.randn(2, 1, 4),
-        )
+        model.validateInputs(bone, ctrl, glob, None, None, None)
 
 
 def test_context_window_greater_than_one() -> None:
@@ -197,7 +202,7 @@ def test_null_emb_vs_explicit_emb_differ() -> None:
 
 
 def test_prompt_emb_wrong_channels_raises() -> None:
-    """promptEmb with wrong channel count must raise ValueError."""
+    """validateInputs() raises ValueError when promptEmb channels mismatch."""
     config = _config(phaseMode=PhaseMode.NONE, promptEmbChannels=32)
     model = MotionController(config).eval()
     bone = torch.randn(2, 1, 22, 6)
@@ -205,7 +210,7 @@ def test_prompt_emb_wrong_channels_raises() -> None:
     glob = torch.randn(2, 1, 4)
     bad_emb = torch.randn(2, 16)  # 16 != 32
     with pytest.raises(ValueError, match="promptEmb has"):
-        model(bone, ctrl, globalWindow=glob, promptEmb=bad_emb)
+        model.validateInputs(bone, ctrl, glob, bad_emb, None, None)
 
 
 def test_prompt_emb_no_grad_to_frozen_encoder() -> None:
