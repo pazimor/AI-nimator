@@ -535,7 +535,7 @@ class TestDenoiserOnnxParity:
 
 
 # ---------------------------------------------------------------------------
-# Controller parity (Goal C, phase C5)
+# Controller parity (Goal A, phase A5)
 # ---------------------------------------------------------------------------
 from ainimator.core.constants.controller import PhaseMode  # noqa: E402
 from ainimator.core.types.controller import (  # noqa: E402
@@ -650,3 +650,69 @@ class TestControllerOnnxParity:
             }
             ortBone, _ortGlobal = session.run(None, feeds)
         assert _maxAbsDiff(out.boneDelta, ortBone) <= ONNX_PARITY_TOLERANCE
+
+    def test_controller_with_prompt_emb_exports(self) -> None:
+        """A controller with promptEmbChannels exports and matches PyTorch."""
+        _PROMPT_DIM = 32
+        config = ControllerV2Config(
+            embedDim=_EMBED_DIM,
+            numHeads=_NUM_HEADS,
+            numLayers=_NUM_LAYERS,
+            numBones=_NUM_BONES,
+            motionChannels=_MOTION_CH,
+            globalChannels=_GLOBAL_CH,
+            contextFrames=_CONTEXT,
+            phaseMode=PhaseMode.NONE,
+            dropout=0.0,
+            promptEmbChannels=_PROMPT_DIM,
+        )
+        controller = MotionController(config)
+        controller.eval()
+        bone = torch.randn(_BATCH, _CONTEXT, _NUM_BONES, _MOTION_CH)
+        control = torch.randn(_BATCH, controller.config.controlChannels)
+        glob = torch.randn(_BATCH, _CONTEXT, _GLOBAL_CH)
+        promptEmb = torch.randn(_BATCH, _PROMPT_DIM)
+        with torch.no_grad():
+            out = controller(
+                bone, control, globalWindow=glob, promptEmb=promptEmb
+            )
+        with tempfile.TemporaryDirectory() as tmpDir:
+            outPath = Path(tmpDir) / "controller_prompt.onnx"
+            exportController(controller, outPath, batchSize=_BATCH)
+            session = _ortSession(outPath)
+            feeds = {
+                "bone_window": bone.numpy(),
+                "control": control.numpy(),
+                "global_window": glob.numpy(),
+                "prompt_emb": promptEmb.numpy(),
+            }
+            ortBone, ortGlobal = session.run(None, feeds)
+        assert _maxAbsDiff(out.boneDelta, ortBone) <= ONNX_PARITY_TOLERANCE
+        assert out.globalDelta is not None
+        assert (
+            _maxAbsDiff(out.globalDelta, ortGlobal) <= ONNX_PARITY_TOLERANCE
+        )
+
+    def test_controller_without_prompt_emb_unaffected(self) -> None:
+        """A controller without promptEmbChannels is unaffected (regression)."""
+        controller = _makeController(PhaseMode.NONE)
+        bone = torch.randn(_BATCH, _CONTEXT, _NUM_BONES, _MOTION_CH)
+        control = torch.randn(_BATCH, controller.config.controlChannels)
+        glob = torch.randn(_BATCH, _CONTEXT, _GLOBAL_CH)
+        with torch.no_grad():
+            out = controller(bone, control, globalWindow=glob)
+        with tempfile.TemporaryDirectory() as tmpDir:
+            outPath = Path(tmpDir) / "controller_no_prompt.onnx"
+            exportController(controller, outPath, batchSize=_BATCH)
+            session = _ortSession(outPath)
+            feeds = {
+                "bone_window": bone.numpy(),
+                "control": control.numpy(),
+                "global_window": glob.numpy(),
+            }
+            ortBone, ortGlobal = session.run(None, feeds)
+        assert _maxAbsDiff(out.boneDelta, ortBone) <= ONNX_PARITY_TOLERANCE
+        assert out.globalDelta is not None
+        assert (
+            _maxAbsDiff(out.globalDelta, ortGlobal) <= ONNX_PARITY_TOLERANCE
+        )

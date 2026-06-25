@@ -754,6 +754,7 @@ def _controllerConfigToDict(config: ControllerV2Config) -> dict[str, object]:
         "maxFrames": config.maxFrames,
         "styleLatentEnabled": config.styleLatentEnabled,
         "styleLatentDim": config.styleLatentDim,
+        "promptEmbChannels": config.promptEmbChannels,
     }
 
 

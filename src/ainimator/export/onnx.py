@@ -363,7 +363,7 @@ class _DenoiserStepWrapper(nn.Module):
 
 
 # -----------------------------------------------------------------------
-# Controller wrapper — one frame (Goal C, phase C5)
+# Controller wrapper — one frame (Goal A, phase A5)
 # -----------------------------------------------------------------------
 class _ControllerStepWrapper(nn.Module):
     """Thin wrapper for exporting a single controller forward via ONNX.
@@ -375,29 +375,116 @@ class _ControllerStepWrapper(nn.Module):
 
     The ``phase`` input is included only when the model uses phase
     conditioning (``phaseChannels > 0``); ``style`` is excluded (deferred
-    C3).
+    A3).  When ``config.promptEmbChannels > 0`` a ``promptEmb`` input is
+    exposed so the ONNX graph receives the pre-computed embedding as an
+    explicit input node — the text encoder runs UPSTREAM, outside the
+    graph (ROADMAP_DETERMINIST §2.4).
+
+    ONNX positional-argument contract
+    ----------------------------------
+    The concrete forward signature exposed to the tracer depends on
+    which optional inputs are active.  Four concrete subclasses cover the
+    four combinations of ``{promptEmb, phase}`` present/absent so the
+    tracer always sees a fixed positional signature with NO Optional
+    arguments (Optional breaks dynamic axes in older opsets).
+
+    :func:`makeControllerStepWrapper` is the factory that picks the
+    right subclass.
     """
 
     def __init__(self, controller: MotionController) -> None:
         super().__init__()
         self.controller = controller
 
-    def forward(
+    def _run(
         self,
         boneWindow: torch.Tensor,
         control: torch.Tensor,
         globalWindow: torch.Tensor,
-        phase: torch.Tensor | None = None,
+        promptEmb: torch.Tensor | None,
+        phase: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run one forward; return ``(boneDelta, globalDelta)``."""
+        """Shared dispatch; asserts globalDelta is present."""
         out = self.controller(
-            boneWindow, control, globalWindow=globalWindow, phase=phase
+            boneWindow,
+            control,
+            globalWindow=globalWindow,
+            promptEmb=promptEmb,
+            phase=phase,
         )
         assert out.globalDelta is not None, (
             "Controller returned None globalDelta; "
             "rebuild with globalChannels > 0."
         )
         return out.boneDelta, out.globalDelta
+
+
+class _ControllerWrapperBase(_ControllerStepWrapper):
+    """Concrete forward: boneWindow, control, globalWindow."""
+
+    def forward(
+        self,
+        boneWindow: torch.Tensor,
+        control: torch.Tensor,
+        globalWindow: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._run(boneWindow, control, globalWindow, None, None)
+
+
+class _ControllerWrapperPhase(_ControllerStepWrapper):
+    """Concrete forward: boneWindow, control, globalWindow, phase."""
+
+    def forward(
+        self,
+        boneWindow: torch.Tensor,
+        control: torch.Tensor,
+        globalWindow: torch.Tensor,
+        phase: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._run(boneWindow, control, globalWindow, None, phase)
+
+
+class _ControllerWrapperPrompt(_ControllerStepWrapper):
+    """Concrete forward: boneWindow, control, globalWindow, promptEmb."""
+
+    def forward(
+        self,
+        boneWindow: torch.Tensor,
+        control: torch.Tensor,
+        globalWindow: torch.Tensor,
+        promptEmb: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._run(boneWindow, control, globalWindow, promptEmb, None)
+
+
+class _ControllerWrapperPromptPhase(_ControllerStepWrapper):
+    """Concrete forward: boneWindow, control, globalWindow, promptEmb, phase."""
+
+    def forward(
+        self,
+        boneWindow: torch.Tensor,
+        control: torch.Tensor,
+        globalWindow: torch.Tensor,
+        promptEmb: torch.Tensor,
+        phase: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._run(boneWindow, control, globalWindow, promptEmb, phase)
+
+
+def _makeControllerStepWrapper(
+    controller: MotionController,
+) -> _ControllerStepWrapper:
+    """Pick the concrete wrapper subclass for the controller's config."""
+    cfg = controller.config
+    has_prompt = cfg.promptEmbChannels > 0
+    has_phase = cfg.phaseChannels > 0
+    if has_prompt and has_phase:
+        return _ControllerWrapperPromptPhase(controller)
+    if has_prompt:
+        return _ControllerWrapperPrompt(controller)
+    if has_phase:
+        return _ControllerWrapperPhase(controller)
+    return _ControllerWrapperBase(controller)
 
 
 # -----------------------------------------------------------------------
@@ -580,7 +667,7 @@ def exportController(
     batchSize: int = 1,
     opsetVersion: int = ONNX_OPSET_VERSION,
 ) -> Path:
-    """Export a single controller forward to ONNX (Goal C, phase C5).
+    """Export a single controller forward to ONNX (Goal A, phase A5).
 
     The rollout loop stays in Python/the engine; only one frame-to-delta
     forward is exported.  A deep copy with all ``nn.MultiheadAttention``
@@ -605,7 +692,7 @@ def exportController(
     """
     outputPath.parent.mkdir(parents=True, exist_ok=True)
     exportReady = _replaceAllMHA(copy.deepcopy(controller))
-    wrapper = _ControllerStepWrapper(exportReady)  # type: ignore[arg-type]
+    wrapper = _makeControllerStepWrapper(exportReady)  # type: ignore[arg-type]
     wrapper.eval()
 
     config = controller.config
@@ -625,9 +712,27 @@ def exportController(
         "global_delta": {0: "batch"},
     }
     exampleInputs: tuple[Any, ...] = (boneWindow, control, globalWindow)
+
+    # Build the concrete example inputs in the order declared by
+    # _ControllerStepWrapper.forward:
+    #   (boneWindow, control, globalWindow [, promptEmb] [, phase])
+    #
+    # Prompt embedding: exposed as an explicit graph input node so the
+    # text encoder (frozen, read-only artifact) runs UPSTREAM — outside
+    # the autoregressive loop and outside the ONNX graph
+    # (ROADMAP_DETERMINIST §2.4).
+    if config.promptEmbChannels > 0:
+        promptEmb = torch.randn(batchSize, config.promptEmbChannels)
+        exampleInputs = (*exampleInputs, promptEmb)
+        inputNames.append("prompt_emb")
+        dynamicAxes["prompt_emb"] = {0: "batch"}
+
+    # Phase conditioning: appended after promptEmb (or directly after
+    # globalWindow when promptEmbChannels == 0) to preserve the positional
+    # argument order expected by _ControllerStepWrapper.forward.
     if config.phaseChannels > 0:
         phase = torch.randn(batchSize, config.phaseChannels)
-        exampleInputs = (boneWindow, control, globalWindow, phase)
+        exampleInputs = (*exampleInputs, phase)
         inputNames.append("phase")
         dynamicAxes["phase"] = {0: "batch"}
 

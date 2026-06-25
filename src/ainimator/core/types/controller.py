@@ -179,6 +179,14 @@ class ControllerV2Config:
     maxFrames: int = 4096
     styleLatentEnabled: bool = False
     styleLatentDim: int = _DEFAULT_STYLE_LATENT_DIM
+    #: Width of the prompt embedding injected into the conditioning bus.
+    #: ``0`` disables text conditioning entirely (backward-compatible: all
+    #: existing checkpoints and tests are unaffected).  When ``> 0`` a
+    #: learnable null embedding of this width is registered on the model
+    #: and substituted whenever ``promptEmb`` is ``None`` at runtime.
+    #: The encoder runs UPSTREAM; this is purely the *embedding* dimension,
+    #: not the sequence-level encoder hidden dim (ROADMAP_DETERMINIST §2.4).
+    promptEmbChannels: int = 0
 
     def __post_init__(self) -> None:
         if self.embedDim % self.numHeads != 0:
@@ -202,6 +210,8 @@ class ControllerV2Config:
             raise ValueError(
                 "styleLatentDim must be >= 1 when styleLatentEnabled."
             )
+        if self.promptEmbChannels < 0:
+            raise ValueError("promptEmbChannels must be >= 0.")
 
     @property
     def controlChannels(self) -> int:
@@ -220,8 +230,18 @@ class ControllerV2Config:
 
     @property
     def conditioningChannels(self) -> int:
-        """Total conditioning width fed to the controller per frame."""
-        return self.controlChannels + self.phaseChannels + self.styleChannels
+        """Total conditioning width fed to the controller per frame.
+
+        Includes control + phase + style + prompt embedding when each is
+        active.  The prompt embedding enters through the SAME AdaLN bus
+        as the other conditioning signals (ROADMAP_DETERMINIST §2.4).
+        """
+        return (
+            self.controlChannels
+            + self.phaseChannels
+            + self.styleChannels
+            + self.promptEmbChannels
+        )
 
     @property
     def boneOutputDim(self) -> int:

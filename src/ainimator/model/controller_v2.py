@@ -1,11 +1,11 @@
-"""Autoregressive deterministic motion controller (Goal C, phase C1).
+"""Autoregressive deterministic motion controller (Goal A, phase A1+).
 
 This is the second generation engine of AI-nimator, parallel to the
 diffusion denoiser (ROADMAP_DETERMINIST §1).  Instead of *sampling* a
 full animation from a text prompt, it *regresses* the motion one frame
 at a time from a control signal:
 
-    f(state_window, control, [phase]) → Δstate
+    f(state_window, control, [promptEmb], [phase]) → Δstate
 
 A single forward produces the next-frame delta — no schedule, no DDIM
 loop — which makes the ONNX/NPU path trivial (ROADMAP_DETERMINIST §2.1
@@ -14,18 +14,31 @@ truth #10, promoted to an acquis here).
 Design
 ------
 * The controller operates on the **lean** representation only:
-  rotation6d (132) + root_translation (3).  It predicts ``Δstate``;
+  rotation6d (132) + root_local_motion (4).  It predicts ``Δstate``;
   FK-derivable signals (velocities, contacts) are supervised at the
   loss, never emitted as redundant channels (§2.2).
-* Conditioning (control signal + locomotor phase [+ style, deferred])
-  drives every block through DiT-style **AdaLN** modulation.  The
-  projection is initialised with a small non-zero ``filmInitStd`` so a
-  gradient path control→output exists from epoch 1 — this is the same
-  escape from posterior collapse used by the denoiser, and it is what
-  keeps ``control_sensitivity`` (§4) above zero.
+* Conditioning (control signal + locomotor phase [+ style, deferred]
+  [+ prompt embedding]) drives every block through DiT-style **AdaLN**
+  modulation.  All conditioning channels — including the prompt
+  embedding — enter through the SAME bus (ROADMAP_DETERMINIST §2.4).
+  The projection is initialised with a small non-zero ``filmInitStd``
+  so a gradient path control→output exists from epoch 1 — this is the
+  same escape from posterior collapse used by the denoiser, and it is
+  what keeps ``control_sensitivity`` (§4) above zero.
 * The backbone is a stack of pre-norm self-attention blocks over the
-  context window (length ``contextFrames``); for C1 the window is 1 so
+  context window (length ``contextFrames``); for A1 the window is 1 so
   the block reduces to a conditioned per-frame residual MLP.
+
+Integrated text encoder (§2.4, LOT-2)
+--------------------------------------
+When ``config.promptEmbChannels > 0`` the controller accepts an
+optional ``promptEmb`` tensor ``(B, promptEmbChannels)`` as a **pre-
+computed** prompt embedding.  The encoder runs UPSTREAM (outside the
+autoregressive loop and outside the ONNX graph); ``promptEmb`` is
+simply an input node of the per-frame graph.  When ``promptEmb`` is
+``None`` a learnable null embedding (``self.nullPromptEmb``) is
+broadcast over the batch, preserving the no-text behaviour.  No
+gradient flows to the encoder; the null embedding IS trained.
 
 Z-normalization (§2.1 truth #3) is the caller's responsibility: the
 controller consumes a normalized state window and emits a normalized
@@ -100,12 +113,13 @@ class _ControllerModulation(nn.Module):
 # Controller block
 # ---------------------------------------------------------------------
 class ControllerBlock(nn.Module):
-    """Pre-norm self-attention + FFN, AdaLN-modulated by the control.
+    """Pre-norm self-attention + FFN, AdaLN-modulated by the condition.
 
     The self-attention runs over the context window axis; with
     ``contextFrames == 1`` it is a no-op mixer and the block behaves as a
-    conditioned residual MLP.  No cross-attention: the controller has no
-    text stream — conditioning enters exclusively through AdaLN.
+    conditioned residual MLP.  Conditioning (control + phase + style +
+    optional prompt embedding) enters exclusively through AdaLN — no
+    cross-attention is used (ROADMAP_DETERMINIST §2.4).
     """
 
     def __init__(
@@ -174,8 +188,14 @@ class MotionController(nn.Module):
     * ``boneWindow``   : ``(B, K, numBones, motionChannels)``
     * ``globalWindow`` : ``(B, K, globalChannels)`` or ``None``
     * ``control``      : ``(B, controlChannels)``
+    * ``promptEmb``    : ``(B, promptEmbChannels)`` or ``None``
+      Pre-computed prompt embedding from the frozen text encoder
+      (UPSTREAM — never computed inside this forward).  When ``None``
+      and ``config.promptEmbChannels > 0`` the learnable null embedding
+      is used instead.  When ``config.promptEmbChannels == 0`` this
+      argument is ignored entirely (backward-compatible).
     * ``phase``        : ``(B, phaseChannels)`` or ``None``
-    * ``style``        : ``(B, styleChannels)`` or ``None`` (deferred C3)
+    * ``style``        : ``(B, styleChannels)`` or ``None`` (deferred A3)
 
     where ``K == config.contextFrames``.
 
@@ -204,14 +224,26 @@ class MotionController(nn.Module):
         self.frameProj = nn.Linear(frameInputDim, embedDim)
 
         # Sized to maxFrames (not contextFrames) so the context-window
-        # axis can stay a dynamic ONNX axis (C5) without resizing the PE
+        # axis can stay a dynamic ONNX axis (A5) without resizing the PE
         # buffer.  The buffer is non-learned, so the cost is negligible.
         self.posEncoder = SinusoidalPositionalEncoding(
             embedDim, maxLen=max(config.maxFrames, config.contextFrames)
         )
         self.embedDropout = nn.Dropout(config.dropout)
 
-        # Conditioning encoder: raw (control [+phase] [+style]) → embedDim.
+        # Learnable null prompt embedding — used when promptEmb is None.
+        # Only registered when promptEmbChannels > 0 so models without
+        # text conditioning have no extra parameters (backward-compat).
+        if config.promptEmbChannels > 0:
+            self.nullPromptEmb: nn.Parameter | None = nn.Parameter(
+                torch.zeros(config.promptEmbChannels)
+            )
+        else:
+            self.nullPromptEmb = None
+
+        # Conditioning encoder: (control [+phase] [+style] [+promptEmb])
+        # → embedDim.  conditioningChannels already includes promptEmbChannels
+        # when > 0 (see ControllerV2Config.conditioningChannels).
         self.condEncoder = nn.Sequential(
             nn.Linear(config.conditioningChannels, embedDim),
             nn.SiLU(),
@@ -258,11 +290,33 @@ class MotionController(nn.Module):
         boneWindow: torch.Tensor,
         control: torch.Tensor,
         globalWindow: torch.Tensor | None = None,
+        promptEmb: torch.Tensor | None = None,
         phase: torch.Tensor | None = None,
         style: torch.Tensor | None = None,
     ) -> ControllerOutput:
-        """Predict the next-frame normalized delta from a state window."""
-        self._validateInputs(boneWindow, control, globalWindow, phase, style)
+        """Predict the next-frame normalized delta from a state window.
+
+        Parameters
+        ----------
+        boneWindow : torch.Tensor
+            ``(B, K, numBones, motionChannels)`` normalized state window.
+        control : torch.Tensor
+            ``(B, controlChannels)`` control signal (z-normalized).
+        globalWindow : torch.Tensor or None
+            ``(B, K, globalChannels)`` root-local motion window.
+        promptEmb : torch.Tensor or None
+            ``(B, promptEmbChannels)`` pre-computed prompt embedding from
+            the frozen text encoder (computed UPSTREAM, never inside this
+            forward).  ``None`` uses the learnable null embedding when
+            ``config.promptEmbChannels > 0``, or is ignored when ``0``.
+        phase : torch.Tensor or None
+            ``(B, phaseChannels)`` locomotor phase signal.
+        style : torch.Tensor or None
+            ``(B, styleChannels)`` style latent (deferred A3).
+        """
+        self._validateInputs(
+            boneWindow, control, globalWindow, promptEmb, phase, style
+        )
         batchSize, window = boneWindow.shape[0], boneWindow.shape[1]
 
         boneTokens = self.boneProj(boneWindow)
@@ -281,7 +335,7 @@ class MotionController(nn.Module):
         frameHidden = self.embedDropout(frameHidden)
 
         condition = self.condEncoder(
-            self._assembleConditioning(control, phase, style)
+            self._assembleConditioning(control, promptEmb, phase, style)
         )
         for block in self.blocks:
             frameHidden = block(frameHidden, condition)
@@ -296,15 +350,37 @@ class MotionController(nn.Module):
     def _assembleConditioning(
         self,
         control: torch.Tensor,
+        promptEmb: torch.Tensor | None,
         phase: torch.Tensor | None,
         style: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Concatenate the active conditioning channels into ``(B, C)``."""
-        parts = [control]
+        """Concatenate the active conditioning channels into ``(B, C)``.
+
+        Channel order: control [+ phase] [+ style] [+ promptEmb].
+        The prompt embedding comes last so existing checkpoints without
+        text conditioning remain bit-for-bit identical (the condEncoder
+        sees the same input layout for control+phase+style when
+        promptEmbChannels == 0).
+        """
+        parts: list[torch.Tensor] = [control]
         if self._config.phaseChannels > 0 and phase is not None:
             parts.append(phase)
         if self._config.styleChannels > 0 and style is not None:
             parts.append(style)
+        if self._config.promptEmbChannels > 0:
+            # Resolve the effective prompt embedding.
+            # ONNX-safe: no data-dependent branching on graph path —
+            # the null embedding is always the same shape; we just
+            # choose between two concrete tensors.
+            assert self.nullPromptEmb is not None  # always true when > 0
+            if promptEmb is not None:
+                parts.append(promptEmb)
+            else:
+                # Broadcast null embedding over the batch dimension.
+                nullExpanded = self.nullPromptEmb.unsqueeze(0).expand(
+                    control.shape[0], -1
+                )
+                parts.append(nullExpanded)
         return torch.cat(parts, dim=-1)
 
     def _splitOutput(
@@ -325,6 +401,7 @@ class MotionController(nn.Module):
         boneWindow: torch.Tensor,
         control: torch.Tensor,
         globalWindow: torch.Tensor | None,
+        promptEmb: torch.Tensor | None,
         phase: torch.Tensor | None,
         style: torch.Tensor | None,
     ) -> None:
@@ -350,16 +427,19 @@ class MotionController(nn.Module):
                 f"boneWindow has {channels} channels; config expects "
                 f"{self._config.motionChannels}."
             )
-        self._validateConditioning(control, globalWindow, phase, style)
+        self._validateConditioning(
+            control, globalWindow, promptEmb, phase, style
+        )
 
     def _validateConditioning(
         self,
         control: torch.Tensor,
         globalWindow: torch.Tensor | None,
+        promptEmb: torch.Tensor | None,
         phase: torch.Tensor | None,
         style: torch.Tensor | None,
     ) -> None:
-        """Validate control / global / phase / style widths."""
+        """Validate control / global / promptEmb / phase / style widths."""
         if control.shape[-1] != self._config.controlChannels:
             raise ValueError(
                 f"control has {control.shape[-1]} channels; config "
@@ -371,6 +451,15 @@ class MotionController(nn.Module):
             raise ValueError(
                 f"globalWindow has {globalWindow.shape[-1]} channels; "
                 f"config expects {self._config.globalChannels}."
+            )
+        if (
+            promptEmb is not None
+            and self._config.promptEmbChannels > 0
+            and promptEmb.shape[-1] != self._config.promptEmbChannels
+        ):
+            raise ValueError(
+                f"promptEmb has {promptEmb.shape[-1]} channels; config "
+                f"expects {self._config.promptEmbChannels}."
             )
         if self._config.phaseChannels > 0 and phase is None:
             raise ValueError(
@@ -416,6 +505,10 @@ class ControllerForwardWrapper(nn.Module):
     ``(boneDelta, globalDelta)`` (or just ``(boneDelta,)`` when there is
     no global branch).  It wraps a *single* forward — the autoregressive
     rollout loop stays outside the graph (ROADMAP_DETERMINIST §2.1).
+
+    When ``config.promptEmbChannels > 0`` the wrapper accepts a
+    ``promptEmb`` argument so the ONNX graph exposes it as an explicit
+    input node (encoder runs upstream, outside the graph).
     """
 
     def __init__(self, controller: MotionController) -> None:
@@ -427,11 +520,16 @@ class ControllerForwardWrapper(nn.Module):
         boneWindow: torch.Tensor,
         control: torch.Tensor,
         globalWindow: torch.Tensor | None = None,
+        promptEmb: torch.Tensor | None = None,
         phase: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Return the next-frame delta(s) as a plain tuple."""
         output = self.controller(
-            boneWindow, control, globalWindow=globalWindow, phase=phase
+            boneWindow,
+            control,
+            globalWindow=globalWindow,
+            promptEmb=promptEmb,
+            phase=phase,
         )
         if output.globalDelta is None:
             return (output.boneDelta,)
