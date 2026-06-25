@@ -1,4 +1,4 @@
-"""Phase C1 tests — autoregressive sequence builder."""
+"""Phase A1 tests — autoregressive sequence builder."""
 
 from __future__ import annotations
 
@@ -26,6 +26,8 @@ def test_transition_count_context_one() -> None:
     )
     assert batch.numTransitions == 9
     assert batch.boneWindow.shape == (9, 1, 22, 6)
+    # globalWindow holds root-local motion deltas (4 channels, not 3).
+    assert batch.globalWindow.shape == (9, 1, 4)
     assert batch.control.shape == (9, 2)
 
 
@@ -50,12 +52,15 @@ def test_delta_targets_are_consistent() -> None:
     )
 
 
-def test_control_is_planar_velocity() -> None:
+def test_control_is_local_planar_velocity() -> None:
+    """Control (vx, vz) equals the root-local planar delta (Δfwd, Δlat)."""
     rot, root = _clip(6)
     batch = buildControllerSequences(
         rot, root, ControllerSequenceConfig(contextFrames=1)
     )
-    expected = batch.targetGlobalDelta[:, [0, 2]]
+    # targetGlobalDelta is (N, 4): (Δforward, Δlateral, Δheight, Δyaw).
+    # Control (no aim) = first two channels = (Δfwd, Δlat) in local frame.
+    expected = batch.targetGlobalDelta[:, :2]
     assert torch.allclose(batch.control, expected, atol=1e-5)
 
 
@@ -72,6 +77,39 @@ def test_aim_direction_appends_two_channels() -> None:
     assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
 
 
+def test_aim_direction_is_decoupled_from_locomotion() -> None:
+    """Aim (pelvis yaw) must differ from locomotion direction (velocity).
+
+    When the character faces one direction while moving in another, aim
+    and locomotion velocity are not collinear — the new implementation
+    decouples them via pelvis yaw (ROADMAP_DETERMINIST §2.2.b).
+    """
+    frames = 10
+    # Pelvis yaw points toward +Z (col0 of rot matrix = [0, 0, 1]).
+    # In rot6d, col0 is the first 3 channels of the 6-channel vector.
+    rot = torch.zeros(frames, 22, 6)
+    rot[:, 0, 0] = 0.0  # col0.x
+    rot[:, 0, 1] = 0.0  # col0.y
+    rot[:, 0, 2] = 1.0  # col0.z  → facing +Z
+    # col1 (channels 3,4,5) = orthogonal; e.g. (0, 1, 0)
+    rot[:, 0, 3] = 0.0
+    rot[:, 0, 4] = 1.0
+    rot[:, 0, 5] = 0.0
+
+    # Character moves along +X (world frame).
+    root = torch.zeros(frames, 3)
+    root[:, 0] = torch.arange(frames, dtype=torch.float32) * 0.1
+
+    batch = buildControllerSequences(
+        rot, root,
+        ControllerSequenceConfig(contextFrames=1, useAimDirection=True),
+    )
+    # Aim should point roughly toward +Z (cos≈0, sin≈1) for all frames.
+    aim = batch.control[:, 2:]
+    # cos θ ≈ 0, sin θ ≈ 1 (facing +Z in the XZ ground plane)
+    assert aim[:, 1].mean() > 0.5, "Aim should point toward +Z (sin > 0)"
+
+
 def test_clip_too_short_raises() -> None:
     rot, root = _clip(2)
     with pytest.raises(ValueError, match="too short"):
@@ -81,7 +119,7 @@ def test_clip_too_short_raises() -> None:
 
 
 # ---------------------------------------------------------------------
-# C2 — foot contacts + gait phase
+# A2 — foot contacts + gait phase
 # ---------------------------------------------------------------------
 def test_foot_contacts_shape_and_range() -> None:
     rot, root = _clip(12)

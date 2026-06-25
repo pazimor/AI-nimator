@@ -1,4 +1,4 @@
-"""Dataclasses for the Goal C deterministic controller.
+"""Dataclasses for the Goal A deterministic controller.
 
 Defines the runtime tensors exchanged with :class:`MotionController`
 (:class:`ControllerState`, :class:`ControlSignal`, :class:`StylePreset`)
@@ -18,12 +18,13 @@ import torch
 
 from ainimator.core.constants.controller import (
     PhaseMode,
+    ROOT_LOCAL_MOTION_CHANNELS,
     controlSignalChannels,
     phaseConditioningChannels,
 )
 
 # Architecture defaults — chosen as the smallest stack that can overfit
-# one sequence at the C1 feasibility gate.  They are NOT the production
+# one sequence at the A1 feasibility gate.  They are NOT the production
 # capacity; the capacity↔N law (ROADMAP §5.2) is re-derived empirically
 # for the controller in later phases.
 _DEFAULT_EMBED_DIM = 256
@@ -31,7 +32,9 @@ _DEFAULT_NUM_HEADS = 8
 _DEFAULT_NUM_LAYERS = 4
 _DEFAULT_NUM_BONES = 22
 _DEFAULT_MOTION_CHANNELS = 6
-_DEFAULT_GLOBAL_CHANNELS = 3
+#: Root-local motion channels: (Δforward, Δlateral, Δheight, Δyaw).
+#: Replaces the 3-channel absolute root_translation of the diffusion stack.
+_DEFAULT_GLOBAL_CHANNELS = ROOT_LOCAL_MOTION_CHANNELS  # 4
 _DEFAULT_CONTEXT_FRAMES = 1
 _DEFAULT_DROPOUT = 0.0
 _DEFAULT_FILM_INIT_STD = 0.02
@@ -44,18 +47,24 @@ class ControllerState:
 
     The controller regresses ``Δstate`` over this lean representation
     only; FK-derivable signals are supervised at the loss, never carried
-    here as redundant channels (ROADMAP_DETERMINIST §2.2).
+    here as redundant channels (ROADMAP_DETERMINIST §2.2.a).
+
+    The state is **136 channels** = rotation6d (132) + root-local motion
+    (4).  The root-local motion ``(Δforward, Δlateral, Δheight, Δyaw)``
+    replaces the absolute ``root_translation`` (3) of the diffusion lean
+    representation — see ROADMAP_DETERMINIST §2.2.a (2026-06-24).
 
     Attributes
     ----------
     rotation6d : torch.Tensor
         Local 6D joint rotations, shape ``(..., numBones, 6)``.
-    rootTranslation : torch.Tensor
-        Global root translation, shape ``(..., 3)``.
+    rootLocalMotion : torch.Tensor
+        Root-local motion delta per frame, shape ``(..., 4)``.
+        Channels: ``(Δforward, Δlateral, Δheight, Δyaw)``.
     """
 
     rotation6d: torch.Tensor
-    rootTranslation: torch.Tensor
+    rootLocalMotion: torch.Tensor
 
     @property
     def numBones(self) -> int:
@@ -74,8 +83,8 @@ class ControlSignal:
         the root-local frame, shape ``(..., 2)``.
     aimDirection : torch.Tensor or None
         Desired heading as a unit 2-vector ``(cos θ, sin θ)``, shape
-        ``(..., 2)``; ``None`` in the C1 minimal control signal, present
-        from C2 onward.
+        ``(..., 2)``; ``None`` in the A1 minimal control signal, present
+        from A2 onward.
     """
 
     desiredPlanarVelocity: torch.Tensor
@@ -84,17 +93,17 @@ class ControlSignal:
 
 @dataclass(frozen=True)
 class StylePreset:
-    """A named, lockable style latent (DEFERRED — phase C3).
+    """A named, lockable style latent (DEFERRED — phase A3).
 
-    Not consumed by C1/C2: the current dataset has no style labels
+    Not consumed by A1/A2: the current dataset has no style labels
     (ROADMAP_DETERMINIST §1, §3.3).  Defined here so the state contract
-    is frozen once and C3 only has to wire it.
+    is frozen once and A3 only has to wire it.
 
     Attributes
     ----------
     name : str
         Preset identifier (e.g. ``"ninja"``), matching a file in
-        ``configs/styles/`` when C3 ships.
+        ``configs/styles/`` when A3 ships.
     vector : torch.Tensor
         The style latent ``z_style``, shape ``(styleLatentDim,)``.
     locked : bool
@@ -128,14 +137,15 @@ class ControllerV2Config:
     motionChannels : int
         Channels per bone (rotation6d → 6).
     globalChannels : int
-        Global per-frame channels (root_translation → 3).
+        Global per-frame channels: root-local motion → 4
+        ``(Δforward, Δlateral, Δheight, Δyaw)``.
     contextFrames : int
-        Number of past frames the controller sees per forward (C1 → 1,
-        extended in C4).
+        Number of past frames the controller sees per forward (A1 → 1,
+        extended in A4).
     phaseMode : PhaseMode
         Locomotor phase regime (``none`` | ``explicit`` | ``learned``).
     useAimDirection : bool
-        Append the aim-direction control channels (C2 rich control).
+        Append the aim-direction control channels (A2 rich control).
     useFilmConditioning : bool
         Global FiLM shortcut on the conditioning vector.
     usePerBlockFilm : bool
@@ -147,7 +157,7 @@ class ControllerV2Config:
     maxFrames : int
         Frame cap used to size positional encodings.
     styleLatentEnabled : bool
-        DEFERRED (C3) — inject a style latent.  Must stay ``False``
+        DEFERRED (A3) — inject a style latent.  Must stay ``False``
         until a style-labelled dataset exists.
     styleLatentDim : int
         Width of ``z_style`` when style latents are enabled.

@@ -1,9 +1,9 @@
-"""Scheduled sampling for the Goal C controller (phase C4).
+"""Scheduled sampling for the Goal A controller (phase A4).
 
-Corrects the **exposure bias** of the C1/C2 teacher-forced loop: at
+Corrects the **exposure bias** of the A1/A2 teacher-forced loop: at
 training time the controller only ever sees ground-truth windows, but at
 rollout it must consume its own (slightly wrong) predictions, and the
-errors compound (ROADMAP_DETERMINIST C4).  Scheduled sampling feeds the
+errors compound (ROADMAP_DETERMINIST A4).  Scheduled sampling feeds the
 model its own predictions during training with a probability ramped from
 0 to a target, so it learns to recover from its own drift.
 
@@ -232,13 +232,20 @@ def _nextWorkingFrame(
     )
     nextBone = (boneWindow[:, -1, :, :] + rawBoneDelta)[0]
     if rawGlobalDelta is None:
+        # Keep the last global frame (zero delta = no motion).
         return nextBone, globalWindow[0, -1, :]
-    nextGlobal = (globalWindow[:, -1, :] + rawGlobalDelta)[0]
+    # The next frame in the global context window is the predicted delta.
+    nextGlobal = rawGlobalDelta[0]
     return nextBone, nextGlobal
 
 
 def _gtNextGlobal(
     batch: ControllerSequenceBatch, step: int
 ) -> torch.Tensor:
-    """Ground-truth next root translation frame for ``step``."""
-    return batch.globalWindow[step, -1, :] + batch.targetGlobalDelta[step]
+    """Ground-truth next root-local-motion frame for ``step``.
+
+    The global context window holds root-local motion deltas (not
+    absolute translations), so the next GT frame is simply the target
+    delta at this step.
+    """
+    return batch.targetGlobalDelta[step]

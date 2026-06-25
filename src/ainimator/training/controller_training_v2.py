@@ -1,7 +1,7 @@
-"""Overfit / rollout training loop for the Goal C controller (C1).
+"""Overfit / rollout training loop for the Goal A controller (A1).
 
 This is the deterministic counterpart of ``training_v2.runOverfit``: the
-**feasibility gate** of ROADMAP_DETERMINIST C1.  Its single objective is
+**feasibility gate** of ROADMAP_DETERMINIST A1.  Its single objective is
 to prove that the autoregressive loop *trains and rolls out without
 exploding* — overfit one sequence, then roll the controller forward under
 the ground-truth-derived control and check that it reproduces the clip.
@@ -23,7 +23,7 @@ from typing import Optional
 import torch
 
 from ainimator.core.checkpoint_io import checkpointDir
-from ainimator.core.constants.controller import PhaseMode
+from ainimator.core.constants.controller import PhaseMode, ROOT_LOCAL_MOTION_CHANNELS
 from ainimator.core.resolved_config import writeResolvedConfig
 from ainimator.core.types.controller import ControllerV2Config
 from ainimator.data.controller_sequences import (
@@ -90,9 +90,9 @@ class ControllerTrainingConfig:
     contextFrames : int
         Autoregressive window length.
     phaseMode : PhaseMode
-        Locomotor phase regime (C1 default: ``none``).
+        Locomotor phase regime (A1 default: ``none``).
     useAimDirection : bool
-        Append aim-direction control channels (C2; off for C1).
+        Append aim-direction control channels (A2; off for A1).
     seed : int
         RNG seed.
     device : str
@@ -102,7 +102,7 @@ class ControllerTrainingConfig:
     lossWeights : ControllerLossWeights
         Loss term weights.
     scheduledSampling : float
-        Target scheduled-sampling probability (C4).  ``0`` keeps the fast
+        Target scheduled-sampling probability (A4).  ``0`` keeps the fast
         parallel teacher-forced loop; ``> 0`` enables the sequential
         scheduled-sampling loop with a linear ramp ``0 → target``.
     resumeCheckpoint : Optional[Path]
@@ -146,7 +146,7 @@ class ControllerOverfitResult:
     verdicts : dict[str, Verdict]
         Contract verdicts keyed by contract name.
     driftCurve : dict[int, float]
-        Rollout drift vs horizon (C4 "drift vs length" curve).
+        Rollout drift vs horizon (A4 "drift vs length" curve).
     checkpointPath : Path
         Saved checkpoint location.
     rolloutPath : Path
@@ -205,15 +205,24 @@ def _fitNormalizers(
     batch: ControllerSequenceBatch,
     numBones: int,
 ) -> tuple[MotionNormalizer, MotionNormalizer]:
-    """Fit the state and delta z-normalizers (truth #3)."""
+    """Fit the state and delta z-normalizers (truth #3).
+
+    Uses ``ROOT_LOCAL_MOTION_CHANNELS`` (4) for the global branch so the
+    normalizer matches the root-local motion representation
+    (ROADMAP_DETERMINIST §2.2.a).
+    """
     stateNormalizer = MotionNormalizer(
-        numBones=numBones, motionChannels=6, globalChannels=3
+        numBones=numBones,
+        motionChannels=6,
+        globalChannels=ROOT_LOCAL_MOTION_CHANNELS,
     )
     stateNormalizer.fitFromTensors(
         boneSamples=[batch.boneWindow], globalSamples=[batch.globalWindow]
     )
     deltaNormalizer = MotionNormalizer(
-        numBones=numBones, motionChannels=6, globalChannels=3
+        numBones=numBones,
+        motionChannels=6,
+        globalChannels=ROOT_LOCAL_MOTION_CHANNELS,
     )
     deltaNormalizer.fitFromTensors(
         boneSamples=[batch.targetBoneDelta],
@@ -288,7 +297,7 @@ def _trainLoop(
 
     Uses the fast parallel teacher-forced step by default; when
     ``config.scheduledSampling > 0`` it runs the sequential
-    scheduled-sampling step with a per-epoch ramped probability (C4).
+    scheduled-sampling step with a per-epoch ramped probability (A4).
     """
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -364,10 +373,19 @@ def _rolloutFromClip(
     stateNormalizer: MotionNormalizer,
     deltaNormalizer: MotionNormalizer,
     controlNorm: torch.Tensor,
+    clipRootTranslation: torch.Tensor,
 ) -> RolloutResult:
-    """Roll out from the first window under the GT-derived control."""
+    """Roll out from the first window under the GT-derived control.
+
+    ``clipRootTranslation`` provides the world-space XYZ seed needed by
+    the integration step in :func:`rolloutController`.
+    """
+    window = model.config.contextFrames
     seedBone = batch.boneWindow[:1]
-    seedGlobal = batch.globalWindow[:1]
+    # globalWindow is now root-local motion deltas (N, K, 4).
+    seedRootLocalMotion = batch.globalWindow[:1]
+    # Seed world-space positions: first K frames of the clip.
+    seedRootTranslation = clipRootTranslation[:window].unsqueeze(0)
     controlSequence = controlNorm.unsqueeze(0)
     phaseSequence = (
         None if batch.phase is None else batch.phase.unsqueeze(0)
@@ -377,23 +395,50 @@ def _rolloutFromClip(
         stateNormalizer,
         deltaNormalizer,
         seedBone,
-        seedGlobal,
+        seedRootTranslation,
         controlSequence,
         phaseSequence=phaseSequence,
+        seedRootLocalMotion=seedRootLocalMotion,
     )
 
 
 def _groundTruthTrajectory(
     batch: ControllerSequenceBatch,
+    clipRootTranslation: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reconstruct the GT trajectory aligned with the rollout frames."""
+    """Reconstruct the GT trajectory (world-space) aligned with the rollout.
+
+    Returns bone and root tensors of shape ``(1, K + N, ...)``.
+    The root is the absolute world-space XYZ trajectory rebuilt by
+    integrating the root-local motion deltas from the seed origin.
+    """
+    window = batch.boneWindow.shape[1]
     seedBone = batch.boneWindow[0]
-    seedGlobal = batch.globalWindow[0]
     bone = torch.cat([seedBone, batch.targetBoneNext], dim=0).unsqueeze(0)
-    rootDeltas = batch.targetGlobalDelta
-    lastSeedRoot = seedGlobal[-1]
-    rootAbsolute = lastSeedRoot + torch.cumsum(rootDeltas, dim=0)
-    root = torch.cat([seedGlobal, rootAbsolute], dim=0).unsqueeze(0)
+
+    # Seed root positions (K frames of absolute world XYZ).
+    seedRoot = clipRootTranslation[:window]  # (K, 3)
+
+    # Integrate the per-transition local deltas from the seed origin.
+    # ``targetGlobalDelta`` holds the local delta at each *next* frame.
+    from ainimator.geometry.root_local import (
+        pelvisYawFromRot6d,
+        rootLocalDeltasToAbsolute,
+    )
+
+    seedPelvisRot6d = batch.boneWindow[0, -1, 0, :]  # pelvis of last seed
+    seedYaw = pelvisYawFromRot6d(seedPelvisRot6d.unsqueeze(0)).squeeze(0)
+    seedOrigin = seedRoot[-1]  # last seed frame's world position
+
+    # localDeltas: (N, 4) from the sequence batch.
+    localDeltas = batch.targetGlobalDelta  # (N, 4)
+    rootAbsolute, _ = rootLocalDeltasToAbsolute(
+        seedOrigin, seedYaw, localDeltas
+    )  # (N, 3)
+
+    root = torch.cat(
+        [seedRoot, rootAbsolute], dim=0
+    ).unsqueeze(0)  # (1, K+N, 3)
     return bone, root
 
 
@@ -405,6 +450,7 @@ def _evaluate(
     stateNormalizer: MotionNormalizer,
     deltaNormalizer: MotionNormalizer,
     healthPath: Path,
+    clipRootTranslation: torch.Tensor,
 ) -> tuple[
     dict[str, float], dict[str, Verdict], dict[int, float], RolloutResult
 ]:
@@ -425,9 +471,10 @@ def _evaluate(
         phase=batch.phase,
     )
     rollout = _rolloutFromClip(
-        model, batch, stateNormalizer, deltaNormalizer, controlNorm
+        model, batch, stateNormalizer, deltaNormalizer, controlNorm,
+        clipRootTranslation,
     )
-    gtBone, gtRoot = _groundTruthTrajectory(batch)
+    gtBone, gtRoot = _groundTruthTrajectory(batch, clipRootTranslation)
     drift = rolloutDrift(rollout, gtBone, gtRoot)
     driftCurve = rolloutDriftCurve(
         rollout, gtBone, gtRoot, _driftHorizons(rollout.rotation6d.shape[1])
@@ -448,7 +495,7 @@ def _evaluate(
 
 
 def _driftHorizons(totalFrames: int) -> list[int]:
-    """Quartile horizons for the drift-vs-length curve (C4 health report)."""
+    """Quartile horizons for the drift-vs-length curve (A4 health report)."""
     quarters = [totalFrames // 4, totalFrames // 2,
                 (3 * totalFrames) // 4, totalFrames]
     return sorted({max(1, horizon) for horizon in quarters})
@@ -477,6 +524,7 @@ _PreparedComponents = tuple[
     torch.Tensor,
     ControllerSequenceBatch,
     torch.Tensor,
+    torch.Tensor,  # clipRootTranslation on device (for rollout seed)
 ]
 
 
@@ -494,8 +542,9 @@ def _prepareFresh(
         emitPhase=config.phaseMode is not PhaseMode.NONE,
         emitContacts=config.lossWeights.footContact > 0.0,
     )
+    clipRootOnDevice = clipRootTranslation.to(device)
     batch = buildControllerSequences(
-        clipRotation6d.to(device), clipRootTranslation.to(device),
+        clipRotation6d.to(device), clipRootOnDevice,
         sequenceConfig,
     )
     stateNormalizer, deltaNormalizer = _fitNormalizers(batch, numBones)
@@ -511,6 +560,7 @@ def _prepareFresh(
         controlStd,
         batch,
         controlNorm,
+        clipRootOnDevice,
     )
 
 
@@ -520,7 +570,7 @@ def _prepareResumed(
     clipRootTranslation: torch.Tensor,
     device: torch.device,
 ) -> _PreparedComponents:
-    """Warm-start: load model + normalizers + control stats (C4 fine-tune).
+    """Warm-start: load model + normalizers + control stats (A4 fine-tune).
 
     Architecture and normalization come from the checkpoint, so the
     fine-tune is numerically consistent with the resumed model.  The
@@ -538,8 +588,9 @@ def _prepareResumed(
         emitPhase=model.config.phaseMode is not PhaseMode.NONE,
         emitContacts=config.lossWeights.footContact > 0.0,
     )
+    clipRootOnDevice = clipRootTranslation.to(device)
     batch = buildControllerSequences(
-        clipRotation6d.to(device), clipRootTranslation.to(device),
+        clipRotation6d.to(device), clipRootOnDevice,
         sequenceConfig,
     )
     controlNorm = (
@@ -553,6 +604,7 @@ def _prepareResumed(
         controlStd,
         batch,
         controlNorm,
+        clipRootOnDevice,
     )
 
 
@@ -565,7 +617,7 @@ def runControllerOverfit(
     config: ControllerTrainingConfig,
     healthPath: Path = _DEFAULT_HEALTH_PATH,
 ) -> ControllerOverfitResult:
-    """Overfit one clip, roll it out, and gate on the C1 contracts."""
+    """Overfit one clip, roll it out, and gate on the A1 contracts."""
     torch.manual_seed(config.seed)
     device = resolveControllerDevice(config.device)
     if config.resumeCheckpoint is not None:
@@ -584,6 +636,7 @@ def runControllerOverfit(
         controlStd,
         batch,
         controlNorm,
+        clipRootOnDevice,
     ) = components
     tensors = _normalizeTensors(batch, stateNormalizer, deltaNormalizer)
 
@@ -601,6 +654,7 @@ def runControllerOverfit(
         stateNormalizer,
         deltaNormalizer,
         healthPath,
+        clipRootOnDevice,
     )
     checkpointPath = saveControllerCheckpoint(
         model,
@@ -717,6 +771,7 @@ def _saveRollout(rollout: RolloutResult, outputDir: Path) -> Path:
         {
             "rotation6d": rollout.rotation6d.detach().cpu(),
             "rootTranslation": rollout.rootTranslation.detach().cpu(),
+            "rootLocalMotion": rollout.rootLocalMotion.detach().cpu(),
         },
         path,
     )

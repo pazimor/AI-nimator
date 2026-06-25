@@ -1,4 +1,4 @@
-"""Tests for multi-clip controller training (C2/C4 validation path)."""
+"""Tests for multi-clip controller training (A2/A4 validation path)."""
 
 from __future__ import annotations
 

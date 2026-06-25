@@ -1,6 +1,6 @@
-"""Phase C0 tests — deterministic controller state, flags and schema.
+"""Phase A0 tests — deterministic controller state, flags and schema.
 
-Covers ROADMAP_DETERMINIST C0 acceptance:
+Covers ROADMAP_DETERMINIST A0 acceptance:
 * a controller YAML block with an unknown key raises a validation error
   that *names* the offending field;
 * the state dataclasses and architecture config behave as frozen;
@@ -46,7 +46,8 @@ _NETWORK_YAML = Path("src/configs/network.yaml")
 # Constants / channel layout
 # ---------------------------------------------------------------------
 def test_lean_state_channels_match_smpl22() -> None:
-    assert LEAN_STATE_CHANNELS == 22 * 6 + 3
+    # State = 22 bones × 6 channels (rot6d) + 4 channels (root-local motion).
+    assert LEAN_STATE_CHANNELS == 22 * 6 + 4
 
 
 def test_control_signal_channels_toggle_aim() -> None:
@@ -60,9 +61,10 @@ def test_control_signal_channels_toggle_aim() -> None:
 # State dataclasses
 # ---------------------------------------------------------------------
 def test_controller_state_is_frozen_and_reports_bones() -> None:
+    # State uses rootLocalMotion (4 channels) not rootTranslation (3).
     state = ControllerState(
         rotation6d=torch.zeros(4, 22, 6),
-        rootTranslation=torch.zeros(4, 3),
+        rootLocalMotion=torch.zeros(4, 4),
     )
     assert state.numBones == 22
     with pytest.raises(AttributeError):
@@ -106,6 +108,14 @@ def test_controller_config_phase_none_drops_phase_channels() -> None:
 
 
 def test_controller_config_output_dims() -> None:
+    # Default: root-local motion (4 channels) → 136 total output channels.
+    config = ControllerV2Config(numBones=22, motionChannels=6)
+    assert config.boneOutputDim == 132
+    assert config.totalOutputDim == 136  # 132 rot6d + 4 root-local motion
+
+
+def test_controller_config_output_dims_custom_global() -> None:
+    # Explicit override still works (e.g. for ablation studies).
     config = ControllerV2Config(numBones=22, motionChannels=6, globalChannels=3)
     assert config.boneOutputDim == 132
     assert config.totalOutputDim == 135
@@ -117,7 +127,7 @@ def test_controller_config_rejects_indivisible_heads() -> None:
 
 
 # ---------------------------------------------------------------------
-# Pydantic schema — unknown-key guard (C0 acceptance)
+# Pydantic schema — unknown-key guard (A0 acceptance)
 # ---------------------------------------------------------------------
 def test_controller_schema_unknown_key_names_field() -> None:
     with pytest.raises(ValidationError) as excinfo:

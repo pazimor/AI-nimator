@@ -124,7 +124,7 @@ __all__ = [
     "LearningRateHyperparameters",
     "NetworkConfig",
     "V2Batch",
-    # Goal C — deterministic controller types
+    # Goal A — deterministic controller types
     "ControlSignal",
     "ControllerState",
     "ControllerV2Config",

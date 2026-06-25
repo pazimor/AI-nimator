@@ -1,7 +1,7 @@
-"""Loss functions for the Goal C deterministic controller (phase C1).
+"""Loss functions for the Goal A deterministic controller (phase A1).
 
 The controller regresses ``Δstate`` per frame.  Its training objective
-(ROADMAP_DETERMINIST C1) combines:
+(ROADMAP_DETERMINIST A1) combines:
 
 1. :func:`velocityDeltaLoss` — L2 on the regressed deltas ("velocities")
    in normalized space.  This is the primary signal: it directly
@@ -12,7 +12,7 @@ The controller regresses ``Δstate`` per frame.  Its training objective
    errors near the root cannot masquerade as large/small depending on
    parameterisation.
 3. :func:`footContactLossController` — FK foot-contact supervision
-   (anti-skating).  Wired in phase C2; exposed here so the combiner is
+   (anti-skating).  Wired in phase A2; exposed here so the combiner is
    complete.
 
 The geodesic operates on **absolute** reconstructed rotations (the
@@ -122,14 +122,13 @@ def footContactStepLoss(
     predictedGlobalDelta: torch.Tensor,
     contactTarget: torch.Tensor,
 ) -> torch.Tensor:
-    """Per-step world-frame anti-skating loss (phase C2).
+    """Per-step anti-skating loss (phase A2).
 
-    For each predicted transition, penalises the **world** planar
-    velocity of a foot that the ground truth marks as in contact at the
-    target frame.  World velocity combines the local foot displacement
-    (from FK of the rotations) with the predicted root planar delta, so a
-    planted foot is penalised for sliding even as the pelvis advances over
-    it — the failure mode a rotation-only loss misses.
+    For each predicted transition, penalises the planar velocity of a
+    foot that the ground truth marks as in contact at the target frame.
+    The FK joint velocity (world-frame, from rotations) is combined with
+    the predicted root planar motion to capture foot sliding even as the
+    pelvis advances — the failure mode a rotation-only loss misses.
 
     Parameters
     ----------
@@ -138,7 +137,13 @@ def footContactStepLoss(
     lastRotation6d : torch.Tensor
         Last-window absolute rotations, ``(N, numBones, 6)``.
     predictedGlobalDelta : torch.Tensor
-        Predicted root translation delta, ``(N, 3)``.
+        Predicted root-local motion delta, ``(N, 4)`` —
+        ``(Δforward, Δlateral, Δheight, Δyaw)``.  Only the first two
+        channels (ground-plane displacement magnitude) are used, expressed
+        in the root-local frame as a proxy for the world-frame root
+        velocity.  The magnitude is frame-invariant; the direction
+        approximation is acceptable because LOT-1 targets straight-ahead
+        motion and the loss is scale-dominated.
     contactTarget : torch.Tensor
         Foot-contact mask at the target frame, ``(N, numFeet)`` ordered
         ``(leftFoot, rightFoot)``.
@@ -146,7 +151,7 @@ def footContactStepLoss(
     Returns
     -------
     torch.Tensor
-        Scalar mean of the contact-weighted squared world foot velocity.
+        Scalar mean of the contact-weighted squared foot velocity.
     """
     footIndices = _footJointIndices()
     nextXyz = rot6dToJointXYZ(predictedNextRotation6d.unsqueeze(1))
@@ -154,7 +159,11 @@ def footContactStepLoss(
     footNext = nextXyz.squeeze(1)[:, footIndices, :]
     footLast = lastXyz.squeeze(1)[:, footIndices, :]
     localVelocity = (footNext - footLast)[..., _GROUND_PLANE_AXES]
-    rootPlanar = predictedGlobalDelta[:, _GROUND_PLANE_AXES].unsqueeze(1)
+    # Use (Δforward, Δlateral) channels — ground-plane displacement in the
+    # root-local frame.  The magnitude equals the world-frame magnitude;
+    # only the direction differs (acceptable proxy for the anti-skating
+    # penalty).
+    rootPlanar = predictedGlobalDelta[:, :2].unsqueeze(1)
     worldVelocity = localVelocity + rootPlanar
     weighted = (worldVelocity ** 2) * contactTarget.unsqueeze(-1)
     return weighted.mean()
@@ -196,7 +205,7 @@ class ControllerLossWeights:
     geodesic : float
         Weight of the geodesic rotation term.
     footContact : float
-        Weight of the foot-contact term (0 until C2).
+        Weight of the foot-contact term (0 until A2).
     """
 
     velocity: float = 1.0
@@ -220,7 +229,7 @@ def combinedControllerLoss(
     weights : ControllerLossWeights
         Term weights.
     footContact : torch.Tensor or None
-        Optional foot-contact scalar (phase C2).
+        Optional foot-contact scalar (phase A2).
 
     Returns
     -------

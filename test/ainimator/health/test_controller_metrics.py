@@ -1,4 +1,4 @@
-"""Phase C1 tests — controller health metrics + contract loading."""
+"""Phase A1 tests — controller health metrics + contract loading."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ def _model() -> MotionController:
 def test_control_sensitivity_positive_for_varied_control() -> None:
     model = _model()
     bone = torch.randn(8, 1, 22, 6)
-    glob = torch.randn(8, 1, 3)
+    glob = torch.randn(8, 1, 4)
     control = torch.randn(8, model.config.controlChannels)
     value = controlSensitivity(model, bone, control, globalWindow=glob)
     assert value > 0.0
@@ -41,7 +41,7 @@ def test_control_sensitivity_positive_for_varied_control() -> None:
 def test_mean_collapse_returns_rank_and_sim() -> None:
     model = _model()
     bone = torch.randn(8, 1, 22, 6)
-    glob = torch.randn(8, 1, 3)
+    glob = torch.randn(8, 1, 4)
     control = torch.randn(8, model.config.controlChannels)
     out = model(bone, control, globalWindow=glob)
     rank, sim = meanCollapse(out)

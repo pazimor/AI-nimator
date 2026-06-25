@@ -1,4 +1,4 @@
-"""Health metrics for the Goal C controller (ROADMAP_DETERMINIST §4).
+"""Health metrics for the Goal A controller (ROADMAP_DETERMINIST §4).
 
 Reinterprets the existing collapse probes for the deterministic engine:
 in diffusion, collapse = the prompt is ignored; in the controller,
@@ -7,7 +7,7 @@ to the mean**.  The probe internals ``effective_rank`` /
 ``intra_batch_sim`` are reused verbatim (only reinterpreted), as required
 by §4.
 
-The three C1 contracts are:
+The three A1 contracts are:
 
 * ``control_sensitivity`` — output change when the control is shuffled
   (higher is better; ≈ 0 means the control is ignored).
@@ -146,10 +146,10 @@ def rolloutDriftCurve(
     groundTruthRootTranslation: torch.Tensor,
     horizons: Iterable[int],
 ) -> dict[int, float]:
-    """Cumulative rollout drift at increasing horizons (C4).
+    """Cumulative rollout drift at increasing horizons (A4).
 
     Produces the "drift vs rollout length" curve recorded in the health
-    report (ROADMAP_DETERMINIST C4): for each horizon ``h`` it measures
+    report (ROADMAP_DETERMINIST A4): for each horizon ``h`` it measures
     the trajectory error over the first ``h`` frames.  A healthy
     long-horizon controller keeps this curve bounded (no freeze /
     explosion).
@@ -175,6 +175,7 @@ def rolloutDriftCurve(
         truncated = RolloutResult(
             rotation6d=rollout.rotation6d[:, :clamped],
             rootTranslation=rollout.rootTranslation[:, :clamped],
+            rootLocalMotion=rollout.rootLocalMotion[:, :clamped],
         )
         curve[clamped] = rolloutDrift(
             truncated,

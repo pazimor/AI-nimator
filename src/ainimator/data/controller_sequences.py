@@ -1,14 +1,29 @@
-"""Autoregressive sequence builder for the Goal C controller (C1).
+"""Autoregressive sequence builder for the Goal A controller (A1).
 
 Turns a ground-truth motion clip (lean representation) into the windows,
 targets and control signal the :class:`MotionController` trains on
-(ROADMAP_DETERMINIST C1: "builder de séquences autorégressives — fenêtres,
+(ROADMAP_DETERMINIST A1: "builder de séquences autorégressives — fenêtres,
 cibles Δstate dérivées de la GT, signal de contrôle dérivé de la GT").
 
 This module lives in the ``data`` layer: ``training`` (the only junction
 module) imports it; ``model`` never does.  It produces tensors in **raw**
 (un-normalized) space — z-normalization is applied by the training loop
 so the same builder serves train, rollout and export.
+
+State representation (ROADMAP_DETERMINIST §2.2.a)
+-------------------------------------------------
+The state is **136 channels** = rotation6d (132) + root-local motion (4).
+The root-local motion ``(Δforward, Δlateral, Δheight, Δyaw)`` replaces the
+absolute ``root_translation`` (3) of the diffusion lean representation.
+Conversion from GT absolute trajectories is handled by
+:mod:`ainimator.geometry.root_local`.
+
+Control signal (ROADMAP_DETERMINIST §2.2.b)
+-------------------------------------------
+``(vx, vz)`` is the desired planar velocity in the **root-local frame**
+at each step (not world frame).  ``(aim_x, aim_z)`` is the facing
+direction unit vector derived from the **pelvis yaw** — decoupled from
+locomotion direction (a character can face east while walking north).
 
 Conventions
 -----------
@@ -17,9 +32,10 @@ Conventions
   state[t]`` and the absolute next rotation ``state[t+1]`` (geodesic
   target).
 * The control signal is *derived from the ground truth* so a rollout
-  driven by it must reproduce the clip (the C1 smoke test).  For C1 the
-  control is the desired **planar root velocity** (world-frame x/z
-  displacement per frame); the aim direction is added in C2.
+  driven by it must reproduce the clip (the A1 smoke test).
+* The ``globalWindow`` tensor holds the **root-local motion deltas**
+  (not absolute translations) so the model's context window is
+  stationary-frame-invariant.
 """
 
 from __future__ import annotations
@@ -31,8 +47,13 @@ import torch
 
 from ainimator.core.constants.controller import (
     CONTROL_PLANAR_VELOCITY_CHANNELS,
+    ROOT_LOCAL_MOTION_CHANNELS,
 )
 from ainimator.geometry.components.ops import rot6dToJointXYZ
+from ainimator.geometry.root_local import (
+    absoluteToRootLocalDeltas,
+    aimDirectionFromPelvisYaw,
+)
 
 # Ground-plane axes of the SMPL Y-up convention (x, z).
 _GROUND_PLANE_AXES = (0, 2)
@@ -43,7 +64,7 @@ _FOOT_JOINT_INDICES = (10, 11)
 # Default contact thresholds: a foot is "in contact" when it sits below
 # ``heightThreshold`` (meters) AND moves slower than ``speedThreshold``
 # (meters/frame) on the ground plane.  Conservative defaults; tuned per
-# dataset during C2 validation.
+# dataset during A2 validation.
 _DEFAULT_CONTACT_HEIGHT = 0.05
 _DEFAULT_CONTACT_SPEED = 0.01
 # Half a gait cycle advances the phase by π (one foot strike).
@@ -59,11 +80,11 @@ class ControllerSequenceConfig:
     contextFrames : int
         Window length ``K`` (frames seen per forward).
     useAimDirection : bool
-        Append the aim-direction control channels (C2 rich control).
+        Append the aim-direction control channels (A2 rich control).
     emitPhase : bool
-        Derive a foot-contact gait phase and emit it per transition (C2).
+        Derive a foot-contact gait phase and emit it per transition (A2).
     emitContacts : bool
-        Derive foot-contact labels and emit them per transition (C2,
+        Derive foot-contact labels and emit them per transition (A2,
         consumed by the anti-skating loss).
     contactHeight : float
         Vertical threshold (m) below which a foot may be in contact.
@@ -96,22 +117,30 @@ class ControllerSequenceBatch:
     boneWindow : torch.Tensor
         ``(N, K, numBones, 6)`` raw rotation6d windows.
     globalWindow : torch.Tensor
-        ``(N, K, 3)`` raw root_translation windows.
+        ``(N, K, 4)`` root-local motion delta windows
+        ``(Δforward, Δlateral, Δheight, Δyaw)``.  Each frame in the
+        window is the local-frame displacement at that frame (computed
+        relative to the previous frame's pelvis yaw).
     targetBoneNext : torch.Tensor
         ``(N, numBones, 6)`` absolute next-frame rotation (geodesic
         target).
     targetBoneDelta : torch.Tensor
         ``(N, numBones, 6)`` next-frame rotation delta.
     targetGlobalDelta : torch.Tensor
-        ``(N, 3)`` next-frame root_translation delta.
+        ``(N, 4)`` next-frame root-local motion delta
+        ``(Δforward, Δlateral, Δheight, Δyaw)``.
     control : torch.Tensor
         ``(N, controlChannels)`` GT-derived control signal.
+        Channel layout: ``(vx, vz [, aim_x, aim_z])``.
+        ``(vx, vz)`` is in the root-local frame (z-normalized by the
+        training loop); ``(aim_x, aim_z)`` is a unit facing vector
+        derived from pelvis yaw (excluded from z-norm).
     phase : torch.Tensor or None
         ``(N, 2)`` gait phase ``(cos φ, sin φ)`` at the target frame
-        (C2), or ``None`` when phase emission is off.
+        (A2), or ``None`` when phase emission is off.
     contactTarget : torch.Tensor or None
         ``(N, 2)`` foot-contact labels ``(left, right)`` at the target
-        frame (C2), or ``None`` when contact emission is off.
+        frame (A2), or ``None`` when contact emission is off.
     """
 
     boneWindow: torch.Tensor
@@ -136,12 +165,16 @@ def buildControllerSequences(
 ) -> ControllerSequenceBatch:
     """Build autoregressive windows + targets + control from one clip.
 
+    Converts the absolute ``rootTranslation`` GT to root-local motion
+    deltas (ROADMAP_DETERMINIST §2.2.a) before building windows.
+
     Parameters
     ----------
     rotation6d : torch.Tensor
         Ground-truth rotations, shape ``(F, numBones, 6)``.
     rootTranslation : torch.Tensor
-        Ground-truth root translation, shape ``(F, 3)``.
+        Ground-truth root translation, shape ``(F, 3)`` — absolute,
+        world-space XYZ (as stored in the AMASS dataset).
     config : ControllerSequenceConfig
         Window / control configuration.
 
@@ -160,6 +193,9 @@ def buildControllerSequences(
     window = config.contextFrames
     numTransitions = frames - window
 
+    # Convert absolute GT trajectory → root-local motion deltas (F, 4).
+    rootLocalMotion = absoluteToRootLocalDeltas(rootTranslation, rotation6d)
+
     starts = torch.arange(numTransitions, device=rotation6d.device)
     windowIndex = starts[:, None] + torch.arange(
         window, device=rotation6d.device
@@ -168,12 +204,14 @@ def buildControllerSequences(
     nextFrame = starts + window
 
     boneWindow = rotation6d[windowIndex]
-    globalWindow = rootTranslation[windowIndex]
+    # globalWindow holds root-local motion delta history (N, K, 4).
+    globalWindow = rootLocalMotion[windowIndex]
     targetBoneNext = rotation6d[nextFrame]
     targetBoneDelta = targetBoneNext - rotation6d[lastFrame]
-    targetGlobalDelta = rootTranslation[nextFrame] - rootTranslation[lastFrame]
+    # Target global delta: the root-local motion at the *next* frame.
+    targetGlobalDelta = rootLocalMotion[nextFrame]
 
-    control = _deriveControl(targetGlobalDelta, config)
+    control = _deriveControl(rotation6d, targetGlobalDelta, nextFrame, config)
     phase, contactTarget = _derivePhaseAndContacts(
         rotation6d, rootTranslation, nextFrame, config
     )
@@ -195,7 +233,7 @@ def _derivePhaseAndContacts(
     nextFrame: torch.Tensor,
     config: ControllerSequenceConfig,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    """Derive per-transition gait phase and contact labels (C2)."""
+    """Derive per-transition gait phase and contact labels (A2)."""
     if not (config.emitPhase or config.emitContacts):
         return None, None
     contacts = deriveFootContacts(
@@ -291,30 +329,28 @@ def _contactOnsets(contacts: torch.Tensor) -> list[int]:
 
 
 def _deriveControl(
-    globalDelta: torch.Tensor,
+    rotation6d: torch.Tensor,
+    targetGlobalDelta: torch.Tensor,
+    nextFrame: torch.Tensor,
     config: ControllerSequenceConfig,
 ) -> torch.Tensor:
-    """Derive the GT control signal from the root translation delta."""
-    planarVelocity = globalDelta[:, _GROUND_PLANE_AXES]
+    """Derive the GT control signal.
+
+    ``(vx, vz)`` = the root-local planar velocity (Δforward, Δlateral)
+    taken directly from ``targetGlobalDelta[:, :2]`` — already in the
+    local frame.
+
+    ``(aim_x, aim_z)`` = unit facing vector derived from the pelvis yaw
+    at the target frame, **decoupled** from locomotion direction
+    (ROADMAP_DETERMINIST §2.2.b).
+    """
+    # Root-local planar velocity: first two channels of the 4-channel delta.
+    planarVelocity = targetGlobalDelta[:, :2]  # (N, 2) — already local frame
     if not config.useAimDirection:
         return planarVelocity
-    aim = _aimDirection(planarVelocity)
+    # Aim from pelvis facing at the *next* (target) frame.
+    aim = aimDirectionFromPelvisYaw(rotation6d)[nextFrame]  # (N, 2)
     return torch.cat([planarVelocity, aim], dim=-1)
-
-
-def _aimDirection(planarVelocity: torch.Tensor) -> torch.Tensor:
-    """Unit heading from planar velocity (C2 rich control).
-
-    Falls back to ``(1, 0)`` for near-stationary frames so the unit
-    vector is always well defined (no NaN from normalizing a zero).
-    """
-    norm = planarVelocity.norm(dim=-1, keepdim=True)
-    safe = norm.clamp(min=1e-6)
-    unit = planarVelocity / safe
-    forward = torch.zeros_like(unit)
-    forward[..., 0] = 1.0
-    isMoving = (norm > 1e-6).to(unit.dtype)
-    return isMoving * unit + (1.0 - isMoving) * forward
 
 
 def _validateClip(
@@ -344,7 +380,11 @@ def _validateClip(
             f"contextFrames={config.contextFrames} (need > K)."
         )
     expectedPlanar = CONTROL_PLANAR_VELOCITY_CHANNELS
-    if expectedPlanar != len(_GROUND_PLANE_AXES):
+    if expectedPlanar != 2:
         raise ValueError(
-            "planar control channels do not match ground-plane axes."
+            "planar control channels do not match expected 2."
+        )
+    if ROOT_LOCAL_MOTION_CHANNELS != 4:
+        raise ValueError(
+            "ROOT_LOCAL_MOTION_CHANNELS must be 4."
         )

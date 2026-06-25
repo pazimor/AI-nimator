@@ -16,8 +16,8 @@ from ainimator.model.motion_normalizer import MotionNormalizer
 
 
 def _normalizers() -> tuple[MotionNormalizer, MotionNormalizer]:
-    state = MotionNormalizer(numBones=22, motionChannels=6, globalChannels=3)
-    delta = MotionNormalizer(numBones=22, motionChannels=6, globalChannels=3)
+    state = MotionNormalizer(numBones=22, motionChannels=6, globalChannels=4)
+    delta = MotionNormalizer(numBones=22, motionChannels=6, globalChannels=4)
     return state, delta
 
 

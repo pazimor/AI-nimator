@@ -1,4 +1,4 @@
-"""Phase C4 tests — scheduled sampling + drift-vs-length curve."""
+"""Phase A4 tests — scheduled sampling + drift-vs-length curve."""
 
 from __future__ import annotations
 

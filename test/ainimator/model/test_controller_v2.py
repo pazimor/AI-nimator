@@ -1,4 +1,4 @@
-"""Phase C1 tests — MotionController forward, shapes, ONNX-friendliness."""
+"""Phase A1 tests — MotionController forward, shapes, ONNX-friendliness."""
 
 from __future__ import annotations
 
@@ -27,12 +27,12 @@ def test_forward_output_shapes_no_phase() -> None:
     out = model(
         torch.randn(batch, window, 22, 6),
         torch.randn(batch, config.controlChannels),
-        globalWindow=torch.randn(batch, window, 3),
+        globalWindow=torch.randn(batch, window, 4),
     )
     assert isinstance(out, ControllerOutput)
     assert out.boneDelta.shape == (batch, 22, 6)
     assert out.globalDelta is not None
-    assert out.globalDelta.shape == (batch, 3)
+    assert out.globalDelta.shape == (batch, 4)
 
 
 def test_forward_with_explicit_phase() -> None:
@@ -41,7 +41,7 @@ def test_forward_with_explicit_phase() -> None:
     out = model(
         torch.randn(3, 1, 22, 6),
         torch.randn(3, config.controlChannels),
-        globalWindow=torch.randn(3, 1, 3),
+        globalWindow=torch.randn(3, 1, 4),
         phase=torch.randn(3, config.phaseChannels),
     )
     assert out.boneDelta.shape == (3, 22, 6)
@@ -54,7 +54,7 @@ def test_missing_phase_raises_when_required() -> None:
         model(
             torch.randn(2, 1, 22, 6),
             torch.randn(2, config.controlChannels),
-            globalWindow=torch.randn(2, 1, 3),
+            globalWindow=torch.randn(2, 1, 4),
         )
 
 
@@ -65,7 +65,7 @@ def test_wrong_window_length_raises() -> None:
         model(
             torch.randn(2, 1, 22, 6),
             torch.randn(2, config.controlChannels),
-            globalWindow=torch.randn(2, 1, 3),
+            globalWindow=torch.randn(2, 1, 4),
         )
 
 
@@ -75,7 +75,7 @@ def test_context_window_greater_than_one() -> None:
     out = model(
         torch.randn(2, 4, 22, 6),
         torch.randn(2, config.controlChannels),
-        globalWindow=torch.randn(2, 4, 3),
+        globalWindow=torch.randn(2, 4, 4),
     )
     assert out.boneDelta.shape == (2, 22, 6)
 
@@ -85,7 +85,7 @@ def test_forward_is_deterministic_in_eval() -> None:
     model = MotionController(config).eval()
     bone = torch.randn(2, 1, 22, 6)
     ctrl = torch.randn(2, config.controlChannels)
-    glob = torch.randn(2, 1, 3)
+    glob = torch.randn(2, 1, 4)
     first = model(bone, ctrl, globalWindow=glob).boneDelta
     second = model(bone, ctrl, globalWindow=glob).boneDelta
     assert torch.allclose(first, second)
@@ -97,7 +97,7 @@ def test_single_forward_is_onnx_exportable(tmp_path) -> None:
     wrapper = ControllerForwardWrapper(MotionController(config)).eval()
     bone = torch.randn(2, 1, 22, 6)
     ctrl = torch.randn(2, config.controlChannels)
-    glob = torch.randn(2, 1, 3)
+    glob = torch.randn(2, 1, 4)
     destination = tmp_path / "controller.onnx"
     torch.onnx.export(
         wrapper,
@@ -121,7 +121,7 @@ def test_control_modulates_output() -> None:
     config = _config(phaseMode=PhaseMode.NONE)
     model = MotionController(config).eval()
     bone = torch.randn(4, 1, 22, 6)
-    glob = torch.randn(4, 1, 3)
+    glob = torch.randn(4, 1, 4)
     out_a = model(bone, torch.zeros(4, config.controlChannels),
                   globalWindow=glob).boneDelta
     out_b = model(bone, torch.ones(4, config.controlChannels) * 5.0,

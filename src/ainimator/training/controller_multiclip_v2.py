@@ -1,7 +1,7 @@
-"""Small-N multi-clip controller training (Goal C — C2/C4 validation).
+"""Small-N multi-clip controller training (Goal A — A2/A4 validation).
 
-The single-clip overfit (``controller_training_v2``) validates C1 and the
-C4 mechanism, but two acceptance criteria are *only* meaningful with
+The single-clip overfit (``controller_training_v2``) validates A1 and the
+A4 mechanism, but two acceptance criteria are *only* meaningful with
 several clips and **varied control** (ROADMAP_DETERMINIST §4/§5):
 
 * ``mean_collapse`` SAIN — ``effective_rank`` only rises when the batch
@@ -26,7 +26,7 @@ from pathlib import Path
 
 import torch
 
-from ainimator.core.constants.controller import PhaseMode
+from ainimator.core.constants.controller import PhaseMode, ROOT_LOCAL_MOTION_CHANNELS
 from ainimator.core.resolved_config import writeResolvedConfig
 from ainimator.data.controller_sequences import (
     ControllerSequenceBatch,
@@ -144,16 +144,24 @@ def _fitNormalizersMulti(
     batches: list[ControllerSequenceBatch],
     numBones: int,
 ) -> tuple[MotionNormalizer, MotionNormalizer]:
-    """Fit state + delta z-normalizers across ALL clips (truth #3)."""
+    """Fit state + delta z-normalizers across ALL clips (truth #3).
+
+    Uses ``ROOT_LOCAL_MOTION_CHANNELS`` (4) for the global branch to
+    match the root-local motion representation (§2.2.a).
+    """
     stateNormalizer = MotionNormalizer(
-        numBones=numBones, motionChannels=6, globalChannels=3
+        numBones=numBones,
+        motionChannels=6,
+        globalChannels=ROOT_LOCAL_MOTION_CHANNELS,
     )
     stateNormalizer.fitFromTensors(
         boneSamples=[b.boneWindow for b in batches],
         globalSamples=[b.globalWindow for b in batches],
     )
     deltaNormalizer = MotionNormalizer(
-        numBones=numBones, motionChannels=6, globalChannels=3
+        numBones=numBones,
+        motionChannels=6,
+        globalChannels=ROOT_LOCAL_MOTION_CHANNELS,
     )
     deltaNormalizer.fitFromTensors(
         boneSamples=[b.targetBoneDelta for b in batches],
@@ -251,6 +259,7 @@ def _multiClipLoss(
 def _evaluateMultiClip(
     model: MotionController,
     batches: list[ControllerSequenceBatch],
+    clipRootTranslations: list[torch.Tensor],
     merged: ControllerSequenceBatch,
     mergedTensors: dict[str, torch.Tensor],
     controlMean: torch.Tensor,
@@ -277,8 +286,8 @@ def _evaluateMultiClip(
         phase=merged.phase,
     )
     drift, driftCurve = _perClipDrift(
-        model, batches, controlMean, controlStd, stateNormalizer,
-        deltaNormalizer,
+        model, batches, clipRootTranslations, controlMean, controlStd,
+        stateNormalizer, deltaNormalizer,
     )
     postNorm = max(
         postNormStats(mergedTensors["normBoneWindow"]),
@@ -297,6 +306,7 @@ def _evaluateMultiClip(
 def _perClipDrift(
     model: MotionController,
     batches: list[ControllerSequenceBatch],
+    clipRootTranslations: list[torch.Tensor],
     controlMean: torch.Tensor,
     controlStd: torch.Tensor,
     stateNormalizer: MotionNormalizer,
@@ -309,9 +319,12 @@ def _perClipDrift(
     for index, batch in enumerate(batches):
         controlNorm = (batch.control - controlMean) / controlStd
         rollout = _rolloutFromClip(
-            model, batch, stateNormalizer, deltaNormalizer, controlNorm
+            model, batch, stateNormalizer, deltaNormalizer, controlNorm,
+            clipRootTranslations[index],
         )
-        gtBone, gtRoot = _groundTruthTrajectory(batch)
+        gtBone, gtRoot = _groundTruthTrajectory(
+            batch, clipRootTranslations[index]
+        )
         drifts.append(rolloutDrift(rollout, gtBone, gtRoot))
         if index == longest:
             curve = rolloutDriftCurve(
@@ -329,7 +342,7 @@ def runControllerMultiClip(
     config: ControllerTrainingConfig,
     healthPath: Path = _DEFAULT_HEALTH_PATH,
 ) -> ControllerOverfitResult:
-    """Train the controller on several clips; gate on C2/C4 contracts."""
+    """Train the controller on several clips; gate on A2/A4 contracts."""
     if len(clips) < 2:
         raise ValueError("multi-clip training needs at least 2 clips.")
     torch.manual_seed(config.seed)
@@ -362,14 +375,21 @@ def runControllerMultiClip(
         controlStd, deltaNormalizer, stateNormalizer, config,
     )
 
+    clipRootTranslations = [
+        rot.to(device) for _, rot in [
+            (clips[i][0], clips[i][1]) for i in range(len(clips))
+        ]
+    ]
+
     config.outputDir.mkdir(parents=True, exist_ok=True)
     metrics, verdicts, driftCurve = _evaluateMultiClip(
-        model, batches, merged, mergedTensors, controlMean, controlStd,
-        stateNormalizer, deltaNormalizer, healthPath,
+        model, batches, clipRootTranslations, merged, mergedTensors,
+        controlMean, controlStd, stateNormalizer, deltaNormalizer, healthPath,
     )
     rollout = _rolloutFromClip(
         model, batches[0], stateNormalizer, deltaNormalizer,
         (batches[0].control - controlMean) / controlStd,
+        clipRootTranslations[0],
     )
     checkpointPath = saveControllerCheckpoint(
         model, stateNormalizer, deltaNormalizer, controlMean, controlStd,
@@ -418,6 +438,10 @@ def _buildOrResumeModel(
         config, config.phaseMode, config.useAimDirection,
         config.contextFrames,
     )
-    placeholderState = MotionNormalizer(numBones, 6, 3).to(device)
-    placeholderDelta = MotionNormalizer(numBones, 6, 3).to(device)
+    placeholderState = MotionNormalizer(
+        numBones, 6, ROOT_LOCAL_MOTION_CHANNELS
+    ).to(device)
+    placeholderDelta = MotionNormalizer(
+        numBones, 6, ROOT_LOCAL_MOTION_CHANNELS
+    ).to(device)
     return model, placeholderState, placeholderDelta, sequenceConfig

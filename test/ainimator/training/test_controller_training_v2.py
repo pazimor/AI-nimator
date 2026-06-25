@@ -1,6 +1,6 @@
-"""Phase C1 feasibility-gate tests — overfit one clip, roll it out.
+"""Phase A1 feasibility-gate tests — overfit one clip, roll it out.
 
-ROADMAP_DETERMINIST C1 acceptance: overfit one sequence → a short
+ROADMAP_DETERMINIST A1 acceptance: overfit one sequence → a short
 rollout that reproduces it (bounded ``rollout_drift``), ``post_norm_stats``
 OK on state and deltas, and a round-tripping checkpoint.  Runs on
 synthetic data (no dataset on disk), mirroring ``make smoke-test``.
@@ -86,16 +86,18 @@ def test_checkpoint_round_trips(tmp_path: Path) -> None:
     )
     model.eval()
     bone = torch.randn(2, model.config.contextFrames, 22, 6)
-    glob = torch.randn(2, model.config.contextFrames, 3)
+    glob = torch.randn(2, model.config.contextFrames, model.config.globalChannels)
     control = torch.randn(2, model.config.controlChannels)
     out = model(bone, control, globalWindow=glob)
     assert out.boneDelta.shape == (2, 22, 6)
+    assert out.globalDelta is not None
+    assert out.globalDelta.shape == (2, model.config.globalChannels)
     assert controlMean.shape[-1] == model.config.controlChannels
     assert controlStd.shape[-1] == model.config.controlChannels
 
 
 # ---------------------------------------------------------------------
-# C2 — explicit phase + rich control + foot contact
+# A2 — explicit phase + rich control + foot contact
 # ---------------------------------------------------------------------
 def _c2Config(outputDir: Path) -> ControllerTrainingConfig:
     return ControllerTrainingConfig(
@@ -129,4 +131,4 @@ def test_c2_phase_and_rich_control_trains_and_reproduces(
     # control_sensitivity must stay strictly positive.
     assert result.metrics["control_sensitivity"] > 0.0
     # mean_collapse SAIN is a varied-control (multi-clip) gate, NOT a
-    # single-overfit-clip property — see ROADMAP_DETERMINIST C2.
+    # single-overfit-clip property — see ROADMAP_DETERMINIST A2.
