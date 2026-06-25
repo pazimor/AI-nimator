@@ -108,6 +108,49 @@ controller_profiles:
       scheduled-sampling: 0.0
       foot-contact-weight: 0.0
 
+# ============================================
+# Diagnose profiles (G-PROFILES, §8.2)
+# ============================================
+# Profiles for `health diagnose --profile <name> <checkpoint>`.
+# Resolution order: base defaults → profile delta.
+# --profile is required in controller mode; optional in diffusion mode.
+# Keys under `diagnose.*` map to the flags listed in ROADMAP §8.2.
+# ============================================
+diagnose_profiles:
+  controller_default:
+    # Controller diagnose defaults (§8.2).
+    # These reproduce the CLI flag defaults that were proposed in §8.2.
+    diagnose:
+      control: "forward:1.0"          # control spec parsed by _parseControl
+      rollout-frames: 120             # autoregressive rollout length
+      shuffle-control: false          # measure control_sensitivity via shuffle
+      phase-mode: null                # null = read from checkpoint
+      seeds: "0,42,123"              # seed sweep for rollout diversity
+    # Diffusion fields unused; kept null to make routing explicit.
+    diffusion:
+      prompt: null
+      cfg-scales: null
+      num-steps: null
+
+  controller_short:
+    # Fast smoke-test diagnose (< 30 s on MPS).
+    diagnose:
+      control: "forward:1.0"
+      rollout-frames: 30
+      shuffle-control: true
+      phase-mode: null
+      seeds: "0,42"
+
+  diffusion_default:
+    # Diffusion diagnose defaults — mirrors the pre-LOT4 CLI flag defaults.
+    # These are the original defaults for the diffusion path.
+    diagnose:
+      prompt: "a person walks forward"
+      seeds: "0,42,123"
+      cfg-scales: "1.0,4.0,6.0"
+      frames: 120
+      num-steps: 100
+
 v2:
   # Top-level embed-dim is unused by v2 (no CLIP contrastive pre-train).
   # Kept for schema compatibility with the loader.
