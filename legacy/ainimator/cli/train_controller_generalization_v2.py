@@ -1,4 +1,11 @@
-"""CLI — Goal A controller **generalization** training (phase A6).
+"""ARCHIVED (A7, 2026-06-25) — superseded by train_controller_v2 --profile full.
+
+Use ``python -m ainimator.cli.train_controller_v2 --profile full`` instead.
+This CLI is kept in ``legacy/`` for historical reference only.
+
+Original module docstring follows.
+----------------------------------------------------------------------
+CLI — Goal A controller **generalization** training (phase A6).
 
 Zero logic: pick a working set of clips, split it into a disjoint
 train / held-out partition (deterministic, seeded), load the tensors and

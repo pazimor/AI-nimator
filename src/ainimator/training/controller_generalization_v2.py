@@ -1,25 +1,24 @@
-"""Generalization training for the Goal A controller (phase A6).
+"""Generalization training for the Goal A controller (phase A6/A7).
 
 A0–A5 were validated in **overfit** (1, then 16 clips): "the rollout
 reproduces the clip it was trained on".  A6 is the first regime that tests
 **generalization** — train on many clips, then judge on clips the model
 **never saw** (ROADMAP_DETERMINIST A6).
 
-Two differences with :mod:`controller_multiclip_v2`:
+This module is also the backing implementation of the ``full`` profile
+of the unified ``train_controller_v2`` CLI (phase A7).
+
+Two differences with the archived multi-clip path:
 
 * **Held-out split.** Training consumes only the train clips; the honest
   metrics (reconstruction, drift, control sensitivity) are measured on a
   disjoint held-out set whose control is derived from *its own* ground
   truth.
-* **Clip-minibatched loop.** The multi-clip path concatenates every clip
-  into one full-batch step — fine at 16 clips, an OOM at ~1000.  Here each
-  optimizer step samples ``clipBatchSize`` clips, builds their sequences on
-  device and discards them, so memory is bounded by the minibatch, not by
-  the dataset size.
-
-The whole evaluation reuses the existing controller machinery (rollout,
-drift, collapse/sensitivity probes); only the train loop and the streaming
-normalizer fit are new.
+* **Clip-minibatched loop.** The multi-clip path concatenated every clip
+  into one full-batch step — fine at 16 clips, an OOM at ~1000.  Here
+  each optimizer step samples ``clipBatchSize`` clips, builds their
+  sequences on device and discards them, so memory is bounded by the
+  minibatch, not by the dataset size.
 """
 
 from __future__ import annotations
@@ -31,7 +30,10 @@ from pathlib import Path
 
 import torch
 
-from ainimator.core.constants.controller import ROOT_LOCAL_MOTION_CHANNELS
+from ainimator.core.constants.controller import (
+    PhaseMode,
+    ROOT_LOCAL_MOTION_CHANNELS,
+)
 from ainimator.core.resolved_config import writeResolvedConfig
 from ainimator.data.controller_sequences import (
     ControllerSequenceBatch,
@@ -44,25 +46,25 @@ from ainimator.health.controller_metrics import (
     controlSensitivity,
     meanCollapse,
     postNormStats,
+    rolloutDrift,
+    rolloutDriftCurve,
 )
+from ainimator.model.controller_rollout import rolloutController
 from ainimator.model.controller_v2 import MotionController
 from ainimator.model.losses_controller_v2 import geodesicRotationLoss
 from ainimator.model.motion_normalizer import (
     MotionNormalizer,
     denormalizeStepDelta,
 )
-from ainimator.training.controller_multiclip_v2 import (
-    _buildClipBatches,
-    _concatClipBatches,
-    _perClipDrift,
-    _sequenceConfig,
-)
 from ainimator.training.controller_training_v2 import (
     ControllerTrainingConfig,
     _DEFAULT_HEALTH_PATH,
+    _driftHorizons,
     _evaluateContracts,
     _forwardLosses,
+    _groundTruthTrajectory,
     _normalizeTensors,
+    _rolloutFromClip,
     buildControllerModelConfig,
     resolveControllerDevice,
     saveControllerCheckpoint,
@@ -72,6 +74,177 @@ LOGGER = logging.getLogger("ainimator.training.controller_generalization")
 
 Clip = tuple[torch.Tensor, torch.Tensor]
 _CONTROL_STD_FLOOR = 1e-5
+
+
+# ---------------------------------------------------------------------
+# Clip-batch utilities (inlined from archived controller_multiclip_v2)
+# ---------------------------------------------------------------------
+def _sequenceConfig(
+    config: ControllerTrainingConfig,
+    phaseMode: PhaseMode,
+    useAim: bool,
+    contextFrames: int,
+) -> ControllerSequenceConfig:
+    """Build the sequence config shared by every clip.
+
+    Parameters
+    ----------
+    config : ControllerTrainingConfig
+        Training config (used for loss-weight flags).
+    phaseMode : PhaseMode
+        Locomotor phase regime.
+    useAim : bool
+        Whether to emit aim-direction control channels.
+    contextFrames : int
+        Autoregressive context window length.
+
+    Returns
+    -------
+    ControllerSequenceConfig
+        Shared config for all clip sequence builds.
+    """
+    return ControllerSequenceConfig(
+        contextFrames=contextFrames,
+        useAimDirection=useAim,
+        emitPhase=phaseMode is not PhaseMode.NONE,
+        emitContacts=config.lossWeights.footContact > 0.0,
+    )
+
+
+def _buildClipBatches(
+    clips: list[Clip],
+    sequenceConfig: ControllerSequenceConfig,
+    device: torch.device,
+) -> list[ControllerSequenceBatch]:
+    """Build one autoregressive batch per clip (on ``device``).
+
+    Parameters
+    ----------
+    clips : list[Clip]
+        List of (rotation6d, rootTranslation) tensor pairs.
+    sequenceConfig : ControllerSequenceConfig
+        Shared sequence config.
+    device : torch.device
+        Target device for tensors.
+
+    Returns
+    -------
+    list[ControllerSequenceBatch]
+        One batch per clip.
+    """
+    batches: list[ControllerSequenceBatch] = []
+    for rotation6d, rootTranslation in clips:
+        batches.append(
+            buildControllerSequences(
+                rotation6d.to(device),
+                rootTranslation.to(device),
+                sequenceConfig,
+            )
+        )
+    return batches
+
+
+def _concatClipBatches(
+    batches: list[ControllerSequenceBatch],
+) -> ControllerSequenceBatch:
+    """Concatenate per-clip batches into one merged batch.
+
+    Parameters
+    ----------
+    batches : list[ControllerSequenceBatch]
+        Per-clip batches to merge along the first (sample) axis.
+
+    Returns
+    -------
+    ControllerSequenceBatch
+        Merged batch containing all clips.
+    """
+    phaseAll = all(b.phase is not None for b in batches)
+    contactAll = all(b.contactTarget is not None for b in batches)
+    return ControllerSequenceBatch(
+        boneWindow=torch.cat([b.boneWindow for b in batches], dim=0),
+        globalWindow=torch.cat(
+            [b.globalWindow for b in batches], dim=0
+        ),
+        targetBoneNext=torch.cat(
+            [b.targetBoneNext for b in batches], dim=0
+        ),
+        targetBoneDelta=torch.cat(
+            [b.targetBoneDelta for b in batches], dim=0
+        ),
+        targetGlobalDelta=torch.cat(
+            [b.targetGlobalDelta for b in batches], dim=0
+        ),
+        control=torch.cat([b.control for b in batches], dim=0),
+        phase=(
+            torch.cat(
+                [b.phase for b in batches], dim=0  # type: ignore[arg-type]
+            )
+            if phaseAll
+            else None
+        ),
+        contactTarget=(
+            torch.cat(
+                [b.contactTarget for b in batches], dim=0  # type: ignore[arg-type]
+            )
+            if contactAll
+            else None
+        ),
+    )
+
+
+def _perClipDrift(
+    model: MotionController,
+    batches: list[ControllerSequenceBatch],
+    clipRootTranslations: list[torch.Tensor],
+    controlMean: torch.Tensor,
+    controlStd: torch.Tensor,
+    stateNormalizer: MotionNormalizer,
+    deltaNormalizer: MotionNormalizer,
+) -> tuple[float, dict[int, float]]:
+    """Mean rollout drift over clips; drift curve on the longest clip.
+
+    Parameters
+    ----------
+    model : MotionController
+        Trained controller (eval mode expected).
+    batches : list[ControllerSequenceBatch]
+        Per-clip sequence batches.
+    clipRootTranslations : list[torch.Tensor]
+        GT root translation per clip (for absolute-world reconstruction).
+    controlMean, controlStd : torch.Tensor
+        Global control statistics for normalization.
+    stateNormalizer, deltaNormalizer : MotionNormalizer
+        State / delta z-normalizers.
+
+    Returns
+    -------
+    tuple[float, dict[int, float]]
+        Mean drift across clips, and drift-vs-horizon curve of the
+        longest clip.
+    """
+    drifts: list[float] = []
+    curve: dict[int, float] = {}
+    longest = max(
+        range(len(batches)),
+        key=lambda index: batches[index].numTransitions,
+    )
+    for index, batch in enumerate(batches):
+        controlNorm = (batch.control - controlMean) / controlStd
+        rollout = _rolloutFromClip(
+            model, batch, stateNormalizer, deltaNormalizer, controlNorm,
+            clipRootTranslations[index],
+        )
+        gtBone, gtRoot = _groundTruthTrajectory(
+            batch, clipRootTranslations[index]
+        )
+        drifts.append(rolloutDrift(rollout, gtBone, gtRoot))
+        if index == longest:
+            curve = rolloutDriftCurve(
+                rollout, gtBone, gtRoot,
+                _driftHorizons(rollout.rotation6d.shape[1]),
+            )
+    return sum(drifts) / max(len(drifts), 1), curve
 
 
 @dataclass(frozen=True)

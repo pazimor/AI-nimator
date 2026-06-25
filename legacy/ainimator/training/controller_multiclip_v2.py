@@ -1,4 +1,15 @@
-"""Small-N multi-clip controller training (Goal A — A2/A4 validation).
+"""ARCHIVED (A7, 2026-06-25) — replaced by the unified full profile.
+
+The multi-clip training logic has been superseded by
+``ainimator.training.controller_generalization_v2`` (the ``full``
+profile of the unified ``train_controller_v2`` CLI).  This file is kept
+in ``legacy/`` for historical reference only.  Nothing in the live
+``ainimator.*`` package may import from ``legacy.*``
+(lint-imports contract ``no_legacy_imports``).
+
+Original module docstring follows.
+----------------------------------------------------------------------
+Small-N multi-clip controller training (Goal A — A2/A4 validation).
 
 The single-clip overfit (``controller_training_v2``) validates A1 and the
 A4 mechanism, but two acceptance criteria are *only* meaningful with

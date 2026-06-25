@@ -1,4 +1,13 @@
-"""CLI — Goal C multi-clip controller training (C2/C4 validation).
+"""ARCHIVED (A7, 2026-06-25) — superseded by train_controller_v2 --profile full.
+
+This CLI is kept in ``legacy/`` for historical reference only.  Use
+``python -m ainimator.cli.train_controller_v2 --profile full`` instead.
+Nothing in ``ainimator.*`` may import from ``legacy.*``
+(lint-imports ``no_legacy_imports``).
+
+Original module docstring follows.
+----------------------------------------------------------------------
+CLI — Goal A multi-clip controller training (A2/A4 validation).
 
 Zero logic: select N clips, load them, delegate to
 :func:`ainimator.training.controller_multiclip_v2.runControllerMultiClip`.
@@ -35,7 +44,7 @@ from ainimator.training.training_v2 import loadDatasetSample
 def _parseArgs() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Goal C multi-clip controller training."
+        description="Goal A multi-clip controller training."
     )
     parser.add_argument("--dataset-root", type=Path, default=None)
     parser.add_argument(
