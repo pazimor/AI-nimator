@@ -1,7 +1,7 @@
 # ============================================
 # Network Architecture Configuration
 # ============================================
-# v2 stack only (phase A5 — 2026-06-13).
+# v2 stack only (2026-06-13).
 # The v1 "default" and "overfit" profiles have been archived to
 # legacy/configs/network_v1_profiles.yaml and are no longer loaded
 # by any live code.
@@ -23,13 +23,98 @@
 # AdaLN) and the learnable null embedding are now ON by default in the
 # Python dataclasses (V2FullTrainingConfig / MotionDenoiserV2Config).
 # ============================================
+# ============================================
+# Controller training profiles (G-PROFILES)
+# ============================================
+# Each profile is a *delta* on top of the base defaults defined in
+# ControllerTrainingConfig (training/controller_training_v2.py).
+# Resolution order: base defaults → profile delta → resolved_config.yaml.
+# All hyperparameter values here REPRODUCE the CLI flag defaults that
+# were in place before the config-first migration (G-HYPERPARAMS).
+#
+# Surface CLI: --profile {overfit|full|debug}
+# Non-config per-invocation args: --dataset-root, --output-dir, --resume
+# ============================================
+controller_profiles:
+  overfit:
+    # Single-clip overfit — A1 smoke test (canonical sanity check, < 2 min).
+    # Reproduces defaults of train_controller_v2.py before migration.
+    data:
+      sample-index: 0            # link index of the overfit clip
+      min-frames: 0              # not used by overfit (single index)
+    arch:
+      embed-dim: 128
+      num-heads: 4
+      num-layers: 3
+      context-frames: 1
+      phase: none                # none | explicit | learned
+      aim-direction: false
+    training:
+      epochs: 300
+      learning-rate: 0.001
+      weight-decay: 0.0
+      seed: 0
+      device: auto
+      log-every: 50
+      scheduled-sampling: 0.0
+      foot-contact-weight: 0.0
+
+  full:
+    # Generalization run — A6/A7 (train/held-out split, many clips).
+    # Reproduces defaults of train_controller_generalization_v2.py.
+    data:
+      num-clips: 256
+      held-out-clips: 32
+      min-frames: 200
+      clip-batch-size: 8
+      eval-sample-clips: 32
+    arch:
+      embed-dim: 256
+      num-heads: 4
+      num-layers: 4
+      context-frames: 8
+      phase: none
+      aim-direction: false
+    training:
+      epochs: 200
+      learning-rate: 0.001
+      weight-decay: 0.0
+      seed: 0
+      device: auto
+      log-every: 50
+      scheduled-sampling: 0.0
+      foot-contact-weight: 0.0
+
+  debug:
+    # Ultra-fast smoke test (< 2 min) — zero data required beyond 1 clip.
+    # Used for CI / pre-commit sanity. Same arch as overfit but 10 epochs.
+    data:
+      sample-index: 0
+      min-frames: 0
+    arch:
+      embed-dim: 128
+      num-heads: 4
+      num-layers: 3
+      context-frames: 1
+      phase: none
+      aim-direction: false
+    training:
+      epochs: 10
+      learning-rate: 0.001
+      weight-decay: 0.0
+      seed: 0
+      device: auto
+      log-every: 5
+      scheduled-sampling: 0.0
+      foot-contact-weight: 0.0
+
 v2:
   # Top-level embed-dim is unused by v2 (no CLIP contrastive pre-train).
   # Kept for schema compatibility with the loader.
   embed-dim: 384
 
   # CLIP block: kept to satisfy the loader schema; the v2 stack does NOT
-  # use this branch (archived in phase A5).
+  # use this branch (archived in legacy/).
   clip:
     motion-num-heads: 4
     motion-num-layers: 2
@@ -48,10 +133,10 @@ v2:
 
   generation:
     # ============================================================
-    # Goal C — engine selector (ROADMAP_DETERMINIST §3.2)
+    # Goal A — engine selector (ROADMAP_DETERMINIST §3.2)
     # ============================================================
     # "diffusion" = canonical behaviour (default, nothing changes).
-    # "controller" = Goal C deterministic autoregressive engine.
+    # "controller" = Goal A deterministic autoregressive engine.
     # The training CLI reads this field; defaults keep diffusion.
     model-type: diffusion          # diffusion | controller
 
@@ -59,17 +144,17 @@ v2:
       autoregressive: true
       phase: explicit              # none | explicit | learned
       # DEFERRED: the current dataset (AMASS + HumanML3D/KIT captions)
-      # has no style labels (§1/§7).  Must stay false until C3.
+      # has no style labels (§1/§7).  Must stay false until A3.
       style-latent: false
       # Autoregressive context window (frames seen per forward).
-      context-frames: 1            # extended in C4 (long robustness)
+      context-frames: 1            # extended in A4 (long robustness)
       losses:
         velocity-loss: true        # flag already present in v2
         foot-contact-loss: true
         geodesic-rotation: true
       training:
         # Scheduled-sampling ramp 0 → target (fixes exposure bias).
-        # Stays 0 until short-rollout validation passes (C4).
+        # Stays 0 until short-rollout validation passes (A4).
         scheduled-sampling: 0.0
 
     # MotionDenoiserV2 (Phase F): compact stack, cross-attn + FiLM +

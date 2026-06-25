@@ -12,6 +12,13 @@ The schema covers:
 * :class:`TextEncoderConfigSchema` — text encoder architecture.
 * :class:`DiffusionConfigSchema` — schedule and prediction mode.
 * :class:`LossesConfigSchema` — every loss weight.
+* :class:`ControllerProfileDataSchema` — data knobs for a controller
+  profile.
+* :class:`ControllerProfileArchSchema` — arch knobs for a controller
+  profile.
+* :class:`ControllerProfileTrainingSchema` — training knobs for a
+  controller profile.
+* :class:`ControllerProfileSchema` — one named controller profile.
 
 Defaults must match the runtime dataclass defaults in
 ``full_training_v2.py`` and ``training_v2.py`` exactly — any
@@ -282,7 +289,7 @@ class RegularisationConfigSchema(BaseModel, extra="forbid"):
 
 
 # =====================================================================
-# Goal C — deterministic controller schemas (ROADMAP_DETERMINIST §3.2)
+# Goal A — deterministic controller schemas (ROADMAP_DETERMINIST §3.2)
 # =====================================================================
 
 _PHASE_MODES = Literal["none", "explicit", "learned"]
@@ -314,7 +321,7 @@ class ControllerTrainingSchema(BaseModel, extra="forbid", populate_by_name=True)
     ----------
     scheduledSampling : float
         Scheduled-sampling target probability (ramped 0 → target in
-        C4).  Stays ``0.0`` until short-rollout validation passes.
+        A4).  Stays ``0.0`` until short-rollout validation passes.
     """
 
     scheduledSampling: float = Field(0.0, alias="scheduled-sampling")
@@ -332,7 +339,7 @@ class ControllerConfigSchema(BaseModel, extra="forbid", populate_by_name=True):
     """Strict schema for the ``v2.generation.controller`` YAML block.
 
     ``extra="forbid"`` makes any unknown key raise a ``ValidationError``
-    that names the offending field — the C0 acceptance guard.
+    that names the offending field — the A0 acceptance guard.
 
     Attributes
     ----------
@@ -341,10 +348,10 @@ class ControllerConfigSchema(BaseModel, extra="forbid", populate_by_name=True):
     phase : str
         Locomotor phase regime (``none`` | ``explicit`` | ``learned``).
     styleLatent : bool
-        DEFERRED (C3) — inject a style latent.  Must stay ``False``
+        DEFERRED (A3) — inject a style latent.  Must stay ``False``
         until a style-labelled dataset exists.
     contextFrames : int
-        Number of past frames seen per forward (C1 → 1).
+        Number of past frames seen per forward (A1 → 1).
     losses : ControllerLossesSchema
         Loss toggles.
     training : ControllerTrainingSchema
@@ -368,13 +375,13 @@ class ControllerConfigSchema(BaseModel, extra="forbid", populate_by_name=True):
 
     @model_validator(mode="after")
     def _checkStyleDeferred(self) -> "ControllerConfigSchema":
-        """Guard against enabling style latents before C3 ships."""
+        """Guard against enabling style latents before A3 ships."""
         if self.styleLatent:
             raise ValueError(
                 "style-latent must stay false: the current dataset has "
                 "no style labels (ROADMAP_DETERMINIST §1/§7). Enabling "
                 "it would train a style lever on data that cannot carry "
-                "it. Phase C3 wires this once a labelled dataset exists."
+                "it. Phase A3 wires this once a labelled dataset exists."
             )
         return self
 
@@ -384,7 +391,7 @@ class GenerationModelSelectorSchema(
 ):
     """Engine selector read from ``v2.generation`` (§3.2).
 
-    Only the two Goal C fields are validated here; the diffusion
+    Only the two Goal A fields are validated here; the diffusion
     ``generation`` keys are parsed elsewhere and intentionally ignored.
 
     Attributes
@@ -516,6 +523,125 @@ class V2FullTrainingConfigSchema(BaseModel, extra="forbid"):
                 "clipGuidanceWeightStart must be >= clipGuidanceWeight."
             )
         return self
+
+
+# =====================================================================
+# Goal A — controller *profile* schemas (G-PROFILES / ROADMAP_DETERMINIST §3.2)
+# =====================================================================
+
+class ControllerProfileDataSchema(
+    BaseModel, extra="forbid", populate_by_name=True
+):
+    """Data-selection knobs for a controller profile.
+
+    Attributes
+    ----------
+    sampleIndex : int
+        Link index of the single clip used by ``overfit`` / ``debug``.
+    minFrames : int
+        Minimum frame count for clip selection (``full`` only).
+    numClips : int
+        Total clips to load for ``full`` profile.
+    heldOutClips : int
+        Clips reserved as held-out for ``full`` profile.
+    clipBatchSize : int
+        Clips per optimiser mini-batch for ``full`` profile.
+    evalSampleClips : int
+        Clips sampled for metrics evaluation in ``full`` profile.
+    """
+
+    sampleIndex: int = Field(0, alias="sample-index")
+    minFrames: int = Field(0, alias="min-frames")
+    numClips: int = Field(256, alias="num-clips")
+    heldOutClips: int = Field(32, alias="held-out-clips")
+    clipBatchSize: int = Field(8, alias="clip-batch-size")
+    evalSampleClips: int = Field(32, alias="eval-sample-clips")
+
+
+class ControllerProfileArchSchema(
+    BaseModel, extra="forbid", populate_by_name=True
+):
+    """Architecture knobs for a controller profile.
+
+    Attributes
+    ----------
+    embedDim : int
+        Transformer embedding width.
+    numHeads : int
+        Number of attention heads.
+    numLayers : int
+        Number of transformer blocks.
+    contextFrames : int
+        Autoregressive context-window length.
+    phase : str
+        Locomotor phase regime (``none`` | ``explicit`` | ``learned``).
+    aimDirection : bool
+        Append aim-direction control channels.
+    """
+
+    embedDim: int = Field(128, alias="embed-dim")
+    numHeads: int = Field(4, alias="num-heads")
+    numLayers: int = Field(3, alias="num-layers")
+    contextFrames: int = Field(1, alias="context-frames")
+    phase: _PHASE_MODES = "none"
+    aimDirection: bool = Field(False, alias="aim-direction")
+
+
+class ControllerProfileTrainingSchema(
+    BaseModel, extra="forbid", populate_by_name=True
+):
+    """Training hyper-parameters for a controller profile.
+
+    Attributes
+    ----------
+    epochs : int
+        Number of optimisation epochs.
+    learningRate : float
+        AdamW learning rate.
+    weightDecay : float
+        AdamW L2 weight decay.
+    seed : int
+        RNG seed (reproducibility).
+    device : str
+        Torch device (``auto`` | ``cpu`` | ``mps`` | ``cuda``).
+    logEvery : int
+        Log a loss line every N epochs.
+    scheduledSampling : float
+        Target scheduled-sampling probability (A4, ``0`` = off).
+    footContactWeight : float
+        Anti-skating foot-contact loss weight (``0`` = off).
+    """
+
+    epochs: int = 300
+    learningRate: float = Field(1e-3, alias="learning-rate")
+    weightDecay: float = Field(0.0, alias="weight-decay")
+    seed: int = 0
+    device: str = "auto"
+    logEvery: int = Field(50, alias="log-every")
+    scheduledSampling: float = Field(0.0, alias="scheduled-sampling")
+    footContactWeight: float = Field(0.0, alias="foot-contact-weight")
+
+
+class ControllerProfileSchema(
+    BaseModel, extra="forbid", populate_by_name=True
+):
+    """One named controller profile (delta on top of base defaults).
+
+    Attributes
+    ----------
+    data : ControllerProfileDataSchema
+        Data-selection knobs.
+    arch : ControllerProfileArchSchema
+        Architecture knobs.
+    training : ControllerProfileTrainingSchema
+        Training hyper-parameters.
+    """
+
+    data: ControllerProfileDataSchema = ControllerProfileDataSchema()
+    arch: ControllerProfileArchSchema = ControllerProfileArchSchema()
+    training: ControllerProfileTrainingSchema = (
+        ControllerProfileTrainingSchema()
+    )
 
 
 class V2TrainingConfigSchema(BaseModel, extra="forbid"):

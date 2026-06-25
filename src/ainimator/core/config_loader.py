@@ -30,7 +30,10 @@ from ainimator.core.types.network import (
     LearningRateHyperparameters,
     NetworkConfig,
 )
-from ainimator.core.config_schema import GenerationModelSelectorSchema
+from ainimator.core.config_schema import (
+    ControllerProfileSchema,
+    GenerationModelSelectorSchema,
+)
 from ainimator.core.constants.controller import PhaseMode
 from ainimator.core.types.controller import ControllerV2Config
 
@@ -183,13 +186,13 @@ def loadGenerationModelSelector(
     configPath: Optional[Path] = None,
     profile: str = "v2",
 ) -> GenerationModelSelectorSchema:
-    """Load and validate the Goal C engine selector from network.yaml.
+    """Load and validate the Goal A engine selector from network.yaml.
 
     Reads only ``model-type`` and ``controller`` from
     ``<profile>.generation``; the diffusion ``generation`` keys are left
     untouched (validated elsewhere).  Unknown keys inside the
     ``controller`` block raise a ``pydantic.ValidationError`` naming the
-    field (ROADMAP_DETERMINIST C0 acceptance).
+    field (ROADMAP_DETERMINIST A0 acceptance).
 
     Parameters
     ----------
@@ -218,6 +221,55 @@ def loadGenerationModelSelector(
     if "controller" in generationSection:
         selectorPayload["controller"] = generationSection["controller"]
     return GenerationModelSelectorSchema.model_validate(selectorPayload)
+
+
+def loadControllerProfile(
+    profileName: str,
+    configPath: Optional[Path] = None,
+) -> ControllerProfileSchema:
+    """Load and validate a named controller profile from ``network.yaml``.
+
+    Resolution: ``controller_profiles.<profileName>`` section in
+    ``network.yaml`` is parsed as a :class:`ControllerProfileSchema`
+    delta; unknown keys raise ``pydantic.ValidationError`` (fail-fast).
+
+    Parameters
+    ----------
+    profileName : str
+        One of ``overfit``, ``full``, ``debug``, or any custom profile
+        added to the ``controller_profiles`` block.
+    configPath : Optional[Path]
+        Path to ``network.yaml`` (defaults to the canonical location).
+
+    Returns
+    -------
+    ControllerProfileSchema
+        Fully-validated profile (all fields carry defaults when absent).
+
+    Raises
+    ------
+    KeyError
+        When ``profileName`` is not present in ``controller_profiles``.
+    FileNotFoundError
+        When the config file is missing.
+    """
+    resolved = (configPath or DEFAULT_NETWORK_CONFIG_PATH)
+    resolved = resolved.expanduser().resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(f"Network config missing: {resolved}")
+
+    payload = yaml.safe_load(
+        resolved.read_text(encoding="utf-8")
+    ) or {}
+    profilesSection = payload.get("controller_profiles") or {}
+    rawProfile = profilesSection.get(profileName)
+    if rawProfile is None:
+        available = list(profilesSection.keys())
+        raise KeyError(
+            f"Controller profile '{profileName}' not found in "
+            f"controller_profiles. Available: {available}"
+        )
+    return ControllerProfileSchema.model_validate(rawProfile)
 
 
 def buildControllerV2Config(
