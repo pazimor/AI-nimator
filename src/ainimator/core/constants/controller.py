@@ -11,7 +11,8 @@ State vector (136 channels — ROADMAP_DETERMINIST §2.2.a)
 The controller predicts ``Δstate`` over the *lean* representation:
 
 * ``rotation6d``         — 22 bones × 6 channels (132)
-* ``root_local_motion``  — 4 channels: ``(Δforward, Δlateral, Δheight, Δyaw)``
+* ``root_local_motion``  — 4 channels:
+  ``(Δforward, Δlateral, Δheight, Δyaw)``
 
 The root is expressed in the **character-local frame** (pelvis-yaw origin),
 **not** as an absolute world-space translation.  This prevents the
@@ -65,7 +66,8 @@ LEAN_STATE_CHANNELS: int = (
 # Control signal (input conditioning, ROADMAP_DETERMINIST §2.2.b).
 # Layout (4 channels, ordered):
 #   (vx, vz, aim_x, aim_z)
-#    ├── (vx, vz)        desired planar velocity, root-local frame, m/frame
+#    ├── (vx, vz)        desired planar velocity, root-local frame,
+#    |                   m/frame
 #    └── (aim_x, aim_z)  facing direction unit 2-vector (cos θ, sin θ)
 #
 # vx/vz are z-normalized (asserted by post_norm_stats).
