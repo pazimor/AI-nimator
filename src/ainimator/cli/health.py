@@ -334,8 +334,8 @@ def _cmdDiagnoseController(
     profile = _loadDiagnoseProfile(profileName)
     diagDefaults = profile.get("diagnose", {})
 
-    # Resolve values: CLI args take precedence, then profile, then hardcoded
-    # defaults.  CLI args are None when the user did not supply them.
+    # Resolve values: profile first, then hardcoded defaults (G-PROFILES:
+    # hyperparameter flags removed from CLI; all knobs live in the profile).
     controlSpec = _resolve(
         getattr(args, "control", None),
         diagDefaults.get("control"),
@@ -423,7 +423,7 @@ def _cmdDiagnoseDiffusion(
     """
     import json
 
-    # Load profile when provided; otherwise defaults come from CLI flags.
+    # Load profile when provided; all knobs come from the profile (G-PROFILES).
     profileName = getattr(args, "profile", None)
     diagDefaults: dict[str, Any] = {}
     if profileName:
@@ -620,51 +620,11 @@ def _buildParser() -> argparse.ArgumentParser:
         help="Where to write diagnose JSON (default: checkpoint dir).",
     )
 
-    # --- Diffusion-specific flags (inactive in controller mode) --------
-    diagP.add_argument(
-        "--prompt", default=None,
-        help="[diffusion] Primary conditioning prompt.",
-    )
-    diagP.add_argument("--seeds", default=None,
-                       help="Seed list (comma-separated).")
-    diagP.add_argument(
-        "--cfg-scales", dest="cfg_scales", default=None,
-        help="[diffusion] CFG scales (comma-separated).",
-    )
-    diagP.add_argument(
-        "--frames", type=int, default=None,
-        help="[diffusion] Generation length in frames.",
-    )
-    diagP.add_argument(
-        "--num-steps", dest="num_steps", type=int, default=None,
-        help="[diffusion] DDIM steps.",
-    )
-
-    # --- Controller-specific flags (inactive in diffusion mode) --------
-    diagP.add_argument(
-        "--control", default=None,
-        help=(
-            "[controller] Control spec string (e.g. 'forward:1.0'). "
-            "Default from profile: 'forward:1.0'."
-        ),
-    )
-    diagP.add_argument(
-        "--rollout-frames", dest="rollout_frames", type=int, default=None,
-        help="[controller] Autoregressive rollout length (default 120).",
-    )
-    diagP.add_argument(
-        "--shuffle-control", dest="shuffle_control",
-        action="store_true", default=False,
-        help=(
-            "[controller] Measure control_sensitivity by replaying "
-            "with shuffled control."
-        ),
-    )
-    diagP.add_argument(
-        "--phase-mode", dest="phase_mode", default=None,
-        choices=["none", "explicit", "learned"],
-        help="[controller] Force phase mode (default: read from checkpoint).",
-    )
+    # Hyperparameter flags removed (G-PROFILES): all run knobs are
+    # controlled via --profile <name> in network.yaml diagnose_profiles.
+    # The _cmdDiagnoseController / _cmdDiagnoseDiffusion handlers read
+    # profile values and fall back to hardcoded defaults when no profile
+    # is specified.
 
     # report
     reportP = sub.add_parser(
