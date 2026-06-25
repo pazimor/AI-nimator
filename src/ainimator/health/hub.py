@@ -25,7 +25,7 @@ import torch.nn as nn
 
 from ainimator.health.contract import Contract, ContractResult, Verdict
 from ainimator.health.jsonl_writer import JsonlWriter
-from ainimator.health.probe import Probe, ProbeSnapshot
+from ainimator.health.probe import Probe
 from ainimator.health.record_schema import VERDICT_PREFIX
 from ainimator.health.tb_writer import TbWriter
 
