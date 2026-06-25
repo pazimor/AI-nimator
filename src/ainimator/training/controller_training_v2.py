@@ -23,7 +23,11 @@ from typing import Optional
 import torch
 
 from ainimator.core.checkpoint_io import checkpointDir
-from ainimator.core.constants.controller import PhaseMode, ROOT_LOCAL_MOTION_CHANNELS
+from ainimator.core.constants.controller import (
+    CONTROL_PLANAR_VELOCITY_CHANNELS,
+    PhaseMode,
+    ROOT_LOCAL_MOTION_CHANNELS,
+)
 from ainimator.core.resolved_config import writeResolvedConfig
 from ainimator.core.types.controller import ControllerV2Config
 from ainimator.data.controller_sequences import (
@@ -194,11 +198,67 @@ def buildControllerModelConfig(
 def _standardiseControl(
     control: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Z-standardise the control signal; return ``(norm, mean, std)``."""
-    mean = control.mean(dim=0, keepdim=True)
-    std = control.std(dim=0, unbiased=False, keepdim=True)
+    """Z-standardise the velocity channels; pass aim channels unchanged.
+
+    Only the first ``CONTROL_PLANAR_VELOCITY_CHANNELS`` (vx, vz) are
+    z-normalised.  Aim-direction channels (aim_x, aim_z) are unit-norm by
+    construction (ROADMAP_DETERMINIST §2.2.b truth #3) and must NOT be
+    z-standardised — their statistics would be wrong.
+
+    Parameters
+    ----------
+    control : torch.Tensor
+        ``(N, controlChannels)`` raw control signal.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ``(normalised, mean, std)`` where ``mean`` and ``std`` have shape
+        ``(1, CONTROL_PLANAR_VELOCITY_CHANNELS)`` (velocity channels only).
+    """
+    velocityChannels = CONTROL_PLANAR_VELOCITY_CHANNELS
+    velocity = control[:, :velocityChannels]
+    mean = velocity.mean(dim=0, keepdim=True)
+    std = velocity.std(dim=0, unbiased=False, keepdim=True)
     std = std.clamp(min=_CONTROL_STD_FLOOR)
-    return (control - mean) / std, mean, std
+    normVelocity = (velocity - mean) / std
+
+    if control.shape[-1] > velocityChannels:
+        # Aim channels: pass through unchanged.
+        aimChannels = control[:, velocityChannels:]
+        normControl = torch.cat([normVelocity, aimChannels], dim=-1)
+    else:
+        normControl = normVelocity
+
+    return normControl, mean, std
+
+
+def _applyControlNorm(
+    control: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+) -> torch.Tensor:
+    """Apply pre-fitted velocity z-norm; pass aim channels unchanged.
+
+    Parameters
+    ----------
+    control : torch.Tensor
+        ``(N, controlChannels)`` raw control signal.
+    mean : torch.Tensor
+        ``(1, CONTROL_PLANAR_VELOCITY_CHANNELS)`` velocity mean.
+    std : torch.Tensor
+        ``(1, CONTROL_PLANAR_VELOCITY_CHANNELS)`` velocity std.
+
+    Returns
+    -------
+    torch.Tensor
+        ``(N, controlChannels)`` with velocity channels normalised.
+    """
+    velocityChannels = CONTROL_PLANAR_VELOCITY_CHANNELS
+    normVelocity = (control[:, :velocityChannels] - mean) / std
+    if control.shape[-1] > velocityChannels:
+        return torch.cat([normVelocity, control[:, velocityChannels:]], dim=-1)
+    return normVelocity
 
 
 def _fitNormalizers(
@@ -593,9 +653,9 @@ def _prepareResumed(
         clipRotation6d.to(device), clipRootOnDevice,
         sequenceConfig,
     )
-    controlNorm = (
-        batch.control - controlMean.to(device)
-    ) / controlStd.to(device)
+    controlNorm = _applyControlNorm(
+        batch.control, controlMean.to(device), controlStd.to(device)
+    )
     return (
         model,
         stateNormalizer.to(device),
