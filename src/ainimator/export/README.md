@@ -1,9 +1,10 @@
-# ONNX Export — Forbidden Ops and Design Rules (§2.10)
+# ONNX Export and Controller Bundle — Design Rules (§2.10 / A7 / B0)
 
 Exportability to ONNX is a **design constraint**, not a performance goal
 (ROADMAP §2.10).  The target is Apple Neural Engine via ONNX Runtime
 CoreML Execution Provider.  This document lists what is forbidden in any
-`forward()` / `encode()` path so future contributors know the contract.
+`forward()` / `encode()` path so future contributors know the contract,
+and documents the **controller bundle** format introduced in A7/B0.
 
 ---
 
@@ -13,9 +14,92 @@ CoreML Execution Provider.  This document lists what is forbidden in any
 |---|---|---|
 | `CustomTextEncoder` | Full `encode()` path (inputIds → hiddenStates + mask) | `export_onnx encoder` |
 | `MotionDenoiserV2` | **One denoising step** (noisy motion + timestep + text → clean) | `export_onnx denoiser` |
-| `MotionController` (Goal C) | **One frame forward** (state window + control [+ phase] → Δstate) | `export_onnx controller` |
+| `MotionController` (Goal A) | **One frame forward** (state window + control [+ phase] → Δstate) | `export_onnx controller` |
+| **Controller bundle** (A7/B0) | Full artefact set for the engine plugin | `export_onnx bundle` |
 
-### Controller export (Goal C, phase C5)
+---
+
+## Controller bundle (A7 / Goal B0)
+
+A **controller bundle** is the complete artefact set a plugin needs to
+run the controller in production without any Python dependency:
+
+```
+<bundle_dir>/
+  controller.onnx          — one-frame forward ONNX graph
+  norm_stats.json          — state / delta / control z-norm statistics
+  manifest.json            — frozen I/O contract (ROADMAP_DETERMINIST §2.2)
+  resolved_config.yaml     — provenance (config + git SHA + date) [optional]
+  presets/
+    walk.json              — example preset: {vx: 0.05, vz: 0.0}
+    run.json               — example preset: {vx: 0.15, vz: 0.0}
+```
+
+### Assembling a bundle
+
+```bash
+python -m ainimator.cli.export_onnx bundle \
+    --checkpoint output/controller/controller_overfit_checkpoint.pt \
+    --output-dir output/controller_bundle \
+    --resolved-config output/controller/resolved_config.yaml
+```
+
+### manifest.json format
+
+`manifest.json` **serialises** the frozen I/O contract of
+`ROADMAP_DETERMINIST §2.2`.  It is NOT a second definition — it is a
+machine-readable snapshot the engine reads at load time to verify
+compatibility:
+
+```json
+{
+  "bundle_version": "A7.0",
+  "state_channels": 136,
+  "num_bones": 22,
+  "rotation_channels_per_bone": 6,
+  "root_local_motion_channels": 4,
+  "control_channels": 2,
+  "control_layout": ["vx", "vz"],
+  "phase_channels": 0,
+  "prompt_emb_channels": 0,
+  "context_frames": 1,
+  "output_layout": "bone_delta|global_delta",
+  "coord_system": "Y-up right-handed",
+  "normalization_note": "vx,vz are z-normalized; aim_x,aim_z are unit-norm",
+  "reserved_input_groups": ["interaction","perception","reaction","morphology"]
+}
+```
+
+### norm_stats.json format
+
+```json
+{
+  "state":   {"bone_mean": [...], "bone_std": [...], "global_mean": [...], "global_std": [...]},
+  "delta":   {"bone_mean": [...], "bone_std": [...], "global_mean": [...], "global_std": [...]},
+  "control": {"mean": [...], "std": [...], "channels": ["vx","vz"],
+              "note": "aim_x, aim_z are unit-norm by construction; no z-norm stats stored for them."}
+}
+```
+
+The engine uses `norm_stats.json` to:
+1. z-normalize the control input before the ONNX forward.
+2. denormalize the `Δstate` output after the ONNX forward.
+
+`aim_x / aim_z` are **not** in `norm_stats.json` — they are unit-norm
+by construction and must not be z-normalized.
+
+### Preset files
+
+Optional JSON files under `presets/` carry named control presets for
+the editor (Unity / Unreal) UI.  Format is free-form; conventionally:
+
+```json
+{"vx": 0.05, "vz": 0.0, "description": "default walk"}
+```
+
+---
+
+### Controller export (Goal A, phase A5)
 
 The deterministic controller is the engine ONNX export was *designed*
 for (ROADMAP_DETERMINIST §2.1 truth #10): a single forward per frame, no

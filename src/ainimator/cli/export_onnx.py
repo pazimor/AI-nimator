@@ -1,20 +1,29 @@
-"""CLI entry point for ONNX export (Phase A8).
+"""CLI entry point for ONNX export (Phase A8) and controller bundle (A7/B0).
 
 Usage
 -----
 .. code-block:: bash
 
-    poetry run python -m ainimator.cli.export_onnx encoder \\
+    python -m ainimator.cli.export_onnx encoder \\
         --encoder-artifact path/to/encoder_artifact \\
         --output output/onnx/encoder.onnx
 
-    poetry run python -m ainimator.cli.export_onnx denoiser \\
+    python -m ainimator.cli.export_onnx denoiser \\
         --checkpoint path/to/checkpoint.pt \\
         --output output/onnx/denoiser_step.onnx
 
+    python -m ainimator.cli.export_onnx controller \\
+        --checkpoint path/to/controller.pt \\
+        --output output/onnx/controller_step.onnx
+
+    python -m ainimator.cli.export_onnx bundle \\
+        --checkpoint path/to/controller.pt \\
+        --output-dir output/controller_bundle
+
 This CLI is logic-free: it parses arguments, loads the components
 from existing artifacts/checkpoints, delegates to
-:mod:`ainimator.export.onnx`, and reports success.
+:mod:`ainimator.export.onnx` and :mod:`ainimator.export.bundle`, and
+reports success.
 """
 
 from __future__ import annotations
@@ -29,6 +38,7 @@ logger = logging.getLogger(__name__)
 _ENCODER_COMMAND = "encoder"
 _DENOISER_COMMAND = "denoiser"
 _CONTROLLER_COMMAND = "controller"
+_BUNDLE_COMMAND = "bundle"
 
 
 def _buildParser() -> argparse.ArgumentParser:
@@ -98,7 +108,7 @@ def _buildParser() -> argparse.ArgumentParser:
         "--text-len", type=int, default=16, metavar="N"
     )
 
-    # --- controller sub-command (Goal C, phase C5) ---------------------
+    # --- controller sub-command (Goal A, phase A5) ---------------------
     ctrlParser = sub.add_parser(
         _CONTROLLER_COMMAND,
         help="Export one controller forward (rollout loop stays in C#/C++).",
@@ -121,6 +131,45 @@ def _buildParser() -> argparse.ArgumentParser:
         ),
     )
     ctrlParser.add_argument(
+        "--batch-size", type=int, default=1, metavar="N"
+    )
+
+    # --- bundle sub-command (Goal A/A7, Goal B/B0) --------------------
+    bundleParser = sub.add_parser(
+        _BUNDLE_COMMAND,
+        help=(
+            "Assemble a complete controller bundle: "
+            "ONNX + norm_stats.json + manifest.json + presets/."
+        ),
+    )
+    bundleParser.add_argument(
+        "--checkpoint",
+        type=Path,
+        required=True,
+        metavar="FILE",
+        help="Path to a controller checkpoint (.pt).",
+    )
+    bundleParser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("output/controller_bundle"),
+        metavar="DIR",
+        help=(
+            "Destination bundle directory.  "
+            "Default: output/controller_bundle"
+        ),
+    )
+    bundleParser.add_argument(
+        "--resolved-config",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help=(
+            "Path to an existing resolved_config.yaml to include "
+            "in the bundle.  Optional."
+        ),
+    )
+    bundleParser.add_argument(
         "--batch-size", type=int, default=1, metavar="N"
     )
     return parser
@@ -216,6 +265,40 @@ def _exportController(args: argparse.Namespace) -> None:
     print(f"Controller forward exported to {args.output}")
 
 
+def _exportBundle(args: argparse.Namespace) -> None:
+    """Load a controller checkpoint and export a complete bundle.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed CLI arguments for the ``bundle`` sub-command.
+    """
+    from ainimator.training.controller_training_v2 import (
+        loadControllerCheckpoint,
+    )
+    from ainimator.export.bundle import exportControllerBundle
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(message)s",
+    )
+    model, stateNorm, deltaNorm, controlMean, controlStd = (
+        loadControllerCheckpoint(args.checkpoint, device=None)
+    )
+    model.eval()
+    bundleDir = exportControllerBundle(
+        controller=model,
+        stateNorm=stateNorm,
+        deltaNorm=deltaNorm,
+        controlMean=controlMean,
+        controlStd=controlStd,
+        outputDir=args.output_dir,
+        resolvedConfigPath=args.resolved_config,
+        batchSize=args.batch_size,
+    )
+    print(f"Controller bundle assembled at {bundleDir}")
+
+
 def main() -> None:
     """Entry point for ``python -m ainimator.cli.export_onnx``."""
     parser = _buildParser()
@@ -227,6 +310,8 @@ def main() -> None:
         _exportDenoiser(args)
     elif args.command == _CONTROLLER_COMMAND:
         _exportController(args)
+    elif args.command == _BUNDLE_COMMAND:
+        _exportBundle(args)
     else:
         parser.print_help()
         sys.exit(1)
