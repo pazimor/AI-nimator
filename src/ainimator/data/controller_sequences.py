@@ -189,38 +189,21 @@ def buildControllerSequences(
         transition (``F <= contextFrames``).
     """
     _validateClip(rotation6d, rootTranslation, config)
-    frames = rotation6d.shape[0]
-    window = config.contextFrames
-    numTransitions = frames - window
-
-    # Convert absolute GT trajectory → root-local motion deltas (F, 4).
     rootLocalMotion = absoluteToRootLocalDeltas(rootTranslation, rotation6d)
-
-    starts = torch.arange(numTransitions, device=rotation6d.device)
-    windowIndex = starts[:, None] + torch.arange(
-        window, device=rotation6d.device
-    )[None, :]
-    lastFrame = starts + window - 1
-    nextFrame = starts + window
-
-    boneWindow = rotation6d[windowIndex]
-    # globalWindow holds root-local motion delta history (N, K, 4).
-    globalWindow = rootLocalMotion[windowIndex]
-    targetBoneNext = rotation6d[nextFrame]
-    targetBoneDelta = targetBoneNext - rotation6d[lastFrame]
-    # Target global delta: the root-local motion at the *next* frame.
-    targetGlobalDelta = rootLocalMotion[nextFrame]
-
-    control = _deriveControl(rotation6d, targetGlobalDelta, nextFrame, config)
+    indices = _buildWindowIndices(rotation6d, config)
+    windows = _gatherWindows(rotation6d, rootLocalMotion, indices)
+    control = _deriveControl(
+        rotation6d, windows.targetGlobalDelta, indices.nextFrame, config
+    )
     phase, contactTarget = _derivePhaseAndContacts(
-        rotation6d, rootTranslation, nextFrame, config
+        rotation6d, rootTranslation, indices.nextFrame, config
     )
     return ControllerSequenceBatch(
-        boneWindow=boneWindow,
-        globalWindow=globalWindow,
-        targetBoneNext=targetBoneNext,
-        targetBoneDelta=targetBoneDelta,
-        targetGlobalDelta=targetGlobalDelta,
+        boneWindow=windows.boneWindow,
+        globalWindow=windows.globalWindow,
+        targetBoneNext=windows.targetBoneNext,
+        targetBoneDelta=windows.targetBoneDelta,
+        targetGlobalDelta=windows.targetGlobalDelta,
         control=control,
         phase=phase,
         contactTarget=contactTarget,
@@ -244,6 +227,64 @@ def _derivePhaseAndContacts(
         phase = deriveGaitPhase(contacts)[nextFrame]
     contactTarget = contacts[nextFrame] if config.emitContacts else None
     return phase, contactTarget
+
+
+# ------------------------------------------------------------------
+# Private helpers for buildControllerSequences
+# ------------------------------------------------------------------
+@dataclass(frozen=True)
+class _WindowIndices:
+    """Index tensors for autoregressive window slicing."""
+
+    windowIndex: torch.Tensor
+    lastFrame: torch.Tensor
+    nextFrame: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _GatheredWindows:
+    """Pre-sliced tensors for one batch of transitions."""
+
+    boneWindow: torch.Tensor
+    globalWindow: torch.Tensor
+    targetBoneNext: torch.Tensor
+    targetBoneDelta: torch.Tensor
+    targetGlobalDelta: torch.Tensor
+
+
+def _buildWindowIndices(
+    rotation6d: torch.Tensor,
+    config: "ControllerSequenceConfig",
+) -> _WindowIndices:
+    """Build index tensors for slicing autoregressive windows."""
+    frames = rotation6d.shape[0]
+    window = config.contextFrames
+    numTransitions = frames - window
+    device = rotation6d.device
+    starts = torch.arange(numTransitions, device=device)
+    windowIndex = starts[:, None] + torch.arange(window, device=device)[None, :]
+    return _WindowIndices(
+        windowIndex=windowIndex,
+        lastFrame=starts + window - 1,
+        nextFrame=starts + window,
+    )
+
+
+def _gatherWindows(
+    rotation6d: torch.Tensor,
+    rootLocalMotion: torch.Tensor,
+    indices: _WindowIndices,
+) -> _GatheredWindows:
+    """Gather boneWindow, globalWindow and targets from index tensors."""
+    boneWindow = rotation6d[indices.windowIndex]
+    targetBoneNext = rotation6d[indices.nextFrame]
+    return _GatheredWindows(
+        boneWindow=boneWindow,
+        globalWindow=rootLocalMotion[indices.windowIndex],
+        targetBoneNext=targetBoneNext,
+        targetBoneDelta=targetBoneNext - rotation6d[indices.lastFrame],
+        targetGlobalDelta=rootLocalMotion[indices.nextFrame],
+    )
 
 
 def deriveFootContacts(

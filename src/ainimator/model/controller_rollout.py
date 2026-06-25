@@ -90,88 +90,25 @@ def rolloutController(
     seedRotation6d : torch.Tensor
         ``(B, K, numBones, 6)`` raw seed window (``K = contextFrames``).
     seedRootTranslation : torch.Tensor
-        ``(B, K, 3)`` raw seed window in **world-space** XYZ.  The
-        final seed frame is used as the integration origin.
+        ``(B, K, 3)`` raw seed window in **world-space** XYZ.
     controlSequence : torch.Tensor
         ``(B, N, controlChannels)`` per-frame control.
     phaseSequence : torch.Tensor or None
         ``(B, N, phaseChannels)`` per-frame phase, or ``None``.
     seedRootLocalMotion : torch.Tensor or None
         ``(B, K, 4)`` seed window for the global (root-local) branch.
-        When ``None``, a zero tensor is used (no motion history before
-        the seed).
 
     Returns
     -------
     RolloutResult
     """
-    window = model.config.contextFrames
     _validateSeed(model, seedRotation6d, seedRootTranslation, controlSequence)
-
-    batchSize = seedRotation6d.shape[0]
-    device = seedRotation6d.device
-    dtype = seedRotation6d.dtype
-
-    boneHistory = list(seedRotation6d.unbind(dim=1))
-    globalChannels = model.config.globalChannels  # 4
-
-    if seedRootLocalMotion is not None:
-        globalHistory = list(seedRootLocalMotion.unbind(dim=1))
-    else:
-        # No prior local motion context: use zeros.
-        zeroFrame = torch.zeros(
-            batchSize, globalChannels, device=device, dtype=dtype
-        )
-        globalHistory = [zeroFrame.clone() for _ in range(window)]
-
-    # Track cumulative world-space position and yaw for integration.
-    # Start from the last seed frame.
-    currentWorldPos = seedRootTranslation[:, -1, :]          # (B, 3)
-    lastSeedPelvis = seedRotation6d[:, -1, _PELVIS_BONE_INDEX, :]  # (B, 6)
-    currentYaw = pelvisYawFromRot6d(lastSeedPelvis)           # (B,)
-
-    # Accumulate world-space positions (seed window + rolled frames).
-    worldPositions = list(seedRootTranslation.unbind(dim=1))   # K frames
-    localMotionHistory = list(
-        (seedRootLocalMotion if seedRootLocalMotion is not None
-         else torch.zeros(batchSize, window, globalChannels,
-                          device=device, dtype=dtype)
-         ).unbind(dim=1)
-    )
-
-    steps = controlSequence.shape[1]
-
-    for step in range(steps):
-        boneWindow = torch.stack(boneHistory[-window:], dim=1)
-        globalWindow = torch.stack(globalHistory[-window:], dim=1)
-        control = controlSequence[:, step, :]
-        phase = None if phaseSequence is None else phaseSequence[:, step, :]
-        nextBone, nextLocalDelta = _stepOnce(
-            model,
-            stateNormalizer,
-            deltaNormalizer,
-            boneWindow,
-            globalWindow,
-            control,
-            phase,
-        )
-        # Integrate local delta → world position.
-        nextWorldPos, nextYaw = _integrateOneStep(
-            currentWorldPos, currentYaw, nextLocalDelta
-        )
-        currentWorldPos = nextWorldPos
-        currentYaw = nextYaw
-
-        boneHistory.append(nextBone)
-        globalHistory.append(nextLocalDelta)
-        worldPositions.append(nextWorldPos)
-        localMotionHistory.append(nextLocalDelta)
-
-    return RolloutResult(
-        rotation6d=torch.stack(boneHistory, dim=1),
-        rootTranslation=torch.stack(worldPositions, dim=1),
-        rootLocalMotion=torch.stack(localMotionHistory, dim=1),
-    )
+    _validatePhaseSequence(model, phaseSequence)
+    state = _initRolloutState(model, seedRotation6d, seedRootTranslation,
+                              seedRootLocalMotion)
+    _runRolloutLoop(model, stateNormalizer, deltaNormalizer,
+                    controlSequence, phaseSequence, state)
+    return _buildResult(state)
 
 
 @torch.no_grad()
@@ -189,10 +126,8 @@ def rolloutControllerClosedLoop(
     """Roll out with periodic ground-truth state re-injection.
 
     Models the deployment regime: a game engine re-grounds the character
-    every few frames (foot-lock IK, physics), so the controller does not
-    accumulate error indefinitely.  Every ``reinjectEvery`` steps the
-    working frame is replaced by ground truth; ``reinjectEvery <= 0`` is
-    pure open-loop.
+    every few frames.  Every ``reinjectEvery`` steps the working frame
+    is replaced by ground truth; ``reinjectEvery <= 0`` is open-loop.
 
     Parameters
     ----------
@@ -208,75 +143,214 @@ def rolloutControllerClosedLoop(
     phaseSequence : torch.Tensor or None
         ``(B, N, phaseChannels)`` per-frame phase.
     groundTruthRootLocalMotion : torch.Tensor or None
-        ``(B, K + N, 4)`` reference root-local motion deltas.  Used for
-        re-injection of the global branch.  When ``None``, the global
-        branch is re-injected with zeros (conservative).
+        ``(B, K + N, 4)`` reference root-local motion deltas.
 
     Returns
     -------
     RolloutResult
     """
+    state = _initClosedLoopState(
+        model, groundTruthRotation6d,
+        groundTruthRootTranslation, groundTruthRootLocalMotion,
+    )
+    _runClosedLoopBody(
+        model, stateNormalizer, deltaNormalizer, state,
+        groundTruthRotation6d, groundTruthRootTranslation,
+        groundTruthRootLocalMotion, controlSequence, phaseSequence,
+        reinjectEvery,
+    )
+    return _buildResult(state)
+
+
+@dataclass
+class _RolloutState:
+    """Mutable accumulator for one rollout pass (open-loop or closed-loop)."""
+
+    boneHistory: list[torch.Tensor]
+    globalHistory: list[torch.Tensor]
+    worldPositions: list[torch.Tensor]
+    localMotionHistory: list[torch.Tensor]
+    currentWorldPos: torch.Tensor
+    currentYaw: torch.Tensor
+    window: int
+
+
+def _zeroGlobalHistory(
+    window: int,
+    batchSize: int,
+    globalChannels: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> list[torch.Tensor]:
+    """Return a list of ``window`` zero tensors for the global branch."""
+    zeroFrame = torch.zeros(batchSize, globalChannels, device=device, dtype=dtype)
+    return [zeroFrame.clone() for _ in range(window)]
+
+
+def _initRolloutState(
+    model: MotionController,
+    seedRotation6d: torch.Tensor,
+    seedRootTranslation: torch.Tensor,
+    seedRootLocalMotion: torch.Tensor | None,
+) -> _RolloutState:
+    """Build the initial mutable state for an open-loop rollout."""
+    window = model.config.contextFrames
+    batchSize = seedRotation6d.shape[0]
+    device = seedRotation6d.device
+    dtype = seedRotation6d.dtype
+    globalChannels = model.config.globalChannels
+    boneHistory = list(seedRotation6d.unbind(dim=1))
+    globalHistory = (
+        list(seedRootLocalMotion.unbind(dim=1))
+        if seedRootLocalMotion is not None
+        else _zeroGlobalHistory(window, batchSize, globalChannels, device, dtype)
+    )
+    worldPositions = list(seedRootTranslation.unbind(dim=1))
+    localMotionSeed = (
+        seedRootLocalMotion
+        if seedRootLocalMotion is not None
+        else torch.zeros(batchSize, window, globalChannels, device=device, dtype=dtype)
+    )
+    lastPelvis = seedRotation6d[:, -1, _PELVIS_BONE_INDEX, :]
+    return _RolloutState(
+        boneHistory=boneHistory,
+        globalHistory=globalHistory,
+        worldPositions=worldPositions,
+        localMotionHistory=list(localMotionSeed.unbind(dim=1)),
+        currentWorldPos=seedRootTranslation[:, -1, :],
+        currentYaw=pelvisYawFromRot6d(lastPelvis),
+        window=window,
+    )
+
+
+def _runRolloutLoop(
+    model: MotionController,
+    stateNormalizer: MotionNormalizer,
+    deltaNormalizer: MotionNormalizer,
+    controlSequence: torch.Tensor,
+    phaseSequence: torch.Tensor | None,
+    state: _RolloutState,
+) -> None:
+    """Advance the rollout state in-place for all steps."""
+    for step in range(controlSequence.shape[1]):
+        boneWin = torch.stack(state.boneHistory[-state.window:], dim=1)
+        globalWin = torch.stack(state.globalHistory[-state.window:], dim=1)
+        phase = None if phaseSequence is None else phaseSequence[:, step, :]
+        nextBone, nextDelta = _stepOnce(
+            model, stateNormalizer, deltaNormalizer,
+            boneWin, globalWin, controlSequence[:, step, :], phase,
+        )
+        nextPos, nextYaw = _integrateOneStep(
+            state.currentWorldPos, state.currentYaw, nextDelta
+        )
+        state.currentWorldPos = nextPos
+        state.currentYaw = nextYaw
+        state.boneHistory.append(nextBone)
+        state.globalHistory.append(nextDelta)
+        state.worldPositions.append(nextPos)
+        state.localMotionHistory.append(nextDelta)
+
+
+def _initClosedLoopState(
+    model: MotionController,
+    groundTruthRotation6d: torch.Tensor,
+    groundTruthRootTranslation: torch.Tensor,
+    groundTruthRootLocalMotion: torch.Tensor | None,
+) -> _RolloutState:
+    """Build the initial mutable state for a closed-loop rollout."""
     window = model.config.contextFrames
     batchSize = groundTruthRotation6d.shape[0]
     device = groundTruthRotation6d.device
     dtype = groundTruthRotation6d.dtype
-    globalChannels = model.config.globalChannels  # 4
-
+    globalChannels = model.config.globalChannels
     boneHistory = list(groundTruthRotation6d[:, :window].unbind(dim=1))
     worldPositions = list(groundTruthRootTranslation[:, :window].unbind(dim=1))
-
-    if groundTruthRootLocalMotion is not None:
-        globalHistory = list(
-            groundTruthRootLocalMotion[:, :window].unbind(dim=1)
-        )
-    else:
-        zeroFrame = torch.zeros(
-            batchSize, globalChannels, device=device, dtype=dtype
-        )
-        globalHistory = [zeroFrame.clone() for _ in range(window)]
-
-    localMotionHistory = list(globalHistory)
-
-    currentWorldPos = groundTruthRootTranslation[:, window - 1, :]
+    globalHistory = (
+        list(groundTruthRootLocalMotion[:, :window].unbind(dim=1))
+        if groundTruthRootLocalMotion is not None
+        else _zeroGlobalHistory(window, batchSize, globalChannels, device, dtype)
+    )
     lastPelvis = groundTruthRotation6d[:, window - 1, _PELVIS_BONE_INDEX, :]
-    currentYaw = pelvisYawFromRot6d(lastPelvis)
+    return _RolloutState(
+        boneHistory=boneHistory,
+        globalHistory=globalHistory,
+        worldPositions=worldPositions,
+        localMotionHistory=list(globalHistory),
+        currentWorldPos=groundTruthRootTranslation[:, window - 1, :],
+        currentYaw=pelvisYawFromRot6d(lastPelvis),
+        window=window,
+    )
 
-    steps = controlSequence.shape[1]
 
-    for step in range(steps):
-        boneWindow = torch.stack(boneHistory[-window:], dim=1)
-        globalWindow = torch.stack(globalHistory[-window:], dim=1)
+def _runClosedLoopBody(
+    model: MotionController,
+    stateNormalizer: MotionNormalizer,
+    deltaNormalizer: MotionNormalizer,
+    state: _RolloutState,
+    gtRotation6d: torch.Tensor,
+    gtRootTranslation: torch.Tensor,
+    gtRootLocalMotion: torch.Tensor | None,
+    controlSequence: torch.Tensor,
+    phaseSequence: torch.Tensor | None,
+    reinjectEvery: int,
+) -> None:
+    """Closed-loop rollout with optional GT re-injection."""
+    for step in range(controlSequence.shape[1]):
+        boneWin = torch.stack(state.boneHistory[-state.window:], dim=1)
+        globalWin = torch.stack(state.globalHistory[-state.window:], dim=1)
         phase = None if phaseSequence is None else phaseSequence[:, step, :]
-        nextBone, nextLocalDelta = _stepOnce(
-            model, stateNormalizer, deltaNormalizer, boneWindow,
-            globalWindow, controlSequence[:, step, :], phase,
+        nextBone, nextDelta = _stepOnce(
+            model, stateNormalizer, deltaNormalizer,
+            boneWin, globalWin, controlSequence[:, step, :], phase,
         )
-        nextWorldPos, nextYaw = _integrateOneStep(
-            currentWorldPos, currentYaw, nextLocalDelta
+        nextPos, nextYaw = _integrateOneStep(
+            state.currentWorldPos, state.currentYaw, nextDelta
         )
-        targetIndex = window + step
+        targetIndex = state.window + step
         if reinjectEvery > 0 and (step + 1) % reinjectEvery == 0:
-            nextBone = groundTruthRotation6d[:, targetIndex]
-            nextWorldPos = groundTruthRootTranslation[:, targetIndex]
-            if groundTruthRootLocalMotion is not None:
-                nextLocalDelta = groundTruthRootLocalMotion[:, targetIndex]
-            # Re-sync yaw from the GT pelvis.
-            nextYaw = pelvisYawFromRot6d(
-                groundTruthRotation6d[:, targetIndex, _PELVIS_BONE_INDEX, :]
+            nextBone, nextPos, nextDelta, nextYaw = _reinjectGT(
+                gtRotation6d, gtRootTranslation,
+                gtRootLocalMotion, targetIndex, nextDelta,
             )
+        state.currentWorldPos = nextPos
+        state.currentYaw = nextYaw
+        state.boneHistory.append(nextBone)
+        state.globalHistory.append(nextDelta)
+        state.worldPositions.append(nextPos)
+        state.localMotionHistory.append(nextDelta)
 
-        currentWorldPos = nextWorldPos
-        currentYaw = nextYaw
 
-        boneHistory.append(nextBone)
-        globalHistory.append(nextLocalDelta)
-        worldPositions.append(nextWorldPos)
-        localMotionHistory.append(nextLocalDelta)
+def _reinjectGT(
+    gtRotation6d: torch.Tensor,
+    gtRootTranslation: torch.Tensor,
+    gtRootLocalMotion: torch.Tensor | None,
+    targetIndex: int,
+    predictedDelta: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Return GT bone/pos/delta/yaw for one re-injection step.
 
+    When ``gtRootLocalMotion`` is ``None`` the predicted delta is kept
+    so the history lists never contain ``None`` entries.
+    """
+    nextBone = gtRotation6d[:, targetIndex]
+    nextPos = gtRootTranslation[:, targetIndex]
+    nextDelta = (
+        gtRootLocalMotion[:, targetIndex]
+        if gtRootLocalMotion is not None
+        else predictedDelta
+    )
+    nextYaw = pelvisYawFromRot6d(
+        gtRotation6d[:, targetIndex, _PELVIS_BONE_INDEX, :]
+    )
+    return nextBone, nextPos, nextDelta, nextYaw
+
+
+def _buildResult(state: _RolloutState) -> RolloutResult:
+    """Assemble a :class:`RolloutResult` from the accumulated state."""
     return RolloutResult(
-        rotation6d=torch.stack(boneHistory, dim=1),
-        rootTranslation=torch.stack(worldPositions, dim=1),
-        rootLocalMotion=torch.stack(localMotionHistory, dim=1),
+        rotation6d=torch.stack(state.boneHistory, dim=1),
+        rootTranslation=torch.stack(state.worldPositions, dim=1),
+        rootLocalMotion=torch.stack(state.localMotionHistory, dim=1),
     )
 
 
@@ -365,6 +439,19 @@ def _validateSeed(
             "controlSequence must be (B, N, controlChannels); got "
             f"{tuple(controlSequence.shape)}."
         )
-    if model.config.phaseMode.value == "explicit" and False:
-        # Phase validation happens at call sites when phaseSequence is None.
-        pass
+
+
+def _validatePhaseSequence(
+    model: MotionController,
+    phaseSequence: torch.Tensor | None,
+) -> None:
+    """Raise ValueError if phase is required but not supplied.
+
+    This guard lives here (outside ``forward()``) so the ONNX graph
+    stays free of data-dependent control flow (G-ONNX).
+    """
+    if model.config.phaseChannels > 0 and phaseSequence is None:
+        raise ValueError(
+            "phase is required when phaseMode is not 'none', "
+            "but phaseSequence was not provided."
+        )

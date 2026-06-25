@@ -295,28 +295,44 @@ def exportControllerBundle(
         The bundle directory (same as ``outputDir``).
     """
     outputDir.mkdir(parents=True, exist_ok=True)
+    _writeOnnxGraph(controller, outputDir, batchSize)
+    _writeNormStats(stateNorm, deltaNorm, controlMean, controlStd, outputDir)
+    _writeManifest(controller, outputDir)
+    _copyResolvedConfig(resolvedConfigPath, outputDir)
+    _writePresets(presets, outputDir)
+    LOGGER.info("Controller bundle complete at: %s", outputDir)
+    return outputDir
 
-    # 1. ONNX graph.
+
+def _writeOnnxGraph(
+    controller: MotionController,
+    outputDir: Path,
+    batchSize: int,
+) -> None:
+    """Export the controller ONNX graph into ``outputDir``."""
     onnxPath = outputDir / ONNX_FILENAME
     controller.eval()
-    exportController(
-        controller=controller,
-        outputPath=onnxPath,
-        batchSize=batchSize,
-    )
+    exportController(controller=controller, outputPath=onnxPath,
+                     batchSize=batchSize)
     LOGGER.info("ONNX graph written: %s", onnxPath)
 
-    # 2. Norm stats.
+
+def _writeNormStats(
+    stateNorm: MotionNormalizer,
+    deltaNorm: MotionNormalizer,
+    controlMean: torch.Tensor,
+    controlStd: torch.Tensor,
+    outputDir: Path,
+) -> None:
+    """Serialise z-norm statistics to ``norm_stats.json``."""
     normPath = outputDir / NORM_STATS_FILENAME
-    normStats = _normStatsToDict(
-        stateNorm, deltaNorm, controlMean, controlStd
-    )
-    normPath.write_text(
-        json.dumps(normStats, indent=2), encoding="utf-8"
-    )
+    normStats = _normStatsToDict(stateNorm, deltaNorm, controlMean, controlStd)
+    normPath.write_text(json.dumps(normStats, indent=2), encoding="utf-8")
     LOGGER.info("Norm stats written: %s", normPath)
 
-    # 3. Manifest.
+
+def _writeManifest(controller: MotionController, outputDir: Path) -> None:
+    """Write the I/O contract manifest to ``manifest.json``."""
     manifestPath = outputDir / MANIFEST_FILENAME
     manifest = _buildManifest(controller)
     manifestPath.write_text(
@@ -324,24 +340,29 @@ def exportControllerBundle(
     )
     LOGGER.info("Manifest written: %s", manifestPath)
 
-    # 4. Resolved config (optional copy).
+
+def _copyResolvedConfig(
+    resolvedConfigPath: Path | None, outputDir: Path
+) -> None:
+    """Copy resolved_config.yaml into the bundle if provided."""
     if resolvedConfigPath is not None and resolvedConfigPath.exists():
         import shutil
-
         destConfig = outputDir / "resolved_config.yaml"
         shutil.copy2(resolvedConfigPath, destConfig)
         LOGGER.info("Resolved config copied: %s", destConfig)
 
-    # 5. Presets.
-    if presets:
-        presetsDir = outputDir / PRESETS_SUBDIR
-        presetsDir.mkdir(exist_ok=True)
-        for name, presetData in presets.items():
-            presetPath = presetsDir / f"{name}.json"
-            presetPath.write_text(
-                json.dumps(presetData, indent=2), encoding="utf-8"
-            )
-            LOGGER.info("Preset written: %s", presetPath)
 
-    LOGGER.info("Controller bundle complete at: %s", outputDir)
-    return outputDir
+def _writePresets(
+    presets: dict[str, dict[str, Any]] | None, outputDir: Path
+) -> None:
+    """Write preset JSON files under ``presets/`` sub-directory."""
+    if not presets:
+        return
+    presetsDir = outputDir / PRESETS_SUBDIR
+    presetsDir.mkdir(exist_ok=True)
+    for name, presetData in presets.items():
+        presetPath = presetsDir / f"{name}.json"
+        presetPath.write_text(
+            json.dumps(presetData, indent=2), encoding="utf-8"
+        )
+        LOGGER.info("Preset written: %s", presetPath)

@@ -119,44 +119,56 @@ def absoluteToRootLocalDeltas(
         ``(Δforward, Δlateral, Δheight, Δyaw)``.  Frame 0 is zeroed
         (no predecessor).
     """
-    frames = rootTranslation.shape[0]
-    device = rootTranslation.device
-    dtype = rootTranslation.dtype
-
-    pelvisRot6d = rotation6d[:, _PELVIS_BONE_INDEX, :]  # (F, 6)
-    yaw = pelvisYawFromRot6d(pelvisRot6d)               # (F,)
-
-    # World-space displacement per frame; frame 0 has no predecessor → zero.
-    worldDelta = torch.zeros(frames, 3, device=device, dtype=dtype)
-    worldDelta[1:] = rootTranslation[1:] - rootTranslation[:-1]
-
-    # Ground-plane displacement (x, z).
-    planarDelta = worldDelta[:, [_AXIS_X, _AXIS_Z]]     # (F, 2)
-    heightDelta = worldDelta[:, _AXIS_Y]                # (F,)
-
-    # Rotate planar delta into the local frame using the yaw at the
-    # **departure** frame (where the step originates), so that the
-    # integration in :func:`rootLocalDeltasToAbsolute` uses the same
-    # reference frame.  Delta at index t goes from frame t-1 → frame t;
-    # the departure yaw is yaw[t-1].  Frame 0 has no predecessor, so it
-    # uses yaw[0] (its delta is zero anyway).
-    departureYaw = torch.cat([yaw[:1], yaw[:-1]], dim=0)  # shift by 1
-    rotMat = yawToRotationMatrix2d(departureYaw)        # (F, 2, 2)
-    # planarDelta: (F, 2) → (F, 2, 1)
-    localPlanar = torch.matmul(
-        rotMat.transpose(-1, -2), planarDelta.unsqueeze(-1)
-    ).squeeze(-1)                                       # (F, 2)
-
-    # Yaw delta (wrapped to [-π, π]).
-    yawDelta = torch.zeros(frames, device=device, dtype=dtype)
-    rawDiff = yaw[1:] - yaw[:-1]
-    yawDelta[1:] = torch.atan2(torch.sin(rawDiff), torch.cos(rawDiff))
-
-    # Stack: (Δforward, Δlateral, Δheight, Δyaw).
+    yaw = pelvisYawFromRot6d(rotation6d[:, _PELVIS_BONE_INDEX, :])
+    worldDelta = _worldSpaceDisplacement(rootTranslation)
+    localPlanar, heightDelta = _planarDeltaInLocalFrame(worldDelta, yaw)
+    yawDelta = _wrappedYawDelta(yaw)
     return torch.stack(
         [localPlanar[:, 0], localPlanar[:, 1], heightDelta, yawDelta],
         dim=-1,
     )
+
+
+def _worldSpaceDisplacement(
+    rootTranslation: torch.Tensor,
+) -> torch.Tensor:
+    """Compute per-frame world-space displacement; frame 0 is zeroed."""
+    frames = rootTranslation.shape[0]
+    device = rootTranslation.device
+    dtype = rootTranslation.dtype
+    worldDelta = torch.zeros(frames, 3, device=device, dtype=dtype)
+    worldDelta[1:] = rootTranslation[1:] - rootTranslation[:-1]
+    return worldDelta
+
+
+def _planarDeltaInLocalFrame(
+    worldDelta: torch.Tensor,
+    yaw: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate planar displacement into the local frame; return (local, height).
+
+    Uses the *departure* yaw (shifted by one frame) so the integration
+    inverse in :func:`rootLocalDeltasToAbsolute` stays consistent.
+    """
+    planarDelta = worldDelta[:, [_AXIS_X, _AXIS_Z]]       # (F, 2)
+    heightDelta = worldDelta[:, _AXIS_Y]                   # (F,)
+    departureYaw = torch.cat([yaw[:1], yaw[:-1]], dim=0)   # shift by 1
+    rotMat = yawToRotationMatrix2d(departureYaw)            # (F, 2, 2)
+    localPlanar = torch.matmul(
+        rotMat.transpose(-1, -2), planarDelta.unsqueeze(-1)
+    ).squeeze(-1)                                          # (F, 2)
+    return localPlanar, heightDelta
+
+
+def _wrappedYawDelta(yaw: torch.Tensor) -> torch.Tensor:
+    """Compute wrapped yaw deltas ([-π, π]); frame 0 is zero."""
+    frames = yaw.shape[0]
+    device = yaw.device
+    dtype = yaw.dtype
+    yawDelta = torch.zeros(frames, device=device, dtype=dtype)
+    rawDiff = yaw[1:] - yaw[:-1]
+    yawDelta[1:] = torch.atan2(torch.sin(rawDiff), torch.cos(rawDiff))
+    return yawDelta
 
 
 # -------------------------------------------------------------------------
@@ -188,67 +200,96 @@ def rootLocalDeltasToAbsolute(
     Returns
     -------
     translations : torch.Tensor
-        Integrated world-space XYZ trajectory, shape ``(N, 3)`` or
-        ``(B, N, 3)``.  The seed frame itself is **not** included.
+        Integrated world-space XYZ, shape ``(N, 3)`` or ``(B, N, 3)``.
     yaws : torch.Tensor
         Cumulative world-space yaw, shape ``(N,)`` or ``(B, N)``.
     """
     batched = localDeltas.ndim == 3
+    localDeltas, seedTranslation, seedYaw = _toBatched(
+        localDeltas, seedTranslation, seedYaw
+    )
+    translations, yaws = _integrateDeltas(
+        localDeltas, seedTranslation, seedYaw
+    )
     if not batched:
-        # Add a batch dimension for uniform processing.
-        localDeltas = localDeltas.unsqueeze(0)
-        seedTranslation = seedTranslation.unsqueeze(0)
-        if isinstance(seedYaw, (int, float)):
-            seedYaw = torch.tensor(
-                seedYaw,
-                dtype=localDeltas.dtype,
-                device=localDeltas.device,
-            ).unsqueeze(0)
-        else:
-            seedYaw = seedYaw.unsqueeze(0)  # type: ignore[union-attr]
+        return translations.squeeze(0), yaws.squeeze(0)
+    return translations, yaws
 
-    batchSize, numSteps, _ = localDeltas.shape
-    device = localDeltas.device
-    dtype = localDeltas.dtype
 
+def _toBatched(
+    localDeltas: torch.Tensor,
+    seedTranslation: torch.Tensor,
+    seedYaw: float | torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Promote unbatched inputs to batch-dim-1 for uniform processing."""
+    if localDeltas.ndim == 3:
+        yawTensor = _toYawTensor(
+            seedYaw, localDeltas.shape[0],
+            localDeltas.dtype, localDeltas.device
+        )
+        return localDeltas, seedTranslation, yawTensor
+    localDeltas = localDeltas.unsqueeze(0)
+    seedTranslation = seedTranslation.unsqueeze(0)
     if isinstance(seedYaw, (int, float)):
-        currentYaw = torch.full(
+        yawTensor = torch.tensor(
+            seedYaw, dtype=localDeltas.dtype, device=localDeltas.device
+        ).unsqueeze(0)
+    else:
+        yawTensor = seedYaw.unsqueeze(0)  # type: ignore[union-attr]
+    return localDeltas, seedTranslation, yawTensor
+
+
+def _toYawTensor(
+    seedYaw: float | torch.Tensor,
+    batchSize: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Materialise a scalar or tensor yaw to a ``(B,)`` tensor."""
+    if isinstance(seedYaw, (int, float)):
+        return torch.full(
             (batchSize,), float(seedYaw), dtype=dtype, device=device
         )
-    else:
-        currentYaw = seedYaw.to(device=device, dtype=dtype)
+    return seedYaw.to(device=device, dtype=dtype)  # type: ignore[union-attr]
 
-    currentPos = seedTranslation.to(device=device, dtype=dtype)  # (B, 3)
 
+def _integrateDeltas(
+    localDeltas: torch.Tensor,
+    seedTranslation: torch.Tensor,
+    seedYaw: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Integrate ``(B, N, 4)`` deltas from a ``(B, 3)`` seed position."""
+    device = localDeltas.device
+    dtype = localDeltas.dtype
+    currentYaw = seedYaw.to(device=device, dtype=dtype)
+    currentPos = seedTranslation.to(device=device, dtype=dtype)
+    numSteps = localDeltas.shape[1]
     translations: list[torch.Tensor] = []
     yaws: list[torch.Tensor] = []
-
     for step in range(numSteps):
-        dFwd = localDeltas[:, step, 0]
-        dLat = localDeltas[:, step, 1]
-        dHeight = localDeltas[:, step, 2]
-        dYaw = localDeltas[:, step, 3]
-
-        # Rotate local (fwd, lat) displacement into world frame.
-        cos = torch.cos(currentYaw)
-        sin = torch.sin(currentYaw)
-        worldDx = cos * dFwd - sin * dLat
-        worldDz = sin * dFwd + cos * dLat
-
-        currentPos = currentPos + torch.stack(
-            [worldDx, dHeight, worldDz], dim=-1
+        currentPos, currentYaw = _applyOneDelta(
+            currentPos, currentYaw, localDeltas[:, step, :]
         )
-        currentYaw = currentYaw + dYaw
-
         translations.append(currentPos.clone())
         yaws.append(currentYaw.clone())
+    return torch.stack(translations, dim=1), torch.stack(yaws, dim=1)
 
-    translationsTensor = torch.stack(translations, dim=1)  # (B, N, 3)
-    yawsTensor = torch.stack(yaws, dim=1)                  # (B, N)
 
-    if not batched:
-        return translationsTensor.squeeze(0), yawsTensor.squeeze(0)
-    return translationsTensor, yawsTensor
+def _applyOneDelta(
+    currentPos: torch.Tensor,
+    currentYaw: torch.Tensor,
+    delta: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply one root-local delta step; return updated (pos, yaw)."""
+    dFwd, dLat, dHeight, dYaw = (
+        delta[:, 0], delta[:, 1], delta[:, 2], delta[:, 3]
+    )
+    cos = torch.cos(currentYaw)
+    sin = torch.sin(currentYaw)
+    worldDx = cos * dFwd - sin * dLat
+    worldDz = sin * dFwd + cos * dLat
+    nextPos = currentPos + torch.stack([worldDx, dHeight, worldDz], dim=-1)
+    return nextPos, currentYaw + dYaw
 
 
 # -------------------------------------------------------------------------

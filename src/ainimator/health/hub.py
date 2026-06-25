@@ -505,15 +505,10 @@ class HealthHub:
 
         Accepts pre-loaded components so ``health`` does not need to
         import ``ainimator.training`` or ``ainimator.data`` (layer L4
-        constraint).  The CLI (L5) handles loading and passes
-        components here.
+        constraint).  The CLI (L5) handles loading and passes components.
 
-        Computes:
-        - cfg_sim (cosine cond vs uncond same seed)
-        - seed_sim (cosine across seeds same prompt)
-        - encoder_cond_uncond_sim (pool-level)
-        - cross_prompt_sim (if probeIndices + dataset supplied)
-        - fidelity / retrieval / distinctness at cfg ∈ {1, 4, 6}
+        Computes: cfg_sim, seed_sim, encoder_cond_uncond_sim,
+        cross_prompt_sim (optional), fidelity/retrieval/distinctness.
 
         Parameters
         ----------
@@ -531,113 +526,40 @@ class HealthHub:
             Unconditional text (CFG null prompt).
         probeIndices : list[int], optional
             When supplied, cross_prompt_sim and multi-CFG eval are run.
-        dataset : PreprocessedLinkDataset, optional
+        dataset : optional
             Pre-loaded dataset for fidelity/retrieval/distinctness.
 
         Returns
         -------
-        dict with all diagnostic metrics.
+        dict
         """
-        # --- Encoder cond↔uncond sim --------------------------------
-        condEnc = tokenizer.encode(prompt)
-        condOut = encoder(
-            condEnc.inputIds.to(device),
-            condEnc.attentionMask.to(device),
+        condOut, uncondOut = _encodePrompts(
+            tokenizer, encoder, prompt, emptyPrompt, device
         )
-        uncondEnc = tokenizer.encode(emptyPrompt)
-        uncondOut = encoder(
-            uncondEnc.inputIds.to(device),
-            uncondEnc.attentionMask.to(device),
+        samplesByConfig = _runSamplingGrid(
+            sampler, denoiser, condOut, uncondOut,
+            seeds, cfgScales, frames, numSteps, device, normalizer,
         )
-        encoderSim = _poolCosineSim(condOut, uncondOut)
-
-        # --- Sampling sweep -----------------------------------------
-        samplesByConfig: dict[tuple[int, float], torch.Tensor] = {}
-        with torch.no_grad():
-            for seed in seeds:
-                for cfg in cfgScales:
-                    useCfg = float(cfg) != 1.0
-                    output = sampler.sample(
-                        denoiser=denoiser,
-                        textHiddenStates=condOut.hiddenStates,
-                        textKeyPaddingMask=condOut.keyPaddingMask,
-                        unconditionalTextHiddenStates=(
-                            uncondOut.hiddenStates if useCfg else None
-                        ),
-                        unconditionalTextKeyPaddingMask=(
-                            uncondOut.keyPaddingMask if useCfg else None
-                        ),
-                        frames=frames,
-                        numSteps=numSteps,
-                        cfgScale=float(cfg),
-                        eta=0.0,
-                        device=device,
-                        seed=int(seed),
-                        normalizer=normalizer,
-                    )
-                    samplesByConfig[(int(seed), float(cfg))] = (
-                        output.boneMotion[0].detach().float().cpu()
-                    )
-
-        cfgSim, seedSim = _computeCollapseSims(
-            samplesByConfig, seeds, cfgScales
+        metrics = _assembleBaseMetrics(
+            condOut, uncondOut, samplesByConfig, seeds, cfgScales
         )
-
-        metrics: dict[str, Any] = {
-            "encoder_cond_uncond_sim": encoderSim,
-            "cfg_sim": cfgSim,
-            "seed_sim": seedSim,
-            "prompt": prompt,
-            "seeds": list(seeds),
-            "cfg_scales": list(cfgScales),
-        }
-
-        # Parity values matching the old diagnose CLI layout.
-        metrics["sample_stats"] = _buildSampleStats(
-            samplesByConfig, seeds, cfgScales
-        )
-
-        # --- Cross-prompt sim + fidelity/retrieval/distinctness ------
         if probeIndices is not None and dataset is not None:
-            from ainimator.health.evaluation import (
-                evaluateMultiCfg, CANONICAL_CFG_SCALES,
+            _appendCrossPromptMetrics(
+                metrics, probeIndices, dataset, tokenizer, encoder,
+                denoiser, sampler, normalizer, device, frames,
+                numSteps, emptyPrompt,
             )
+        self._writeDiagnoseOutput(metrics)
+        return metrics
 
-            crossSim = _crossPromptSim(
-                probeIndices, dataset, tokenizer, encoder, denoiser,
-                sampler, normalizer, device, frames, numSteps,
-                emptyPrompt
-            )
-            metrics["cross_prompt_sim"] = crossSim
-
-            evalRows = evaluateMultiCfg(
-                probeIndices=probeIndices,
-                dataset=dataset,
-                tokenizer=tokenizer,
-                encoder=encoder,
-                denoiser=denoiser,
-                sampler=sampler,
-                normalizer=normalizer,
-                device=device,
-                cfgScales=CANONICAL_CFG_SCALES,
-                frames=frames,
-                numSteps=numSteps,
-                emptyPrompt=emptyPrompt,
-            )
-            metrics["eval_rows"] = evalRows
-
-        # Write output.
+    def _writeDiagnoseOutput(self, metrics: dict[str, Any]) -> None:
+        """Write diagnose.json to the output directory."""
         import json
-        diagPath = (
-            self._outputDir / "health" / "diagnose.json"
-        )
+        diagPath = self._outputDir / "health" / "diagnose.json"
         diagPath.parent.mkdir(parents=True, exist_ok=True)
         with diagPath.open("w", encoding="utf-8") as fh:
             json.dump(metrics, fh, indent=2, default=str)
-        LOGGER.info(
-            "HealthHub.diagnose: results written to %s", diagPath
-        )
-        return metrics
+        LOGGER.info("HealthHub.diagnose: results written to %s", diagPath)
 
     # ------------------------------------------------------------------
     # Runtime: diagnoseController (offline controller checkpoint)
@@ -657,149 +579,27 @@ class HealthHub:
     ) -> dict[str, Any]:
         """Offline diagnostics for a controller checkpoint.
 
-        Computes the three Goal A contracts:
-        - ``control_sensitivity`` — output change under shuffled control.
-        - ``mean_collapse_rank`` / ``mean_collapse_sim`` — rank + cosine
-          similarity of varied-control outputs.
-        - ``rollout_drift`` — short-horizon trajectory error vs. the seed.
-
-        Accepts pre-loaded components so ``health`` does not import
-        ``ainimator.training`` (layer L4 constraint).  The CLI (L5) loads
-        the checkpoint and passes components here.
-
-        Parameters
-        ----------
-        model : MotionController
-            Loaded and eval'd controller.
-        stateNormalizer, deltaNormalizer : MotionNormalizer
-            Fitted normalizers from the checkpoint.
-        device : torch.device or str
-            Inference device.
-        controlSpec : str
-            Control specification string (e.g. ``"forward:1.0"``).
-            Parsed into a control tensor by :func:`_parseControlSpec`.
-        rolloutFrames : int
-            Number of frames to roll out after the seed window.
-        shuffleControl : bool
-            When ``True``, also measures ``control_sensitivity`` by
-            replaying with a shuffled control batch.
-        seeds : tuple of int
-            RNG seeds for synthetic seed-state generation.
-        phaseMode : str or None
-            Force a phase mode (``"none"``, ``"explicit"``,
-            ``"learned"``); ``None`` reads the mode from the checkpoint.
-        controlChannels : int or None
-            Override the control channel count; inferred from the model
-            when ``None``.
-
-        Returns
-        -------
-        dict
-            Diagnostic metrics including all Goal A contract values.
+        Delegates to :func:`ainimator.health.controller_diagnose.diagnoseController`
+        to keep ``hub.py`` under G-FILELEN.  See that module for the full
+        contract documentation.
         """
-        import json as _json
-
-        from ainimator.health.controller_metrics import (
-            controlSensitivity,
-            meanCollapse,
-            postNormStats,
+        from ainimator.health.controller_diagnose import (
+            diagnoseController as _diagnoseCtrl,
         )
 
-        dev = torch.device(device) if isinstance(device, str) else device
-        numBones = getattr(model, "config", None)
-        numBones = (
-            numBones.numBones
-            if numBones is not None and hasattr(numBones, "numBones")
-            else 22
+        return _diagnoseCtrl(
+            model=model,
+            stateNormalizer=stateNormalizer,
+            deltaNormalizer=deltaNormalizer,
+            device=device,
+            outputDir=self._outputDir,
+            controlSpec=controlSpec,
+            rolloutFrames=rolloutFrames,
+            shuffleControl=shuffleControl,
+            seeds=seeds,
+            phaseMode=phaseMode,
+            controlChannels=controlChannels,
         )
-        contextFrames = getattr(
-            getattr(model, "config", None), "contextFrames", 1
-        )
-        if controlChannels is None:
-            controlChannels = getattr(
-                getattr(model, "config", None), "controlChannels", 4
-            )
-
-        metrics: dict[str, Any] = {
-            "model_type": "controller",
-            "control_spec": controlSpec,
-            "rollout_frames": rolloutFrames,
-            "shuffle_control": shuffleControl,
-            "seeds": list(seeds),
-        }
-
-        # Build a batch of synthetic seed states (one per seed).
-        batchSize = max(len(seeds), 2)
-        boneWindows: list[torch.Tensor] = []
-        globalWindows: list[torch.Tensor] = []
-        controls: list[torch.Tensor] = []
-        for seed in range(batchSize):
-            rng = torch.Generator()
-            rng.manual_seed(seed)
-            boneWindow = torch.randn(
-                contextFrames, numBones, 6, generator=rng
-            )
-            globalWindow = torch.randn(contextFrames, 4, generator=rng)
-            ctrl = _buildControlVector(
-                controlSpec, controlChannels, seed=seed
-            )
-            boneWindows.append(boneWindow)
-            globalWindows.append(globalWindow)
-            controls.append(ctrl)
-
-        boneBatch = torch.stack(boneWindows).to(dev)  # (B, K, numBones, 6)
-        globalBatch = torch.stack(globalWindows).to(dev)  # (B, K, 4)
-        controlBatch = torch.stack(controls).to(dev)     # (B, controlCh)
-
-        model.eval()
-
-        # --- control_sensitivity ----------------------------------------
-        if shuffleControl:
-            sensitivity = controlSensitivity(
-                model,    # type: ignore[arg-type]
-                boneBatch,
-                controlBatch,
-                globalWindow=globalBatch,
-            )
-            metrics["control_sensitivity"] = sensitivity
-        else:
-            metrics["control_sensitivity"] = None
-
-        # --- mean_collapse (rank + sim under varied control) ------------
-        with torch.no_grad():
-            output = model(
-                boneBatch, controlBatch, globalWindow=globalBatch
-            )
-        rank, sim = meanCollapse(output)  # type: ignore[arg-type]
-        metrics["mean_collapse_rank"] = rank
-        metrics["mean_collapse_sim"] = sim
-
-        # --- post_norm_stats --------------------------------------------
-        normStatVal = postNormStats(boneBatch.reshape(-1, numBones, 6))
-        metrics["post_norm_stats"] = normStatVal
-
-        # --- rollout_drift (short-horizon) ------------------------------
-        rolloutDriftVal = _computeRolloutDriftFromSeed(
-            model,       # type: ignore[arg-type]
-            stateNormalizer,
-            deltaNormalizer,
-            boneBatch,
-            globalBatch,
-            controlBatch,
-            rolloutFrames,
-            dev,
-        )
-        metrics["rollout_drift"] = rolloutDriftVal
-
-        # Write output.
-        diagPath = self._outputDir / "health" / "diagnose_controller.json"
-        diagPath.parent.mkdir(parents=True, exist_ok=True)
-        with diagPath.open("w", encoding="utf-8") as fh:
-            _json.dump(metrics, fh, indent=2, default=str)
-        LOGGER.info(
-            "HealthHub.diagnoseController: results written to %s", diagPath
-        )
-        return metrics
 
     # ------------------------------------------------------------------
     # Runtime: report
@@ -878,6 +678,118 @@ class HealthHub:
     def close(self) -> None:
         """Close TensorBoard writer."""
         self._tb.close()
+
+
+# ------------------------------------------------------------------
+# Diagnose helpers (diffusion branch)
+# ------------------------------------------------------------------
+def _encodePrompts(
+    tokenizer: Any,
+    encoder: Any,
+    prompt: str,
+    emptyPrompt: str,
+    device: Any,
+) -> tuple[Any, Any]:
+    """Encode conditional and unconditional prompts."""
+    condEnc = tokenizer.encode(prompt)
+    condOut = encoder(
+        condEnc.inputIds.to(device), condEnc.attentionMask.to(device)
+    )
+    uncondEnc = tokenizer.encode(emptyPrompt)
+    uncondOut = encoder(
+        uncondEnc.inputIds.to(device), uncondEnc.attentionMask.to(device)
+    )
+    return condOut, uncondOut
+
+
+def _runSamplingGrid(
+    sampler: Any,
+    denoiser: Any,
+    condOut: Any,
+    uncondOut: Any,
+    seeds: tuple[int, ...],
+    cfgScales: tuple[float, ...],
+    frames: int,
+    numSteps: int,
+    device: Any,
+    normalizer: Any,
+) -> dict[tuple[int, float], torch.Tensor]:
+    """Run the seed × cfg sampling grid; return motion tensor dict."""
+    samplesByConfig: dict[tuple[int, float], torch.Tensor] = {}
+    with torch.no_grad():
+        for seed in seeds:
+            for cfg in cfgScales:
+                useCfg = float(cfg) != 1.0
+                output = sampler.sample(
+                    denoiser=denoiser,
+                    textHiddenStates=condOut.hiddenStates,
+                    textKeyPaddingMask=condOut.keyPaddingMask,
+                    unconditionalTextHiddenStates=(
+                        uncondOut.hiddenStates if useCfg else None
+                    ),
+                    unconditionalTextKeyPaddingMask=(
+                        uncondOut.keyPaddingMask if useCfg else None
+                    ),
+                    frames=frames, numSteps=numSteps,
+                    cfgScale=float(cfg), eta=0.0,
+                    device=device, seed=int(seed),
+                    normalizer=normalizer,
+                )
+                samplesByConfig[(int(seed), float(cfg))] = (
+                    output.boneMotion[0].detach().float().cpu()
+                )
+    return samplesByConfig
+
+
+def _assembleBaseMetrics(
+    condOut: Any,
+    uncondOut: Any,
+    samplesByConfig: dict[tuple[int, float], torch.Tensor],
+    seeds: tuple[int, ...],
+    cfgScales: tuple[float, ...],
+) -> dict[str, Any]:
+    """Build base metrics dict from encoder + sampling results."""
+    encoderSim = _poolCosineSim(condOut, uncondOut)
+    cfgSim, seedSim = _computeCollapseSims(samplesByConfig, seeds, cfgScales)
+    return {
+        "encoder_cond_uncond_sim": encoderSim,
+        "cfg_sim": cfgSim,
+        "seed_sim": seedSim,
+        "seeds": list(seeds),
+        "cfg_scales": list(cfgScales),
+        "sample_stats": _buildSampleStats(samplesByConfig, seeds, cfgScales),
+    }
+
+
+def _appendCrossPromptMetrics(
+    metrics: dict[str, Any],
+    probeIndices: list[int],
+    dataset: Any,
+    tokenizer: Any,
+    encoder: Any,
+    denoiser: Any,
+    sampler: Any,
+    normalizer: Any,
+    device: Any,
+    frames: int,
+    numSteps: int,
+    emptyPrompt: str,
+) -> None:
+    """Add cross_prompt_sim and eval_rows to metrics in-place."""
+    from ainimator.health.evaluation import (
+        evaluateMultiCfg, CANONICAL_CFG_SCALES,
+    )
+    metrics["cross_prompt_sim"] = _crossPromptSim(
+        probeIndices, dataset, tokenizer, encoder, denoiser,
+        sampler, normalizer, device, frames, numSteps, emptyPrompt,
+    )
+    metrics["eval_rows"] = evaluateMultiCfg(
+        probeIndices=probeIndices, dataset=dataset,
+        tokenizer=tokenizer, encoder=encoder, denoiser=denoiser,
+        sampler=sampler, normalizer=normalizer, device=device,
+        cfgScales=CANONICAL_CFG_SCALES, frames=frames,
+        numSteps=numSteps, emptyPrompt=emptyPrompt,
+    )
 
 
 # ------------------------------------------------------------------
@@ -1192,138 +1104,6 @@ def _formatSheet(
     return "\n".join(lines)
 
 
-# ------------------------------------------------------------------
-# Controller diagnose helpers
-# ------------------------------------------------------------------
-def _buildControlVector(
-    controlSpec: str,
-    controlChannels: int,
-    seed: int = 0,
-) -> torch.Tensor:
-    """Build a 1-D control tensor from a spec string.
-
-    The spec format is ``"<keyword>:<scale>"`` where ``keyword``
-    determines the direction pattern and ``scale`` sets the magnitude.
-    Currently supported keywords:
-
-    * ``"forward"`` — forward locomotion; all channels set to ``scale``
-      except lateral (index 1) which is zero.
-    * ``"random"`` — random unit vector scaled by ``scale``; uses
-      ``seed`` as the RNG seed.
-
-    Parameters
-    ----------
-    controlSpec : str
-        Spec string, e.g. ``"forward:1.0"`` or ``"random:0.5"``.
-    controlChannels : int
-        Number of control channels expected by the model.
-    seed : int
-        RNG seed for ``"random"`` mode (ignored for ``"forward"``).
-
-    Returns
-    -------
-    torch.Tensor
-        Shape ``(controlChannels,)``.
-    """
-    keyword, _, scaleStr = controlSpec.partition(":")
-    scale = float(scaleStr) if scaleStr else 1.0
-    keyword = keyword.strip().lower()
-
-    if keyword == "forward":
-        ctrl = torch.zeros(controlChannels)
-        ctrl[0] = scale  # forward velocity channel
-        return ctrl
-
-    # Default: random unit vector scaled by scale.
-    rng = torch.Generator()
-    rng.manual_seed(seed)
-    ctrl = torch.randn(controlChannels, generator=rng)
-    norm = ctrl.norm()
-    if float(norm.item()) > 0.0:
-        ctrl = ctrl / norm
-    return ctrl * scale
-
-
-def _computeRolloutDriftFromSeed(
-    model: "nn.Module",
-    stateNormalizer: Any,
-    deltaNormalizer: Any,
-    boneBatch: torch.Tensor,
-    globalBatch: torch.Tensor,
-    controlBatch: torch.Tensor,
-    rolloutFrames: int,
-    device: Any,
-) -> float:
-    """Compute open-loop rollout drift relative to the seed state.
-
-    Uses the first sample's last seed frame as the ``ground truth``
-    baseline: a controller that merely repeats its seed has zero drift
-    (it cannot get worse).  A controller that diverges from the seed
-    increases this value.  For offline diagnose without a ground-truth
-    clip, this is the most we can measure without a dataset.
-
-    Parameters
-    ----------
-    model : MotionController
-        Loaded eval'd controller.
-    stateNormalizer, deltaNormalizer : MotionNormalizer
-        Fitted normalizers (from the checkpoint).
-    boneBatch : torch.Tensor
-        ``(B, contextFrames, numBones, 6)`` seed rotations.
-    globalBatch : torch.Tensor
-        ``(B, contextFrames, 4)`` seed root-local motion.
-    controlBatch : torch.Tensor
-        ``(B, controlChannels)`` control signals.
-    rolloutFrames : int
-        Number of frames to roll out.
-    device : torch.device
-        Inference device.
-
-    Returns
-    -------
-    float
-        Mean per-frame MSE between rolled-out trajectory and the static
-        repetition of the seed's last frame (drift proxy).
-    """
-    try:
-        from ainimator.model.controller_rollout import rolloutController
-
-        seedRot6d = boneBatch.detach().cpu()  # (B, K, numBones, 6)
-        seedRoot = globalBatch.detach().cpu()  # (B, K, 4) local-motion
-
-        # Build a constant-control sequence of length rolloutFrames.
-        controlSeq = controlBatch.detach().cpu().unsqueeze(1).expand(
-            -1, rolloutFrames, -1
-        )  # (B, rolloutFrames, controlChannels)
-
-        # Synthesise a fake absolute root translation for rolloutController.
-        batchSize = seedRot6d.shape[0]
-        seedRootAbs = torch.zeros(batchSize, seedRot6d.shape[1], 3)
-
-        rollout = rolloutController(
-            model,  # type: ignore[arg-type]
-            stateNormalizer,
-            deltaNormalizer,
-            seedRotation6d=seedRot6d,
-            seedRootTranslation=seedRootAbs,
-            controlSequence=controlSeq,
-        )
-
-        # Drift = MSE vs. static repetition of the seed's last frame.
-        lastFrame = seedRot6d[:, -1:, :, :]  # (B, 1, numBones, 6)
-        refRot = lastFrame.expand_as(
-            rollout.rotation6d[:, seedRot6d.shape[1]:, :, :]
-        )
-        predictedRot = rollout.rotation6d[:, seedRot6d.shape[1]:, :, :]
-        rotErr = float(
-            torch.mean((predictedRot - refRot) ** 2).item()
-        )
-        return rotErr
-    except Exception as exc:
-        LOGGER.warning(
-            "rollout_drift computation failed: %s; returning NaN", exc
-        )
-        return float("nan")
 
 
 # ------------------------------------------------------------------

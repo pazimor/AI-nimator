@@ -248,41 +248,41 @@ class TestLoadDiagnoseProfile:
 
 
 # ------------------------------------------------------------------
-# _buildControlVector tests
+# buildControlVector tests (moved to controller_diagnose module)
 # ------------------------------------------------------------------
 class TestBuildControlVector:
     """Tests for the control vector builder."""
 
     def test_forward_spec_sets_first_channel(self) -> None:
-        from ainimator.health.hub import _buildControlVector
+        from ainimator.health.controller_diagnose import buildControlVector
 
-        ctrl = _buildControlVector("forward:1.0", controlChannels=4)
+        ctrl = buildControlVector("forward:1.0", controlChannels=4)
         assert ctrl.shape == (4,)
         assert float(ctrl[0].item()) == pytest.approx(1.0)
         assert float(ctrl[1].item()) == pytest.approx(0.0)
 
     def test_forward_spec_respects_scale(self) -> None:
-        from ainimator.health.hub import _buildControlVector
+        from ainimator.health.controller_diagnose import buildControlVector
 
-        ctrl = _buildControlVector("forward:2.5", controlChannels=4)
+        ctrl = buildControlVector("forward:2.5", controlChannels=4)
         assert float(ctrl[0].item()) == pytest.approx(2.5)
 
     def test_random_spec_produces_correct_shape(self) -> None:
-        from ainimator.health.hub import _buildControlVector
+        from ainimator.health.controller_diagnose import buildControlVector
 
-        ctrl = _buildControlVector("random:1.0", controlChannels=8, seed=0)
+        ctrl = buildControlVector("random:1.0", controlChannels=8, seed=0)
         assert ctrl.shape == (8,)
 
     def test_random_spec_is_scaled_by_scale(self) -> None:
-        from ainimator.health.hub import _buildControlVector
+        from ainimator.health.controller_diagnose import buildControlVector
 
-        ctrl = _buildControlVector("random:0.5", controlChannels=4, seed=0)
+        ctrl = buildControlVector("random:0.5", controlChannels=4, seed=0)
         assert float(ctrl.norm().item()) == pytest.approx(0.5, abs=1e-5)
 
     def test_unknown_keyword_falls_back_to_random(self) -> None:
-        from ainimator.health.hub import _buildControlVector
+        from ainimator.health.controller_diagnose import buildControlVector
 
-        ctrl = _buildControlVector("sideways:1.0", controlChannels=4, seed=0)
+        ctrl = buildControlVector("sideways:1.0", controlChannels=4, seed=0)
         assert ctrl.shape == (4,)
 
 
