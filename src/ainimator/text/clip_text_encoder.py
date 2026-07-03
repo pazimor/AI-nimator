@@ -1,33 +1,15 @@
-"""Frozen CLIP text encoder for AI-nimator v2 (Phase 2).
+"""Frozen HuggingFace text encoder for AI-nimator v2 (Phase 2).
 
-The custom 8K-BPE encoder (:mod:`custom_text_encoder`) is trained from
-scratch on ~56k motion captions.  At that corpus size it cannot build a
-sharp semantic space — "jumping", "stepping" and "walking" stay close
-together, so the diffusion model receives a blurry conditioning signal.
+Wraps any HuggingFace encoder model (CLIP, XLM-RoBERTa, …) as a frozen
+backbone with a small trainable projection head.  The backbone is kept
+fully **frozen**; only the projection (``backboneHiddenDim → outputDim``)
+and the learnable CFG null embedding receive gradients.
 
-This module swaps in the text tower of OpenAI CLIP (ViT-B/32) which was
-pretrained contrastively on 400M image-text pairs.  CLIP is kept fully
-**frozen**; only a small trainable projection (512 → ``outputDim``) and
-the learnable CFG null embedding receive gradients.  The public surface
-mirrors :class:`CustomTextEncoder` / :class:`CustomTokenizer` exactly so
-the rest of the v2 stack treats it as a drop-in replacement:
+The public surface mirrors :class:`CustomTextEncoder` / :class:`CustomTokenizer`
+exactly so the rest of the v2 stack treats it as a drop-in replacement.
 
-* :class:`ClipTokenizer` exposes ``encode(texts) -> EncodedBatch`` and
-  the ``config.maxLength`` / ``vocabSize`` / ``padTokenId`` attributes.
-* :class:`ClipTextEncoder` exposes
-  ``forward(inputIds, attentionMask) -> TextEncoderOutput``,
-  ``forwardNull(batchSize, ...)`` and the ``config`` / ``outputDim`` /
-  ``nullEmbedding`` attributes.
-
-Both the CLIP weights and the CLIP BPE tokenizer are loaded from the
-HuggingFace hub via ``transformers``.  The first call downloads
-``openai/clip-vit-base-patch32`` (~600 MB) and caches it; offline
-environments must pre-populate the HF cache.
-
-Trainable parameter budget (outputDim=384):
-* projection Linear 512→384 + LayerNorm  ≈ 197k
-* null embedding 1×1×384                 ≈ 384
-* **Total trainable ≈ 0.2M** (CLIP's ~63M stay frozen).
+Default model: ``openai/clip-vit-base-patch32`` (original CLIP behaviour).
+Supported alternative: ``xlm-roberta-base`` (backboneHiddenDim=768).
 """
 
 from __future__ import annotations
@@ -43,12 +25,11 @@ import torch.nn.functional as F
 from ainimator.text.custom_text_encoder import TextEncoderOutput
 from ainimator.text.custom_tokenizer import EncodedBatch
 
-# Default CLIP checkpoint — the ViT-B/32 variant whose text tower is a
-# 12-layer / 512-dim transformer with a 77-token context window and a
-# 49408-entry BPE vocabulary.
 DEFAULT_CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
 CLIP_HIDDEN_DIM = 512
 CLIP_CONTEXT_LENGTH = 77
+# Maximum sequence length accepted by this class when not using CLIP.
+_MAX_CONTEXT_LENGTH = 512
 
 
 # =====================================================================
@@ -66,9 +47,9 @@ class ClipTokenizerConfig:
     maxLength: int = 32
 
     def __post_init__(self) -> None:
-        if not (1 <= self.maxLength <= CLIP_CONTEXT_LENGTH):
+        if not (1 <= self.maxLength <= _MAX_CONTEXT_LENGTH):
             raise ValueError(
-                f"maxLength must be in [1, {CLIP_CONTEXT_LENGTH}]; got "
+                f"maxLength must be in [1, {_MAX_CONTEXT_LENGTH}]; got "
                 f"{self.maxLength}."
             )
 
@@ -87,12 +68,12 @@ class ClipTokenizer:
         modelName: str = DEFAULT_CLIP_MODEL_NAME,
         maxLength: int = 32,
     ) -> None:
-        from transformers import CLIPTokenizerFast
+        from transformers import AutoTokenizer
 
         self._config = ClipTokenizerConfig(
             modelName=modelName, maxLength=maxLength
         )
-        self._backend = CLIPTokenizerFast.from_pretrained(modelName)
+        self._backend = AutoTokenizer.from_pretrained(modelName)
 
     @property
     def config(self) -> ClipTokenizerConfig:
@@ -184,9 +165,9 @@ class ClipTextEncoderConfig:
             raise ValueError("clipHiddenDim must be >= 1.")
         if not (0.0 <= self.dropout < 1.0):
             raise ValueError("dropout must be in [0, 1).")
-        if not (1 <= self.maxLength <= CLIP_CONTEXT_LENGTH):
+        if not (1 <= self.maxLength <= _MAX_CONTEXT_LENGTH):
             raise ValueError(
-                f"maxLength must be in [1, {CLIP_CONTEXT_LENGTH}]; got "
+                f"maxLength must be in [1, {_MAX_CONTEXT_LENGTH}]; got "
                 f"{self.maxLength}."
             )
 
@@ -209,9 +190,15 @@ class ClipTextEncoder(nn.Module):
         super().__init__()
         self._config = config
 
-        from transformers import CLIPTextModel
+        from transformers import AutoModel
 
-        self.clip = CLIPTextModel.from_pretrained(config.modelName)
+        backbone = AutoModel.from_pretrained(config.modelName)
+        # A full CLIP checkpoint bundles vision + text towers and its
+        # forward requires pixel_values; keep the text tower only.
+        # Text-only backbones (e.g. xlm-roberta) have no text_model
+        # attribute and are used as-is.
+        textTower = getattr(backbone, "text_model", None)
+        self.clip = textTower if textTower is not None else backbone
         # Freeze the entire CLIP text tower.
         for parameter in self.clip.parameters():
             parameter.requires_grad_(False)
