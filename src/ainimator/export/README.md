@@ -30,10 +30,25 @@ run the controller in production without any Python dependency:
   norm_stats.json          — state / delta / control z-norm statistics
   manifest.json            — frozen I/O contract (ROADMAP_DETERMINIST §2.2)
   resolved_config.yaml     — provenance (config + git SHA + date) [optional]
-  presets/
-    walk.json              — example preset: {vx: 0.05, vz: 0.0}
-    run.json               — example preset: {vx: 0.15, vz: 0.0}
+  presets/                 — default locomotion set (schema-validated)
+    idle.json  forward.json  backward.json
+    strafe_left.json  strafe_right.json
 ```
+
+JSON Schemas + the full engine-facing contract live in `apps/spec/`:
+`inference_contract.md`, `manifest.schema.json`,
+`control_preset.schema.json`.  The generated manifest and every preset
+validate their schema (locked by `test/ainimator/export/test_bundle.py`,
+which also locks an engine-style ONNXRuntime step — JSON stats only —
+against the torch path at 1e-3).
+
+Text-conditioned checkpoints (`prompt_emb_channels > 0`) additionally
+serialise the **learned null prompt embedding** in `norm_stats.json`
+(section `prompt.null_emb`): the ONNX `promptEmb` input is required, so
+a promptless engine must feed this exact vector — zeros are not a valid
+substitute.  Prompt packaging decision (B0): presets may carry
+precomputed `prompt_emb`; no `text_encoder.onnx` in the bundle v1
+(see `apps/spec/inference_contract.md` §4).
 
 ### Assembling a bundle
 

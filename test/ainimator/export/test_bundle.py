@@ -163,3 +163,125 @@ def test_bundle_with_presets(tmp_path: Path) -> None:
 
 
 import pytest  # noqa: E402 (placed here to keep imports at module top)
+
+
+# ---------------------------------------------------------------------
+# B0 acceptance: schemas + default presets + engine-style parity
+# ---------------------------------------------------------------------
+_SPEC_DIR = Path(__file__).parents[3] / "apps" / "spec"
+
+
+def test_default_presets_written_and_valid(tmp_path: Path) -> None:
+    """No presets arg -> the standard locomotion set, schema-valid."""
+    import jsonschema
+
+    controller = _tinyController()
+    state, delta = _tinyNorms(NUM_SMPL22_BONES)
+    exportControllerBundle(
+        controller, state, delta,
+        torch.zeros(2), torch.ones(2), tmp_path,
+    )
+    schema = json.loads(
+        (_SPEC_DIR / "control_preset.schema.json").read_text()
+    )
+    presetDir = tmp_path / PRESETS_SUBDIR
+    names = sorted(p.stem for p in presetDir.glob("*.json"))
+    assert names == [
+        "backward", "forward", "idle", "strafe_left", "strafe_right",
+    ]
+    for path in presetDir.glob("*.json"):
+        jsonschema.validate(json.loads(path.read_text()), schema)
+
+
+def test_manifest_validates_schema(tmp_path: Path) -> None:
+    """The generated manifest must satisfy apps/spec/manifest.schema.json."""
+    import jsonschema
+
+    controller = _tinyController()
+    state, delta = _tinyNorms(NUM_SMPL22_BONES)
+    exportControllerBundle(
+        controller, state, delta,
+        torch.zeros(2), torch.ones(2), tmp_path,
+    )
+    schema = json.loads((_SPEC_DIR / "manifest.schema.json").read_text())
+    manifest = json.loads((tmp_path / MANIFEST_FILENAME).read_text())
+    jsonschema.validate(manifest, schema)
+
+
+def test_null_prompt_emb_serialized_for_text_models(tmp_path: Path) -> None:
+    """Text-conditioned checkpoints ship the learned null embedding."""
+    cfg = ControllerV2Config(
+        embedDim=64, numHeads=4, numLayers=2,
+        numBones=NUM_SMPL22_BONES, contextFrames=1,
+        phaseMode=PhaseMode.NONE, promptEmbChannels=16,
+    )
+    controller = MotionController(cfg)
+    state, delta = _tinyNorms(NUM_SMPL22_BONES)
+    exportControllerBundle(
+        controller, state, delta,
+        torch.zeros(2), torch.ones(2), tmp_path,
+    )
+    stats = json.loads((tmp_path / NORM_STATS_FILENAME).read_text())
+    assert stats["prompt"]["channels"] == 16
+    assert len(stats["prompt"]["null_emb"]) == 16
+
+
+def test_bundle_engine_parity_with_normalization(tmp_path: Path) -> None:
+    """Engine-style step from bundle files only == torch path (1e-3).
+
+    Reads norm_stats.json as plain JSON (no MotionNormalizer), z-norms
+    a raw state window, runs controller.onnx via ONNXRuntime, and
+    denormalizes the delta — exactly what a plugin does per frame.
+    """
+    import numpy as np
+    import onnxruntime as ort
+
+    torch.manual_seed(0)
+    controller = _tinyController().eval()
+    state, delta = _tinyNorms(NUM_SMPL22_BONES)
+    controlMean, controlStd = torch.zeros(2), torch.ones(2) * 2.0
+    exportControllerBundle(
+        controller, state, delta, controlMean, controlStd, tmp_path,
+    )
+    stats = json.loads((tmp_path / NORM_STATS_FILENAME).read_text())
+
+    rawBone = torch.randn(1, 1, NUM_SMPL22_BONES, 6)
+    rawGlobal = torch.randn(1, 1, ROOT_LOCAL_MOTION_CHANNELS)
+    rawControl = torch.tensor([[0.5, 1.0]])
+
+    # --- engine side: JSON stats only -----------------------------
+    bMean = np.array(stats["state"]["bone_mean"], dtype=np.float32)
+    bStd = np.array(stats["state"]["bone_std"], dtype=np.float32)
+    gMean = np.array(stats["state"]["global_mean"], dtype=np.float32)
+    gStd = np.array(stats["state"]["global_std"], dtype=np.float32)
+    cMean = np.array(stats["control"]["mean"], dtype=np.float32)
+    cStd = np.array(stats["control"]["std"], dtype=np.float32)
+    normBoneNp = (rawBone.numpy() - bMean) / bStd
+    normGlobalNp = (rawGlobal.numpy() - gMean) / gStd
+    normControlNp = (rawControl.numpy() - cMean) / cStd
+
+    session = ort.InferenceSession(
+        str(tmp_path / ONNX_FILENAME), providers=["CPUExecutionProvider"]
+    )
+    inputNames = [i.name for i in session.get_inputs()]
+    feeds = dict(zip(inputNames, [
+        normBoneNp.astype(np.float32),
+        normControlNp.astype(np.float32),
+        normGlobalNp.astype(np.float32),
+    ]))
+    boneDeltaOrt, globalDeltaOrt = session.run(None, feeds)
+    dbMean = np.array(stats["delta"]["bone_mean"], dtype=np.float32)
+    dbStd = np.array(stats["delta"]["bone_std"], dtype=np.float32)
+    engineBoneDelta = boneDeltaOrt * dbStd[0] + dbMean[0]
+
+    # --- torch reference side --------------------------------------
+    with torch.no_grad():
+        normBone = (rawBone - state.boneMean) / state.boneStd
+        normGlobal = (rawGlobal - state.globalMean) / state.globalStd
+        normControl = (rawControl - controlMean) / controlStd
+        out = controller(normBone, normControl, globalWindow=normGlobal)
+        torchBoneDelta = out.boneDelta * delta.boneStd + delta.boneMean
+
+    assert np.allclose(
+        engineBoneDelta, torchBoneDelta.numpy(), atol=1e-3
+    ), "engine-style bundle step diverges from the torch path"

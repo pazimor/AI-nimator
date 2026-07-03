@@ -40,8 +40,6 @@ from ainimator.core.constants.controller import (
     NUM_SMPL22_BONES,
     ROOT_LOCAL_MOTION_CHANNELS,
     ROTATION6D_CHANNELS,
-    CONTROL_PLANAR_VELOCITY_CHANNELS,
-    CONTROL_AIM_DIRECTION_CHANNELS,
     controlSignalChannels,
     phaseConditioningChannels,
 )
@@ -59,6 +57,51 @@ ONNX_FILENAME = "controller.onnx"
 NORM_STATS_FILENAME = "norm_stats.json"
 MANIFEST_FILENAME = "manifest.json"
 PRESETS_SUBDIR = "presets"
+
+# Default preset walking speed, meters per frame in the root-local
+# ground frame (~1 m/s at the 30 fps dataset rate).  Presets are
+# engine-editable examples, not tuned hyperparameters.
+DEFAULT_PRESET_SPEED = 0.033
+
+
+def defaultControlPresets(
+    useAimDirection: bool,
+) -> dict[str, dict[str, Any]]:
+    """Build the default ControlPreset set shipped in every bundle.
+
+    Five locomotion presets covering the raw control space
+    (``vx, vz`` in meters/frame, root-local ground frame — the engine
+    z-normalizes them with ``norm_stats.json``).  ``aim_x, aim_z``
+    (unit-norm, facing forward) are included only when the checkpoint
+    was trained with aim conditioning.
+
+    Parameters
+    ----------
+    useAimDirection : bool
+        Whether the controller consumes the 2-channel aim direction.
+
+    Returns
+    -------
+    dict[str, dict[str, Any]]
+        Mapping ``presetName -> preset dict`` matching
+        ``apps/spec/control_preset.schema.json``.
+    """
+    speed = DEFAULT_PRESET_SPEED
+    velocities = {
+        "idle": (0.0, 0.0),
+        "forward": (0.0, speed),
+        "backward": (0.0, -speed),
+        "strafe_left": (-speed, 0.0),
+        "strafe_right": (speed, 0.0),
+    }
+    presets: dict[str, dict[str, Any]] = {}
+    for name, (vx, vz) in velocities.items():
+        control: dict[str, float] = {"vx": vx, "vz": vz}
+        if useAimDirection:
+            control["aim_x"] = 0.0
+            control["aim_z"] = 1.0
+        presets[name] = {"name": name, "control": control}
+    return presets
 
 
 @dataclass(frozen=True)
@@ -285,7 +328,9 @@ def exportControllerBundle(
         When ``None`` the file is not included in the bundle.
     presets : dict[str, dict[str, Any]] | None
         Mapping ``presetName → preset_dict`` to write as JSON files
-        under ``presets/``.  Pass ``None`` or ``{}`` for no presets.
+        under ``presets/``.  ``None`` (default) writes the standard
+        locomotion set from :func:`defaultControlPresets`; pass ``{}``
+        for an explicitly preset-free bundle.
     batchSize : int
         Concrete batch size for the ONNX trace example.
 
@@ -295,8 +340,13 @@ def exportControllerBundle(
         The bundle directory (same as ``outputDir``).
     """
     outputDir.mkdir(parents=True, exist_ok=True)
+    if presets is None:
+        presets = defaultControlPresets(controller.config.useAimDirection)
     _writeOnnxGraph(controller, outputDir, batchSize)
-    _writeNormStats(stateNorm, deltaNorm, controlMean, controlStd, outputDir)
+    _writeNormStats(
+        stateNorm, deltaNorm, controlMean, controlStd, outputDir,
+        controller=controller,
+    )
     _writeManifest(controller, outputDir)
     _copyResolvedConfig(resolvedConfigPath, outputDir)
     _writePresets(presets, outputDir)
@@ -323,10 +373,28 @@ def _writeNormStats(
     controlMean: torch.Tensor,
     controlStd: torch.Tensor,
     outputDir: Path,
+    controller: MotionController | None = None,
 ) -> None:
-    """Serialise z-norm statistics to ``norm_stats.json``."""
+    """Serialise z-norm statistics to ``norm_stats.json``.
+
+    When the controller carries a learned null prompt embedding it is
+    serialised too: the ONNX ``promptEmb`` input is REQUIRED whenever
+    ``prompt_emb_channels > 0``, so a promptless engine must feed this
+    exact vector (zeros are NOT a valid substitute).
+    """
     normPath = outputDir / NORM_STATS_FILENAME
     normStats = _normStatsToDict(stateNorm, deltaNorm, controlMean, controlStd)
+    if controller is not None and controller.nullPromptEmb is not None:
+        normStats["prompt"] = {
+            "null_emb": (
+                controller.nullPromptEmb.detach().cpu().float().tolist()
+            ),
+            "channels": int(controller.config.promptEmbChannels),
+            "note": (
+                "Feed null_emb as promptEmb when no prompt is active; "
+                "it is a trained parameter, not zeros."
+            ),
+        }
     normPath.write_text(json.dumps(normStats, indent=2), encoding="utf-8")
     LOGGER.info("Norm stats written: %s", normPath)
 
