@@ -1,0 +1,180 @@
+// Copyright AI-nimator.
+
+#pragma once
+
+#include "CoreMinimal.h"
+#include "UObject/Object.h"
+#include "AInimatorManifest.h"
+#include "AInimatorNormStats.h"
+#include "AInimatorNormalizer.h"
+#include "AInimatorStateBuffer.h"
+#include "AInimatorControlPreset.h"
+#include "AInimatorControllerRuntime.generated.h"
+
+namespace UE::NNE
+{
+	class IModelInstanceCPU;
+}
+class UNNEModelData;
+
+/**
+ * Owns one loaded controller bundle and runs exactly one NNE forward
+ * per Tick() call — no autoregressive loop inside the model graph
+ * (ROADMAP_PLUGINS.md §2 vérité #2; inference_contract.md §2).
+ *
+ * Responsibilities (single class, no gameplay logic):
+ * - Load the bundle (manifest + norm_stats + presets) via
+ *   FBundleLoader / FPresetLoader and the .onnx via NNE.
+ * - Maintain the FStateBuffer autoregressive window.
+ * - Normalize inputs / denormalize the output delta via FNormalizer.
+ * - Integrate Δstate → state (root-local motion → world yaw/position,
+ *   matching ainimator/model/controller_rollout.py's
+ *   _integrateOneStep exactly, so Unreal and the Python/Unity
+ *   reference reproduce the same trajectory).
+ * - Expose SetControl / SetPreset / Tick to Blueprint.
+ *
+ * Foot-lock IK and physics blending (B4) are explicitly NOT this
+ * class's job — Tick() returns a plausible unlocked pose, downstream
+ * post-processing is the caller's responsibility.
+ *
+ * NNE API note: this targets UE 5.3+ NNE (`UE::NNE::GetRuntime<
+ * INNERuntimeCPU>`, `IModelCPU::CreateModelInstanceCPU()`,
+ * `IModelInstanceCPU::RunSync(Inputs, Outputs)` with
+ * `FTensorBindingCPU`). NNE's public surface changed across 5.2-5.4;
+ * VERIFY exact type/method names against the installed engine's
+ * `NNE`/`NNERuntimeCPU` module headers before compiling — this file
+ * cannot be compiled or engine-tested in this environment.
+ */
+UCLASS(BlueprintType)
+class AINIMATOR_API UAInimatorControllerRuntime : public UObject
+{
+	GENERATED_BODY()
+
+public:
+	/**
+	 * Loads a bundle directory (manifest.json, norm_stats.json,
+	 * controller.onnx, presets/) and prepares the runtime for ticking.
+	 *
+	 * Fails loudly (returns false, logs to LogAInimator) on any
+	 * contract violation — never a silent partial initialization
+	 * (ROADMAP_PLUGINS.md §2 vérité #4).
+	 */
+	UFUNCTION(BlueprintCallable, Category = "AInimator|Runtime")
+	bool LoadBundle(const FString& BundleDirectory);
+
+	/** Sets the raw (unnormalized) control vector applied on the next
+	 *  Tick(); length must equal the manifest's control_channels. */
+	UFUNCTION(BlueprintCallable, Category = "AInimator|Runtime")
+	bool SetControl(const TArray<float>& RawControlVector);
+
+	/** Convenience wrapper around SetControl that builds the vector
+	 *  from a ControlPreset asset (§1.1: presets are a convenience,
+	 *  never a mandatory entry point). */
+	UFUNCTION(BlueprintCallable, Category = "AInimator|Runtime")
+	bool SetPreset(UAInimatorControlPreset* Preset);
+
+	/** Sets the active prompt embedding; ignored (with a warning) if
+	 *  the bundle has PromptEmbChannels == 0. Passing an empty array
+	 *  reverts to the learned null embedding (never zeros). */
+	UFUNCTION(BlueprintCallable, Category = "AInimator|Runtime")
+	bool SetPromptEmbedding(const TArray<float>& PromptEmbedding);
+
+	/**
+	 * Runs exactly one forward and integrates the resulting Δstate
+	 * into the running world-space state. Call this once per game
+	 * tick (or at a fixed animation-update cadence).
+	 *
+	 * Returns
+	 * -------
+	 * bool
+	 *     False if the runtime has no bundle loaded or the forward
+	 *     failed (logged); callers should stop driving the pawn rather
+	 *     than apply a stale/garbage pose.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "AInimator|Runtime")
+	bool Tick();
+
+	/** Current world-space root position (meters, Unreal Y-up
+	 *  convention matches manifest.coord_system "Y-up right-handed"). */
+	UFUNCTION(BlueprintPure, Category = "AInimator|Runtime")
+	FVector GetWorldRootPosition() const { return CurrentWorldPosition; }
+
+	/** Current world-space yaw in radians. */
+	UFUNCTION(BlueprintPure, Category = "AInimator|Runtime")
+	float GetWorldYaw() const { return CurrentWorldYaw; }
+
+	/** Latest raw (denormalized) bone rotation6d frame, flattened
+	 *  bone-major/channel-minor (NumBones * RotationChannelsPerBone). */
+	UFUNCTION(BlueprintPure, Category = "AInimator|Runtime")
+	const TArray<float>& GetLatestBoneFrame() const { return LatestRawBoneFrame; }
+
+	UFUNCTION(BlueprintPure, Category = "AInimator|Runtime")
+	const FAInimatorManifest& GetManifest() const { return Manifest; }
+
+	UFUNCTION(BlueprintPure, Category = "AInimator|Runtime")
+	bool IsLoaded() const { return bIsLoaded; }
+
+	/** Presets discovered under the loaded bundle's presets/ directory. */
+	UFUNCTION(BlueprintPure, Category = "AInimator|Runtime")
+	const TArray<UAInimatorControlPreset*>& GetBundledPresets() const
+	{
+		return BundledPresets;
+	}
+
+private:
+	bool InitializeModel(const FString& OnnxPath);
+	bool InitializeSeedState();
+	void ResetRuntimeState();
+
+	/** Builds this frame's ONNX inputs from the state buffer, current
+	 *  control and prompt/phase, runs RunSync, and writes the raw
+	 *  (denormalized) deltas into OutRawBoneDelta / OutRawGlobalDelta. */
+	bool RunOneForward(
+		TArray<float>& OutRawBoneDelta,
+		TArray<float>& OutRawGlobalDelta);
+
+	/** Integrates one root-local motion delta into world position/yaw.
+	 *  Mirrors controller_rollout.py::_integrateOneStep exactly:
+	 *      worldDx = cos(yaw) * dFwd - sin(yaw) * dLat
+	 *      worldDz = sin(yaw) * dFwd + cos(yaw) * dLat
+	 *      newPos  = pos + (worldDx, dHeight, worldDz)
+	 *      newYaw  = yaw + dYaw
+	 *  (Unreal FVector is (X, Y, Z) with Y-up per the contract's
+	 *  coord_system: worldDx -> X, dHeight -> Y, worldDz -> Z.) */
+	void IntegrateRootLocalDelta(const TArray<float>& RawGlobalDelta);
+
+	FAInimatorManifest Manifest;
+	FAInimatorNormStats NormStats;
+	TUniquePtr<FNormalizer> Normalizer;
+	TUniquePtr<FStateBuffer> StateBuffer;
+
+	/** Model asset + instance. TObjectPtr keeps the model data alive
+	 *  for the lifetime of this runtime; the instance is created once
+	 *  in InitializeModel and reused every Tick (no per-frame
+	 *  allocation, ROADMAP_PLUGINS.md NNE-specifics guidance). */
+	UPROPERTY()
+	TObjectPtr<UNNEModelData> ModelData;
+
+	TSharedPtr<UE::NNE::IModelInstanceCPU> ModelInstance;
+
+	/** Pre-allocated, reused every Tick — normalized state/control
+	 *  scratch buffers feeding the ONNX input tensors. */
+	TArray<float> ScratchNormalizedBoneWindow;
+	TArray<float> ScratchNormalizedGlobalWindow;
+	TArray<float> ScratchNormalizedControl;
+	TArray<float> ScratchBoneDeltaOutput;
+	TArray<float> ScratchGlobalDeltaOutput;
+
+	TArray<float> CurrentRawControl;
+	TArray<float> CurrentPromptEmb;
+
+	TArray<float> LatestRawBoneFrame;
+
+	FVector CurrentWorldPosition = FVector::ZeroVector;
+	float CurrentWorldYaw = 0.0f;
+
+	UPROPERTY()
+	TArray<TObjectPtr<UAInimatorControlPreset>> BundledPresets;
+
+	bool bIsLoaded = false;
+};
