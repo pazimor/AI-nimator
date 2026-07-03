@@ -1,0 +1,28 @@
+{
+  "name": "com.ainimator.controller",
+  "version": "0.1.0-b1",
+  "displayName": "AI-nimator Controller (Sentis)",
+  "description": "Real-time runtime for the AI-nimator deterministic autoregressive controller, powered by Unity Sentis. Loads a frozen controller bundle (controller.onnx + norm_stats.json + manifest.json + presets) exported by the ainimator Python pipeline and drives it one forward-pass per frame. Defines no model: it consumes the bundle as-is (see apps/spec/inference_contract.md, the single source of truth for the I/O contract).",
+  "unity": "2023.2",
+  "documentationUrl": "https://github.com/pazimor/AI-nimator/blob/main/apps/unity-sentis/README.md",
+  "keywords": [
+    "ai-nimator",
+    "sentis",
+    "onnx",
+    "animation",
+    "controller"
+  ],
+  "author": {
+    "name": "AI-nimator project"
+  },
+  "dependencies": {
+    "com.unity.sentis": "1.6.0"
+  },
+  "samples": [
+    {
+      "displayName": "Controller Demo (WASD capsule)",
+      "description": "A capsule driven by WASD -> ControlPreset bindings (forward/backward/strafe/idle), no IK. Drop CapsuleDemoBootstrap into an empty scene and press Play; it self-configures a capsule + ground + camera and loads the bundle from StreamingAssets/AInimatorBundle.",
+      "path": "Samples~/ControllerDemo"
+    }
+  ]
+}

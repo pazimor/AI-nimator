@@ -1,0 +1,17 @@
+{
+  "name": "AInimator.Controller.Samples.ControllerDemo",
+  "rootNamespace": "AInimator.Controller.Samples.ControllerDemo",
+  "references": [
+    "AInimator.Controller.Runtime",
+    "Unity.Sentis"
+  ],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": false,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}
