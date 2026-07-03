@@ -88,6 +88,7 @@ def test_contracts_evaluate_healthy_metrics() -> None:
         "mean_collapse_sim": 0.2,
         "rollout_drift": 0.001,
         "post_norm_stats": 0.02,
+        "prompt_sensitivity": 0.05,
     }
     for name, contract in contracts.items():
         assert contract.evaluate(healthy).verdict is Verdict.OK, name
