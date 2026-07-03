@@ -30,15 +30,18 @@ inférence** : version compatible, dims I/O attendues, sinon STOP
 
 ## 2. Entrées / sorties ONNX
 
+Noms **exacts** des tenseurs du graphe (snake_case — vérifiés par
+introspection `onnx.load` du bundle de référence) :
+
 | Tenseur | Shape | Présence |
 |---|---|---|
-| `boneWindow` | `(B, context_frames, 22, 6)` | toujours |
+| `bone_window` | `(B, context_frames, 22, 6)` | toujours |
 | `control` | `(B, control_channels)` | toujours |
-| `globalWindow` | `(B, context_frames, 4)` | toujours |
-| `promptEmb` | `(B, prompt_emb_channels)` | si `prompt_emb_channels > 0` |
+| `global_window` | `(B, context_frames, 4)` | toujours |
+| `prompt_emb` | `(B, prompt_emb_channels)` | si `prompt_emb_channels > 0` |
 | `phase` | `(B, 2)` | si `phase_channels == 2` |
-| **sortie** `boneDelta` | `(B, 22, 6)` | toujours |
-| **sortie** `globalDelta` | `(B, 4)` | toujours |
+| **sortie** `bone_delta` | `(B, 22, 6)` | toujours |
+| **sortie** `global_delta` | `(B, 4)` | toujours |
 
 Aucune boucle dans le graphe : **un forward = une frame**. La boucle
 autorégressive, l'intégration `Δstate → état`, le foot-lock IK et le
@@ -55,6 +58,11 @@ blending vivent côté moteur (`ROADMAP_PLUGINS.md §3.3`).
 3. **Sortie** : le `Δstate` sorti est **normalisé** — dénormaliser avec
    les stats `delta` avant l'intégration.
 4. **Phase** : `(cos, sin)` — déjà bornée, pas de stats.
+5. **Garantie sur les stats** : tous les `std` sérialisés (état, delta,
+   contrôle) sont **plafonnés à `1e-5` au fit, côté Python** — le moteur
+   peut diviser directement ; un clamp supplémentaire à l'inférence est
+   un no-op autorisé mais inutile. Un bundle avec un std < 1e-5 est
+   hors contrat.
 
 ## 4. Canal prompt — packaging (arbitrage B0)
 
