@@ -48,6 +48,7 @@ CONTROLLER_CONTRACT_NAMES: tuple[str, ...] = (
     "mean_collapse_sim",
     "rollout_drift",
     "post_norm_stats",
+    "prompt_sensitivity",
 )
 
 _EPS = 1e-8
@@ -69,6 +70,7 @@ def controlSensitivity(
     control: torch.Tensor,
     globalWindow: torch.Tensor | None = None,
     phase: torch.Tensor | None = None,
+    promptEmb: torch.Tensor | None = None,
 ) -> float:
     """Relative output change when the control signal is shuffled.
 
@@ -76,6 +78,12 @@ def controlSensitivity(
     batch of at least two samples so the shuffle is a real permutation.
     The phase (when present) is held fixed so the measured change is
     attributable to the control alone.
+
+    Parameters
+    ----------
+    promptEmb : torch.Tensor or None
+        ``(B, promptEmbChannels)`` pre-computed prompt embedding.  Held
+        fixed across both passes so only the control is shuffled.
 
     Returns
     -------
@@ -86,13 +94,58 @@ def controlSensitivity(
     if boneWindow.shape[0] < 2:
         raise ValueError("controlSensitivity needs batch size >= 2.")
     realOut = flattenOutput(
-        model(boneWindow, control, globalWindow=globalWindow, phase=phase)
+        model(boneWindow, control, globalWindow=globalWindow, phase=phase,
+              promptEmb=promptEmb)
     )
     shuffled = control[torch.roll(torch.arange(control.shape[0]), 1)]
     shufOut = flattenOutput(
-        model(boneWindow, shuffled, globalWindow=globalWindow, phase=phase)
+        model(boneWindow, shuffled, globalWindow=globalWindow, phase=phase,
+              promptEmb=promptEmb)
     )
     delta = (realOut - shufOut).norm(dim=-1)
+    base = realOut.norm(dim=-1).clamp(min=_EPS)
+    return float((delta / base).mean().item())
+
+
+@torch.no_grad()
+def promptSensitivity(
+    model: MotionController,
+    boneWindow: torch.Tensor,
+    control: torch.Tensor,
+    promptEmb: torch.Tensor,
+    globalWindow: torch.Tensor | None = None,
+    phase: torch.Tensor | None = None,
+) -> float:
+    """Relative output change when swapping real prompt for null embedding.
+
+    Only meaningful when ``model.config.promptEmbChannels > 0`` and a
+    trained null embedding is present.  Returns 0.0 when the model has
+    no text conditioning.
+
+    Parameters
+    ----------
+    promptEmb : torch.Tensor
+        ``(B, promptEmbChannels)`` real prompt embeddings.
+
+    Returns
+    -------
+    float
+        ``mean ||f(promptEmb) - f(nullEmb)|| / ||f(promptEmb)||``;
+        near 0 means the model ignores the text prompt.
+    """
+    if model.nullPromptEmb is None or model.config.promptEmbChannels == 0:
+        return 0.0
+    realOut = flattenOutput(
+        model(boneWindow, control, globalWindow=globalWindow, phase=phase,
+              promptEmb=promptEmb)
+    )
+    batchSize = boneWindow.shape[0]
+    nullExpanded = model.nullPromptEmb.unsqueeze(0).expand(batchSize, -1)
+    nullOut = flattenOutput(
+        model(boneWindow, control, globalWindow=globalWindow, phase=phase,
+              promptEmb=nullExpanded)
+    )
+    delta = (realOut - nullOut).norm(dim=-1)
     base = realOut.norm(dim=-1).clamp(min=_EPS)
     return float((delta / base).mean().item())
 

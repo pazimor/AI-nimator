@@ -100,3 +100,51 @@ def test_generalization_checkpoint_round_trips(tmp_path: Path) -> None:
     )
     model, _s, _d, _m, _st = loadControllerCheckpoint(result.checkpointPath)
     assert model.config.contextFrames == 4
+
+
+def test_prompt_sensitivity_computed_for_text_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A text-conditioned run must report prompt_sensitivity, not UNKNOWN.
+
+    Locks the A6-bis wiring: evaluation feeds per-clip captions (train
+    AND held-out) through the encoder and computes the real-vs-null
+    output delta.  The encoder is mocked — no artifact on disk.
+    """
+    import ainimator.training.controller_generalization_v2 as gen
+    from ainimator.health.contract import Verdict
+
+    def _fakeEncode(texts, encoder, tokenizer, device):
+        rng = torch.Generator().manual_seed(sum(map(ord, texts[0])))
+        return torch.randn(len(texts), 8, generator=rng).to(device)
+
+    monkeypatch.setattr(
+        gen, "_maybeLoadEncoder", lambda config, device: ("enc", "tok")
+    )
+    monkeypatch.setattr(gen, "encodeTextToPooled", _fakeEncode)
+
+    from dataclasses import replace
+
+    config = replace(_config(tmp_path), epochs=10, promptEmbChannels=8)
+    result = runControllerGeneralization(
+        _trainClips(), _heldOutClips(), config,
+        clipBatchSize=2, evalSampleClips=4,
+        trainClipTexts=[f"train clip {i}" for i in range(6)],
+        heldOutClipTexts=[f"held out clip {i}" for i in range(3)],
+    )
+    assert "prompt_sensitivity" in result.trainMetrics
+    assert "prompt_sensitivity" in result.heldOutMetrics
+    assert result.heldOutMetrics["prompt_sensitivity"] >= 0.0
+    assert result.verdicts["prompt_sensitivity"] is not Verdict.UNKNOWN
+
+
+def test_prompt_sensitivity_unknown_without_text(tmp_path: Path) -> None:
+    """A run without text conditioning keeps the UNKNOWN verdict."""
+    from ainimator.health.contract import Verdict
+
+    result = runControllerGeneralization(
+        _trainClips(), _heldOutClips(), _config(tmp_path),
+        clipBatchSize=2, evalSampleClips=4,
+    )
+    assert "prompt_sensitivity" not in result.heldOutMetrics
+    assert result.verdicts["prompt_sensitivity"] is Verdict.UNKNOWN

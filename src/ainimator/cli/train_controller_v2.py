@@ -42,7 +42,7 @@ from ainimator.training.controller_training_v2 import (
 
 LOGGER = logging.getLogger("ainimator.cli.train_controller_v2")
 
-_OVERFIT_PROFILES = ("overfit", "debug")
+_OVERFIT_PROFILES = ("overfit", "debug", "controller_text")
 _FULL_PROFILE = "full"
 
 
@@ -58,7 +58,6 @@ def _parseArgs() -> argparse.Namespace:
         "--profile",
         type=str,
         default="overfit",
-        choices=["overfit", "full", "debug"],
         help=(
             "Named training profile from controller_profiles in "
             "src/configs/network.yaml.  Default: overfit."
@@ -101,6 +100,17 @@ def _parseArgs() -> argparse.Namespace:
             "Useful for testing alternate configs."
         ),
     )
+    parser.add_argument(
+        "--encoder-artifact",
+        dest="encoderArtifact",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Path to a frozen text encoder artifact directory.  "
+            "Required when the profile has prompt-emb-channels > 0."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -120,12 +130,12 @@ def _resolveDatasetRoot(explicit: Path | None) -> Path:
 
 def _loadDatasetSample(
     datasetRoot: Path, sampleIndex: int
-) -> tuple[object, object]:
+) -> tuple[object, object, str]:
     """Load a single clip from the dataset."""
     from ainimator.training.training_v2 import loadDatasetSample
 
     sample = loadDatasetSample(datasetRoot, sampleIndex)
-    return sample.rotation6d, sample.rootTranslation
+    return sample.rotation6d, sample.rootTranslation, sample.rawText or ""
 
 
 def _selectFullIndices(
@@ -154,15 +164,17 @@ def _selectFullIndices(
 
 def _loadClipsList(
     datasetRoot: Path, indices: list[int]
-) -> list[tuple[object, object]]:
-    """Load (rotation6d, rootTranslation) for each link index."""
+) -> tuple[list[tuple[object, object]], list[str]]:
+    """Load (rotation6d, rootTranslation) and rawText for each link index."""
     from ainimator.training.training_v2 import loadDatasetSample
 
     clips = []
+    texts = []
     for index in indices:
         sample = loadDatasetSample(datasetRoot, index)
         clips.append((sample.rotation6d, sample.rootTranslation))
-    return clips
+        texts.append(sample.rawText or "")
+    return clips, texts
 
 
 def _runOverfit(
@@ -175,9 +187,14 @@ def _runOverfit(
     arch = profile.arch
     training = profile.training
     data = profile.data
+    text = profile.text
 
-    rotation6d, rootTranslation = _loadDatasetSample(
+    rotation6d, rootTranslation, rawText = _loadDatasetSample(
         datasetRoot, data.sampleIndex
+    )
+    encoderArtifactPath = (
+        args.encoderArtifact
+        or (Path(text.encoderArtifactPath) if text.encoderArtifactPath else None)
     )
     config = ControllerTrainingConfig(
         outputDir=args.output_dir,
@@ -200,8 +217,13 @@ def _runOverfit(
         ),
         scheduledSampling=training.scheduledSampling,
         resumeCheckpoint=args.resume,
+        promptEmbChannels=text.promptEmbChannels,
+        condDropoutProb=text.condDropoutProb,
+        encoderArtifactPath=encoderArtifactPath,
     )
-    result = runControllerOverfit(rotation6d, rootTranslation, config)
+    result = runControllerOverfit(
+        rotation6d, rootTranslation, config, clipRawText=rawText
+    )
     LOGGER.info("final loss: %.6f", result.finalLoss)
     for name, verdict in result.verdicts.items():
         LOGGER.info("contract %s: %s", name, verdict.value)
@@ -217,6 +239,7 @@ def _runFull(args: argparse.Namespace, datasetRoot: Path) -> None:
     arch = profile.arch
     training = profile.training
     data = profile.data
+    text = profile.text
 
     trainIndices, heldOutIndices = _selectFullIndices(
         datasetRoot,
@@ -230,9 +253,13 @@ def _runFull(args: argparse.Namespace, datasetRoot: Path) -> None:
         len(trainIndices),
         len(heldOutIndices),
     )
-    trainClips = _loadClipsList(datasetRoot, trainIndices)
-    heldOutClips = _loadClipsList(datasetRoot, heldOutIndices)
+    trainClips, trainTexts = _loadClipsList(datasetRoot, trainIndices)
+    heldOutClips, heldOutTexts = _loadClipsList(datasetRoot, heldOutIndices)
 
+    encoderArtifactPath = (
+        args.encoderArtifact
+        or (Path(text.encoderArtifactPath) if text.encoderArtifactPath else None)
+    )
     config = ControllerTrainingConfig(
         outputDir=args.output_dir,
         epochs=training.epochs,
@@ -254,6 +281,9 @@ def _runFull(args: argparse.Namespace, datasetRoot: Path) -> None:
         ),
         scheduledSampling=training.scheduledSampling,
         resumeCheckpoint=args.resume,
+        promptEmbChannels=text.promptEmbChannels,
+        condDropoutProb=text.condDropoutProb,
+        encoderArtifactPath=encoderArtifactPath,
     )
     result = runControllerGeneralization(
         trainClips,
@@ -261,6 +291,10 @@ def _runFull(args: argparse.Namespace, datasetRoot: Path) -> None:
         config,
         clipBatchSize=data.clipBatchSize,
         evalSampleClips=data.evalSampleClips,
+        trainClipTexts=trainTexts if text.promptEmbChannels > 0 else None,
+        heldOutClipTexts=(
+            heldOutTexts if text.promptEmbChannels > 0 else None
+        ),
     )
     LOGGER.info("final train loss: %.6f", result.finalLoss)
     LOGGER.info("train  metrics: %s", result.trainMetrics)

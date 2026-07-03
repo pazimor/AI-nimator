@@ -27,6 +27,7 @@ import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 import torch
 
@@ -42,10 +43,12 @@ from ainimator.data.controller_sequences import (
 )
 from ainimator.geometry.root_local import absoluteToRootLocalDeltas
 from ainimator.health.contract import Verdict
+from ainimator.health.controller_health_writer import ControllerHealthWriter
 from ainimator.health.controller_metrics import (
     controlSensitivity,
     meanCollapse,
     postNormStats,
+    promptSensitivity,
     rolloutDrift,
     rolloutDriftCurve,
 )
@@ -56,6 +59,7 @@ from ainimator.model.motion_normalizer import (
     MotionNormalizer,
     denormalizeStepDelta,
 )
+from ainimator.text.artifact import AnyEncoder, AnyTokenizer
 from ainimator.training.controller_training_v2 import (
     ControllerTrainingConfig,
     _DEFAULT_HEALTH_PATH,
@@ -65,9 +69,13 @@ from ainimator.training.controller_training_v2 import (
     _groundTruthTrajectory,
     _normalizeTensors,
     _rolloutFromClip,
+    applyCondDropout,
     buildControllerModelConfig,
+    encodeTextToPooled,
+    loadFrozenTextEncoder,
     resolveControllerDevice,
     saveControllerCheckpoint,
+    weightedControllerLossComponents,
 )
 
 LOGGER = logging.getLogger("ainimator.training.controller_generalization")
@@ -191,6 +199,41 @@ def _concatClipBatches(
             else None
         ),
     )
+
+
+def _buildMergedPromptEmb(
+    encoder: AnyEncoder,
+    tokenizer: AnyTokenizer,
+    model: MotionController,
+    texts: Sequence[str],
+    stepCounts: Sequence[int],
+    condDropoutProb: float,
+    device: torch.device,
+    condRng: torch.Generator,
+) -> torch.Tensor:
+    """Build a merged ``(total_steps, D)`` prompt embedding tensor.
+
+    Each clip ``i`` contributes ``stepCounts[i]`` identical rows (one
+    text per clip), with per-row cond-dropout applied independently.
+
+    Parameters
+    ----------
+    texts : Sequence[str]
+        One text per clip in the minibatch.
+    stepCounts : Sequence[int]
+        Number of training transitions contributed by each clip.
+    """
+    parts: list[torch.Tensor] = []
+    for text, nSteps in zip(texts, stepCounts):
+        pooled = encodeTextToPooled([text], encoder, tokenizer, device)
+        repeated = pooled.expand(nSteps, -1).contiguous()
+        if condDropoutProb > 0.0 and model.nullPromptEmb is not None:
+            repeated = applyCondDropout(
+                repeated, model.nullPromptEmb.detach(),
+                condDropoutProb, condRng,
+            )
+        parts.append(repeated)
+    return torch.cat(parts, dim=0)
 
 
 def _perClipDrift(
@@ -346,11 +389,16 @@ def _mergedMinibatch(
     indices: list[int],
     sequenceConfig: ControllerSequenceConfig,
     device: torch.device,
-) -> ControllerSequenceBatch:
-    """Build + concat the sequences of the selected clips (on device)."""
+) -> tuple[ControllerSequenceBatch, list[int]]:
+    """Build + concat the sequences of the selected clips (on device).
+
+    Returns the merged batch AND a list of per-clip step counts so that
+    text embeddings can be replicated to match each clip's contribution.
+    """
     chunk = [trainClips[index] for index in indices]
     batches = _buildClipBatches(chunk, sequenceConfig, device)
-    return _concatClipBatches(batches)
+    stepCounts = [b.boneWindow.shape[0] for b in batches]
+    return _concatClipBatches(batches), stepCounts
 
 
 def _trainEpoch(
@@ -364,29 +412,73 @@ def _trainEpoch(
     config: ControllerTrainingConfig,
     clipBatchSize: int,
     device: torch.device,
-) -> float:
-    """Run one clip-minibatched epoch; return the mean step loss."""
+    clipTexts: list[str] | None = None,
+    encoder: AnyEncoder | None = None,
+    tokenizer: AnyTokenizer | None = None,
+    condRng: torch.Generator | None = None,
+) -> tuple[float, dict[str, float]]:
+    """Run one clip-minibatched epoch.
+
+    Returns the mean step loss and the mean weighted loss components
+    (``loss_*`` keys, for the health stream).
+    """
     stateNormalizer, deltaNormalizer = norms
     controlMean, controlStd = controlStats
     total = 0.0
+    componentSums: dict[str, float] = {}
     steps = 0
     for start in range(0, len(order), clipBatchSize):
         indices = order[start : start + clipBatchSize]
-        merged = _mergedMinibatch(
+        merged, stepCounts = _mergedMinibatch(
             trainClips, indices, sequenceConfig, device
         )
         tensors = _normalizeTensors(merged, stateNormalizer, deltaNormalizer)
         controlNorm = (merged.control - controlMean) / controlStd
+        promptEmb = _maybeBuildPromptEmb(
+            encoder, tokenizer, model, clipTexts, indices,
+            stepCounts, config.condDropoutProb, device, condRng,
+        )
         optimizer.zero_grad()
         result = _forwardLosses(
             model, merged, tensors, controlNorm, deltaNormalizer,
-            config.lossWeights,
+            config.lossWeights, promptEmb=promptEmb,
         )
         result.total.backward()
         optimizer.step()
         total += float(result.total.item())
+        weighted = weightedControllerLossComponents(
+            result, config.lossWeights
+        )
+        for name, value in weighted.items():
+            componentSums[name] = componentSums.get(name, 0.0) + value
         steps += 1
-    return total / max(steps, 1)
+    divisor = max(steps, 1)
+    meanComponents = {
+        name: value / divisor for name, value in componentSums.items()
+    }
+    return total / divisor, meanComponents
+
+
+def _maybeBuildPromptEmb(
+    encoder: AnyEncoder | None,
+    tokenizer: AnyTokenizer | None,
+    model: MotionController,
+    clipTexts: list[str] | None,
+    indices: list[int],
+    stepCounts: list[int],
+    condDropoutProb: float,
+    device: torch.device,
+    condRng: torch.Generator | None,
+) -> torch.Tensor | None:
+    """Build merged prompt embeddings for a minibatch, or return None."""
+    if encoder is None or tokenizer is None or clipTexts is None:
+        return None
+    texts = [clipTexts[i] for i in indices]
+    rng = condRng if condRng is not None else torch.Generator("cpu")
+    return _buildMergedPromptEmb(
+        encoder, tokenizer, model, texts, stepCounts,
+        condDropoutProb, device, rng,
+    )
 
 
 def _train(
@@ -398,25 +490,39 @@ def _train(
     config: ControllerTrainingConfig,
     clipBatchSize: int,
     device: torch.device,
+    clipTexts: list[str] | None = None,
+    encoder: AnyEncoder | None = None,
+    tokenizer: AnyTokenizer | None = None,
+    healthWriter: ControllerHealthWriter | None = None,
 ) -> float:
-    """Clip-minibatched training loop; return the final mean epoch loss."""
+    """Clip-minibatched training loop; return the final mean epoch loss.
+
+    When ``healthWriter`` is set, one ``loss_*`` record is appended to
+    the run's ``health/health.jsonl`` at each ``logEvery`` epoch.
+    """
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.learningRate,
         weight_decay=config.weightDecay,
     )
     rng = random.Random(config.seed)
+    condRng = torch.Generator(device=torch.device("cpu"))
+    condRng.manual_seed(config.seed + 7919)
     order = list(range(len(trainClips)))
     lastLoss = float("nan")
     model.train()
     for epoch in range(config.epochs):
         rng.shuffle(order)
-        lastLoss = _trainEpoch(
+        lastLoss, meanComponents = _trainEpoch(
             model, trainClips, order, sequenceConfig, optimizer, norms,
             controlStats, config, clipBatchSize, device,
+            clipTexts=clipTexts, encoder=encoder, tokenizer=tokenizer,
+            condRng=condRng,
         )
         if epoch % config.logEvery == 0 or epoch == config.epochs - 1:
             LOGGER.info("epoch %d — mean loss %.6f", epoch, lastLoss)
+            if healthWriter is not None:
+                healthWriter.writeLosses(epoch, lastLoss, meanComponents)
     return lastLoss
 
 
@@ -453,6 +559,9 @@ def _evaluateClips(
     norms: tuple[MotionNormalizer, MotionNormalizer],
     controlStats: tuple[torch.Tensor, torch.Tensor],
     device: torch.device,
+    clipTexts: list[str] | None = None,
+    encoder: AnyEncoder | None = None,
+    tokenizer: AnyTokenizer | None = None,
 ) -> tuple[dict[str, float], dict[int, float]]:
     """Metrics on a (small) clip set; reuses the controller probes.
 
@@ -461,6 +570,15 @@ def _evaluateClips(
     of them (one per train-sample / held-out clip) blows the MPS budget at
     large N.  No metric here needs gradients (the probes are forward-only),
     so disabling grad keeps peak memory bounded by the activations alone.
+
+    Parameters
+    ----------
+    clipTexts, encoder, tokenizer
+        Optional text-conditioning context (one caption per clip).
+        When all three are given, ``prompt_sensitivity`` is added to
+        the metrics (real prompt vs null embedding, no cond-dropout).
+        The other metrics keep their established unconditioned regime
+        so their baselines stay comparable across runs.
     """
     stateNormalizer, deltaNormalizer = norms
     controlMean, controlStd = controlStats
@@ -496,12 +614,39 @@ def _evaluateClips(
             postNormStats(tensors["normBoneDelta"]),
         ),
     }
+    if encoder is not None and tokenizer is not None and clipTexts:
+        stepCounts = [b.boneWindow.shape[0] for b in batches]
+        promptEmbs = _buildMergedPromptEmb(
+            encoder, tokenizer, model, clipTexts, stepCounts,
+            condDropoutProb=0.0, device=device,
+            condRng=torch.Generator("cpu"),
+        )
+        metrics["prompt_sensitivity"] = promptSensitivity(
+            model, tensors["normBoneWindow"], controlNorm, promptEmbs,
+            globalWindow=tensors["normGlobalWindow"], phase=merged.phase,
+        )
     return metrics, curve
 
 
 # ---------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------
+def _maybeLoadEncoder(
+    config: ControllerTrainingConfig,
+    device: torch.device,
+) -> tuple[AnyEncoder | None, AnyTokenizer | None]:
+    """Load frozen encoder + tokenizer when configured; else return Nones."""
+    if (
+        config.promptEmbChannels > 0
+        and config.encoderArtifactPath is not None
+    ):
+        encoder, tokenizer = loadFrozenTextEncoder(
+            config.encoderArtifactPath, device
+        )
+        return encoder, tokenizer
+    return None, None
+
+
 def runControllerGeneralization(
     trainClips: list[Clip],
     heldOutClips: list[Clip],
@@ -509,8 +654,23 @@ def runControllerGeneralization(
     clipBatchSize: int = 8,
     evalSampleClips: int = 32,
     healthPath: Path = _DEFAULT_HEALTH_PATH,
+    trainClipTexts: list[str] | None = None,
+    heldOutClipTexts: list[str] | None = None,
 ) -> GeneralizationResult:
-    """Train on ``trainClips``; judge generalization on ``heldOutClips``."""
+    """Train on ``trainClips``; judge generalization on ``heldOutClips``.
+
+    Parameters
+    ----------
+    trainClipTexts : list[str] or None
+        Optional motion descriptions, one per train clip.  Required (and
+        used) when ``config.promptEmbChannels > 0`` and
+        ``config.encoderArtifactPath`` is set.  When ``None``, text
+        conditioning is skipped regardless of the config.
+    heldOutClipTexts : list[str] or None
+        Optional captions for the held-out clips, used only at
+        evaluation to compute ``prompt_sensitivity`` on unseen clips
+        (the honest judge for the text axis).
+    """
     if len(trainClips) < 2:
         raise ValueError("generalization needs at least 2 train clips.")
     if len(heldOutClips) < 2:
@@ -529,22 +689,32 @@ def runControllerGeneralization(
     norms = (stateNormalizer.to(device), deltaNormalizer.to(device))
     controlStats = _fitControlStats(trainClips, sequenceConfig, device)
 
+    encoder, tokenizer = _maybeLoadEncoder(config, device)
     model = MotionController(
         buildControllerModelConfig(config, numBones)
     ).to(device)
+    healthWriter = ControllerHealthWriter(config.outputDir)
     finalLoss = _train(
         model, trainClips, sequenceConfig, norms, controlStats, config,
         clipBatchSize, device,
+        clipTexts=trainClipTexts, encoder=encoder, tokenizer=tokenizer,
+        healthWriter=healthWriter,
     )
 
-    trainSample = trainClips[: max(2, min(evalSampleClips, len(trainClips)))]
+    sampleCount = max(2, min(evalSampleClips, len(trainClips)))
+    trainSample = trainClips[:sampleCount]
+    trainSampleTexts = (
+        trainClipTexts[:sampleCount] if trainClipTexts else None
+    )
     trainMetrics, _ = _evaluateClips(
-        model, trainSample, sequenceConfig, norms, controlStats, device
+        model, trainSample, sequenceConfig, norms, controlStats, device,
+        clipTexts=trainSampleTexts, encoder=encoder, tokenizer=tokenizer,
     )
     if device.type == "mps":
         torch.mps.empty_cache()
     heldOutMetrics, driftCurve = _evaluateClips(
-        model, heldOutClips, sequenceConfig, norms, controlStats, device
+        model, heldOutClips, sequenceConfig, norms, controlStats, device,
+        clipTexts=heldOutClipTexts, encoder=encoder, tokenizer=tokenizer,
     )
 
     config.outputDir.mkdir(parents=True, exist_ok=True)
@@ -553,11 +723,15 @@ def runControllerGeneralization(
         config.outputDir,
     )
     writeResolvedConfig(config, config.outputDir)
+    heldOutVerdicts = _evaluateContracts(heldOutMetrics, healthPath)
+    healthWriter.writeEvaluation(
+        config.epochs, heldOutMetrics, heldOutVerdicts
+    )
     return GeneralizationResult(
         finalLoss=finalLoss,
         trainMetrics=trainMetrics,
         heldOutMetrics=heldOutMetrics,
-        verdicts=_evaluateContracts(heldOutMetrics, healthPath),
+        verdicts=heldOutVerdicts,
         driftCurve=driftCurve,
         checkpointPath=checkpointPath,
         numTrainClips=len(trainClips),

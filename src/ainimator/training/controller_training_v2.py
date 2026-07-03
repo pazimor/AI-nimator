@@ -23,6 +23,7 @@ from typing import Optional
 import torch
 
 from ainimator.core.checkpoint_io import checkpointDir
+from ainimator.text.artifact import AnyEncoder, AnyTokenizer
 from ainimator.core.constants.controller import (
     CONTROL_PLANAR_VELOCITY_CHANNELS,
     PhaseMode,
@@ -36,11 +37,13 @@ from ainimator.data.controller_sequences import (
     buildControllerSequences,
 )
 from ainimator.health.contract import Verdict
+from ainimator.health.controller_health_writer import ControllerHealthWriter
 from ainimator.health.controller_metrics import (
     controlSensitivity,
     loadControllerContracts,
     meanCollapse,
     postNormStats,
+    promptSensitivity,
     rolloutDrift,
     rolloutDriftCurve,
 )
@@ -135,6 +138,17 @@ class ControllerTrainingConfig:
     )
     scheduledSampling: float = 0.0
     resumeCheckpoint: Optional[Path] = None
+    # ---- Text encoder conditioning (Goal A, LOT-2) ----
+    # Width of the pooled prompt embedding injected into the conditioning
+    # bus.  ``0`` disables text conditioning (backward-compatible).
+    # Must match the ``outputDim`` of the encoder artifact when non-zero.
+    promptEmbChannels: int = 0
+    # Path to a frozen encoder artifact produced by ``train_text_encoder``.
+    # Required when ``promptEmbChannels > 0``; ignored otherwise.
+    encoderArtifactPath: Optional[Path] = None
+    # Per-sample probability of replacing the real prompt embedding with
+    # the model's learnable null embedding during training (cond-dropout).
+    condDropoutProb: float = 0.1
 
 
 @dataclass(frozen=True)
@@ -192,6 +206,7 @@ def buildControllerModelConfig(
         contextFrames=config.contextFrames,
         phaseMode=config.phaseMode,
         useAimDirection=config.useAimDirection,
+        promptEmbChannels=config.promptEmbChannels,
     )
 
 
@@ -261,6 +276,123 @@ def _applyControlNorm(
     return normVelocity
 
 
+# ---------------------------------------------------------------------
+# Text encoder helpers (LOT-2 — integrated encoder)
+# ---------------------------------------------------------------------
+def loadFrozenTextEncoder(
+    artifactPath: Path,
+    device: torch.device,
+) -> tuple[AnyEncoder, AnyTokenizer]:
+    """Load encoder + tokenizer from artifact; freeze all encoder params.
+
+    The encoder is **always** loaded in eval mode and frozen — it is
+    never fine-tuned inside the controller training loop (the controller
+    trains its ``nullPromptEmb`` and ``condEncoder`` instead).
+    """
+    from ainimator.text.artifact import loadEncoderArtifact
+    encoder, tokenizer = loadEncoderArtifact(artifactPath, device=device)
+    for param in encoder.parameters():
+        param.requires_grad_(False)
+    encoder.eval()
+    return encoder, tokenizer
+
+
+def _pooledMaskedMeanEmb(
+    hiddenStates: torch.Tensor,
+    keyPaddingMask: torch.Tensor,
+) -> torch.Tensor:
+    """Masked mean pool ``(B, T, D)`` hidden states to ``(B, D)``.
+
+    Parameters
+    ----------
+    hiddenStates : torch.Tensor
+        ``(B, T, D)`` per-token encoder output.
+    keyPaddingMask : torch.Tensor
+        ``(B, T)`` bool, ``True`` on padding positions.
+
+    Returns
+    -------
+    torch.Tensor
+        ``(B, D)`` mean-pooled embedding.
+    """
+    realMask = (~keyPaddingMask).float().unsqueeze(-1)  # (B, T, 1)
+    sumEmb = (hiddenStates * realMask).sum(dim=1)       # (B, D)
+    count = realMask.sum(dim=1).clamp(min=1.0)          # (B, 1)
+    return sumEmb / count
+
+
+def encodeTextToPooled(
+    texts: list[str],
+    encoder: AnyEncoder,
+    tokenizer: AnyTokenizer,
+    device: torch.device,
+) -> torch.Tensor:
+    """Tokenize ``texts`` and return a masked mean-pooled ``(B, D)`` tensor.
+
+    Parameters
+    ----------
+    texts : list[str]
+        Batch of raw prompt strings.
+    encoder : AnyEncoder
+        Frozen text encoder.
+    tokenizer : AnyTokenizer
+        Paired tokenizer.
+    device : torch.device
+        Target device.
+
+    Returns
+    -------
+    torch.Tensor
+        ``(B, D)`` where D = ``encoder.outputDim``.
+    """
+    encoded = tokenizer.encode(texts)
+    output = encoder.encode(
+        encoded.inputIds.to(device),
+        encoded.attentionMask.to(device),
+    )
+    return _pooledMaskedMeanEmb(output.hiddenStates, output.keyPaddingMask)
+
+
+def applyCondDropout(
+    promptEmb: torch.Tensor,
+    nullEmb: torch.Tensor,
+    condDropoutProb: float,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """Randomly replace rows with ``nullEmb`` at rate ``condDropoutProb``.
+
+    Parameters
+    ----------
+    promptEmb : torch.Tensor
+        ``(N, D)`` batch of prompt embeddings.
+    nullEmb : torch.Tensor
+        ``(D,)`` learnable null embedding from the model.
+    condDropoutProb : float
+        Per-row dropout probability.
+    generator : torch.Generator
+        CPU RNG for reproducibility.
+
+    Returns
+    -------
+    torch.Tensor
+        ``(N, D)`` tensor with some rows replaced by ``nullEmb``.
+    """
+    if condDropoutProb <= 0.0:
+        return promptEmb
+    coins = torch.rand(
+        (promptEmb.shape[0],),
+        generator=generator,
+        device=torch.device("cpu"),
+    )
+    drop = coins < condDropoutProb
+    if not drop.any():
+        return promptEmb
+    result = promptEmb.clone()
+    null = nullEmb.detach().unsqueeze(0).expand(promptEmb.shape[0], -1)
+    result[drop] = null[drop].to(result.dtype)
+    return result
+
+
 def _fitNormalizers(
     batch: ControllerSequenceBatch,
     numBones: int,
@@ -301,6 +433,7 @@ def _forwardLosses(
     controlNorm: torch.Tensor,
     deltaNormalizer: MotionNormalizer,
     weights: ControllerLossWeights,
+    promptEmb: torch.Tensor | None = None,
 ) -> ControllerLossResult:
     """Forward + combined controller loss over the full batch."""
     output = model(
@@ -308,6 +441,7 @@ def _forwardLosses(
         controlNorm,
         globalWindow=tensors["normGlobalWindow"],
         phase=batch.phase,
+        promptEmb=promptEmb,
     )
     velocity = velocityDeltaLoss(
         output.boneDelta, tensors["normBoneDelta"]
@@ -344,6 +478,26 @@ def _footContactTerm(
     )
 
 
+def weightedControllerLossComponents(
+    result: ControllerLossResult,
+    weights: ControllerLossWeights,
+) -> dict[str, float]:
+    """Weighted per-term losses for the ``loss_share`` health record.
+
+    Component names already carry the ``loss_`` prefix (see
+    :func:`~ainimator.model.losses_controller_v2.combinedControllerLoss`).
+    """
+    factor = {
+        "loss_velocity": weights.velocity,
+        "loss_geodesic": weights.geodesic,
+        "loss_foot_contact": weights.footContact,
+    }
+    return {
+        name: float(value.item()) * factor.get(name, 1.0)
+        for name, value in result.components.items()
+    }
+
+
 def _trainLoop(
     model: MotionController,
     batch: ControllerSequenceBatch,
@@ -352,32 +506,75 @@ def _trainLoop(
     stateNormalizer: MotionNormalizer,
     deltaNormalizer: MotionNormalizer,
     config: ControllerTrainingConfig,
+    promptEmbBase: torch.Tensor | None = None,
+    healthWriter: ControllerHealthWriter | None = None,
 ) -> float:
     """Overfit loop; return the final total loss.
 
     Uses the fast parallel teacher-forced step by default; when
     ``config.scheduledSampling > 0`` it runs the sequential
     scheduled-sampling step with a per-epoch ramped probability (A4).
+
+    Parameters
+    ----------
+    promptEmbBase : torch.Tensor or None
+        ``(N, D)`` base prompt embedding (same text for all N steps of the
+        clip), computed ONCE upstream by the frozen encoder.  Per-epoch
+        cond-dropout is applied inside the loop.  ``None`` = no text cond.
+    healthWriter : ControllerHealthWriter or None
+        When set, one ``loss_*`` record is appended to the run's
+        ``health/health.jsonl`` at each ``logEvery`` epoch.
     """
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.learningRate,
         weight_decay=config.weightDecay,
     )
+    condRng = torch.Generator(device=torch.device("cpu"))
+    condRng.manual_seed(config.seed + 7919)
     lastLoss = float("nan")
     model.train()
     for epoch in range(config.epochs):
+        promptEmb = _epochPromptEmb(
+            model, promptEmbBase, config.condDropoutProb, condRng
+        )
         optimizer.zero_grad()
         result = _trainStep(
             model, batch, tensors, controlNorm, stateNormalizer,
-            deltaNormalizer, config, epoch,
+            deltaNormalizer, config, epoch, promptEmb=promptEmb,
         )
         result.total.backward()
         optimizer.step()
         lastLoss = float(result.total.item())
         if epoch % config.logEvery == 0 or epoch == config.epochs - 1:
             LOGGER.info("epoch %d — loss %.6f", epoch, lastLoss)
+            if healthWriter is not None:
+                healthWriter.writeLosses(
+                    epoch,
+                    lastLoss,
+                    weightedControllerLossComponents(
+                        result, config.lossWeights
+                    ),
+                )
     return lastLoss
+
+
+def _epochPromptEmb(
+    model: MotionController,
+    promptEmbBase: torch.Tensor | None,
+    condDropoutProb: float,
+    condRng: torch.Generator,
+) -> torch.Tensor | None:
+    """Return per-epoch prompt embedding with cond-dropout applied.
+
+    Returns ``None`` when text conditioning is disabled (promptEmbBase is
+    None or the model has no promptEmbChannels).
+    """
+    if promptEmbBase is None or model.nullPromptEmb is None:
+        return promptEmbBase
+    return applyCondDropout(
+        promptEmbBase, model.nullPromptEmb, condDropoutProb, condRng
+    )
 
 
 def _trainStep(
@@ -389,12 +586,13 @@ def _trainStep(
     deltaNormalizer: MotionNormalizer,
     config: ControllerTrainingConfig,
     epoch: int,
+    promptEmb: torch.Tensor | None = None,
 ) -> ControllerLossResult:
     """Dispatch to the teacher-forced or scheduled-sampling step."""
     if config.scheduledSampling <= 0.0:
         return _forwardLosses(
             model, batch, tensors, controlNorm, deltaNormalizer,
-            config.lossWeights,
+            config.lossWeights, promptEmb=promptEmb,
         )
     probability = scheduledSamplingProbability(
         epoch, config.epochs, config.scheduledSampling
@@ -434,11 +632,13 @@ def _rolloutFromClip(
     deltaNormalizer: MotionNormalizer,
     controlNorm: torch.Tensor,
     clipRootTranslation: torch.Tensor,
+    promptEmb: torch.Tensor | None = None,
 ) -> RolloutResult:
     """Roll out from the first window under the GT-derived control.
 
     ``clipRootTranslation`` provides the world-space XYZ seed needed by
-    the integration step in :func:`rolloutController`.
+    the integration step in :func:`rolloutController`.  ``promptEmb``
+    ``(1, D)`` is broadcast at each step.
     """
     window = model.config.contextFrames
     seedBone = batch.boneWindow[:1]
@@ -450,6 +650,10 @@ def _rolloutFromClip(
     phaseSequence = (
         None if batch.phase is None else batch.phase.unsqueeze(0)
     )
+    # Rollout uses batch=1; take the first row of promptEmb if provided.
+    rolloutPromptEmb = (
+        promptEmb[:1] if promptEmb is not None else None
+    )
     return rolloutController(
         model,
         stateNormalizer,
@@ -459,6 +663,7 @@ def _rolloutFromClip(
         controlSequence,
         phaseSequence=phaseSequence,
         seedRootLocalMotion=seedRootLocalMotion,
+        promptEmb=rolloutPromptEmb,
     )
 
 
@@ -511,6 +716,7 @@ def _evaluate(
     deltaNormalizer: MotionNormalizer,
     healthPath: Path,
     clipRootTranslation: torch.Tensor,
+    promptEmb: torch.Tensor | None = None,
 ) -> tuple[
     dict[str, float], dict[str, Verdict], dict[int, float], RolloutResult
 ]:
@@ -521,6 +727,7 @@ def _evaluate(
         controlNorm,
         globalWindow=tensors["normGlobalWindow"],
         phase=batch.phase,
+        promptEmb=promptEmb,
     )
     rank, sim = meanCollapse(output)
     sensitivity = controlSensitivity(
@@ -529,10 +736,11 @@ def _evaluate(
         controlNorm,
         globalWindow=tensors["normGlobalWindow"],
         phase=batch.phase,
+        promptEmb=promptEmb,
     )
     rollout = _rolloutFromClip(
         model, batch, stateNormalizer, deltaNormalizer, controlNorm,
-        clipRootTranslation,
+        clipRootTranslation, promptEmb=promptEmb,
     )
     gtBone, gtRoot = _groundTruthTrajectory(batch, clipRootTranslation)
     drift = rolloutDrift(rollout, gtBone, gtRoot)
@@ -550,6 +758,15 @@ def _evaluate(
         "rollout_drift": drift,
         "post_norm_stats": postNorm,
     }
+    if promptEmb is not None:
+        metrics["prompt_sensitivity"] = promptSensitivity(
+            model,
+            tensors["normBoneWindow"],
+            controlNorm,
+            promptEmb,
+            globalWindow=tensors["normGlobalWindow"],
+            phase=batch.phase,
+        )
     verdicts = _evaluateContracts(metrics, healthPath)
     return metrics, verdicts, driftCurve, rollout
 
@@ -676,8 +893,25 @@ def runControllerOverfit(
     clipRootTranslation: torch.Tensor,
     config: ControllerTrainingConfig,
     healthPath: Path = _DEFAULT_HEALTH_PATH,
+    clipRawText: str = "",
 ) -> ControllerOverfitResult:
-    """Overfit one clip, roll it out, and gate on the A1 contracts."""
+    """Overfit one clip, roll it out, and gate on the A1 contracts.
+
+    Parameters
+    ----------
+    clipRotation6d : torch.Tensor
+        ``(F, numBones, 6)`` raw rotation sequence.
+    clipRootTranslation : torch.Tensor
+        ``(F, 3)`` raw world-space root translation.
+    config : ControllerTrainingConfig
+        Training knobs.  ``promptEmbChannels > 0`` activates text cond.
+    healthPath : Path
+        Health contract config.
+    clipRawText : str
+        Optional motion description for the clip.  Used only when
+        ``config.promptEmbChannels > 0`` and
+        ``config.encoderArtifactPath`` is set.
+    """
     torch.manual_seed(config.seed)
     device = resolveControllerDevice(config.device)
     if config.resumeCheckpoint is not None:
@@ -699,12 +933,15 @@ def runControllerOverfit(
         clipRootOnDevice,
     ) = components
     tensors = _normalizeTensors(batch, stateNormalizer, deltaNormalizer)
-
+    promptEmbBase = _buildOverfitPromptEmb(
+        config, model, clipRawText, batch.boneWindow.shape[0], device
+    )
+    healthWriter = ControllerHealthWriter(config.outputDir)
     finalLoss = _trainLoop(
         model, batch, tensors, controlNorm, stateNormalizer,
-        deltaNormalizer, config,
+        deltaNormalizer, config, promptEmbBase=promptEmbBase,
+        healthWriter=healthWriter,
     )
-
     config.outputDir.mkdir(parents=True, exist_ok=True)
     metrics, verdicts, driftCurve, rollout = _evaluate(
         model,
@@ -715,7 +952,9 @@ def runControllerOverfit(
         deltaNormalizer,
         healthPath,
         clipRootOnDevice,
+        promptEmb=promptEmbBase,
     )
+    healthWriter.writeEvaluation(config.epochs, metrics, verdicts)
     checkpointPath = saveControllerCheckpoint(
         model,
         stateNormalizer,
@@ -734,6 +973,37 @@ def runControllerOverfit(
         checkpointPath=checkpointPath,
         rolloutPath=rolloutPath,
     )
+
+
+def _buildOverfitPromptEmb(
+    config: ControllerTrainingConfig,
+    model: MotionController,
+    rawText: str,
+    numSteps: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Build the (numSteps, D) base prompt embedding for overfit training.
+
+    Returns ``None`` when text conditioning is not configured.
+
+    Parameters
+    ----------
+    rawText : str
+        Motion description for the clip.
+    numSteps : int
+        Number of training transitions (batch size for the overfit loop).
+    """
+    if (
+        config.promptEmbChannels == 0
+        or config.encoderArtifactPath is None
+        or not rawText.strip()
+    ):
+        return None
+    encoder, tokenizer = loadFrozenTextEncoder(
+        config.encoderArtifactPath, device
+    )
+    pooled = encodeTextToPooled([rawText], encoder, tokenizer, device)
+    return pooled.expand(numSteps, -1).contiguous()
 
 
 # ---------------------------------------------------------------------
