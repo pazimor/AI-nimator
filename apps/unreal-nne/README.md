@@ -93,9 +93,101 @@ from a validated A6 checkpoint, `apps/spec/inference_contract.md §7`).
 | `UAInimatorControllerRuntime` | Owns the NNE model instance; `LoadBundle` / `SetControl` / `SetPreset` / `SetPromptEmbedding` / `Tick` (one forward per call); integrates `Δstate → state` (world yaw + position) exactly like `ainimator/model/controller_rollout.py`. |
 | `UAInimatorControlPreset` | `UDataAsset` hydrated from `presets/*.json`; builds a raw control vector in the manifest's declared channel order. |
 | `AAInimatorDemoPawn` | Keyboard demo content (WASD → preset), phase B2 scope only. |
+| `UAInimatorActionComponent` | **B3** — `[Input] -> [ControlPreset]` bindings (Enhanced Input `UInputAction` or legacy `FKey` fallback), applies the resolved preset to a `UAInimatorControllerRuntime` every frame. See `docs/authoring.md`. |
+| `FAInimatorActionComponentDetails` (editor module) | **B3** — Details panel customization: "Create New Preset" / "Import Presets From Bundle..." buttons alongside the editable bindings list. |
+| `UAInimatorControlPresetFactory` (editor module) | **B3** — Content Browser asset factory for `UAInimatorControlPreset`. |
+| `FFootContactDetector` | **B4** — re-derives foot contact from FK pose + hysteresis (`footlock_blending.md` §2). |
+| `FSmplForwardKinematics` (`AInimatorForwardKinematics.h`) / `AInimatorSmpl22Skeleton` | **B4** — minimal SMPL-22 FK (rotation6d + bone offsets) needed for foot-lock IK; offsets ported from `ainimator/core/constants/skeletons.py`. |
+| `AInimatorTwoBoneIkSolver` | **B4** — analytic two-bone IK (hip→knee→ankle), pole vector from the current pose. |
+| `FFootLockIK` | **B4** — capture/clamp/fade foot-lock orchestration (`footlock_blending.md` §3), applied **after** `FStateBuffer::PushFrame` (never contaminates the autoregressive window). |
+| `FIdleMoveBlender` | **B4** — idle↔move pose-space cross-fade state machine (`footlock_blending.md` §4). |
+| `FFootSlidingMetric` | **B4** — debug-only utility measuring mean planar foot displacement during contact frames (before/after comparison, spec §5). |
+| `UAInimatorPostProcessComponent` | **B4** — wires the above into one component with on/off switches + spec-default thresholds as `UPROPERTY`s; call `TickPostProcess()` **after** `Runtime->Tick()`. |
 
-Foot-lock IK / physics blending (B4) and the authoring component with
-Details-panel bindings (B3) are **not** in this phase's scope.
+## Authoring a binding without code (phase B3)
+
+See `docs/authoring.md` for the one-page recipe: add
+`UAInimatorActionComponent`, create/import a `ControlPreset`, add a
+binding row (`Action` or `Key` → `Preset`), press Play. The Details
+panel customization (`FAInimatorActionComponentDetails`, editor module
+only) adds "+ Create New Preset" and "Import Presets From Bundle..."
+buttons on top of the plain editable `Bindings` array.
+
+## Post-processing: foot-lock IK + idle/move blending (phase B4)
+
+Design is **shared and normative** with the Unity plugin —
+`apps/spec/footlock_blending.md` is the single source of truth for
+every threshold, hysteresis rule, IK chain and fade duration; this
+plugin does not deviate from it (see "Deviations from the shared
+design" below — currently none).
+
+**Hard rule preserved by construction**: `UAInimatorPostProcessComponent`
+only ever *reads* `UAInimatorControllerRuntime::GetLatestBoneFrame()` /
+`GetWorldRootPosition()` / `GetWorldYaw()` **after** `Runtime->Tick()`
+has already pushed the raw state into `FStateBuffer`. It has no path
+back into the runtime's state — the autoregressive window always sees
+the controller's raw output, never the IK-corrected pose
+(`footlock_blending.md` §1).
+
+Call order, once per frame:
+
+```cpp
+Runtime->Tick();
+PostProcessComponent->TickPostProcess(DeltaSeconds, RawControlVx, RawControlVz);
+// PostProcessComponent->GetCorrectedAnklePosition(0 /*left*/) / (1 /*right*/)
+// PostProcessComponent->GetCorrectedKneePosition(...)
+// PostProcessComponent->GetMoveBlendWeight()
+```
+
+Every spec threshold is exposed as a `UPROPERTY` on
+`UAInimatorPostProcessComponent`, defaulted to the spec's value
+(`ContactHeightThreshold` 0.05m, `ContactSpeedThreshold` 0.01 m/frame,
+`ContactExitFrames` 2, `ContactReleaseHeightMultiplier` 1.5,
+`MaxCorrectionMeters` 0.3m, `ReleaseFadeSeconds` 0.1s,
+`MoveSpeedThreshold` 0.005 m/frame, `IdleDelaySeconds` 0.25s,
+`CrossFadeSeconds` 0.2s), plus `bEnableFootLockIK` /
+`bEnableIdleMoveBlend` on/off switches for the mandatory before/after
+comparison.
+
+### Foot-sliding metric (before/after)
+
+`FFootSlidingMetric` (enabled via `bRecordFootSlidingMetric`) measures
+the mean planar (XZ) displacement of a foot across consecutive
+contact-to-contact frames — exactly the "déplacement planaire moyen
+des pieds pendant leurs frames de contact" acceptance metric
+(`footlock_blending.md` §5). Procedure to reproduce:
+
+1. Drive the `forward` preset for 10s (300 steps @ 30 fps) from the
+   reference bundle's rest-pose seed.
+2. Run once with `bEnableFootLockIK = false` (records the raw FK
+   ankle's sliding) and once with `bEnableFootLockIK = true` (records
+   `GetCorrectedAnklePosition`'s sliding), calling
+   `GetAverageFootSlidingMeters()` / `GetSampleCount()` at the end of
+   each run.
+3. Record both numbers here:
+
+   | Run | Avg. planar sliding (m/frame) | Contact-frame pairs sampled |
+   |---|---|---|
+   | Before (IK off) | _pending — needs a real UE + bundle run_ | _pending_ |
+   | After (IK on) | _pending — needs a real UE + bundle run_ | _pending_ |
+
+   **Not yet measured in this environment** (no Unreal Engine install,
+   no NNE inference available here — see "Known points that need a
+   real Unreal/NNE install to validate" below). `AInimatorPostProcessSmokeTest.cpp`
+   exercises the same code path against a synthetic walk cycle and
+   asserts the after-IK average is `<=` the before average as a
+   regression guard, but that synthetic result is **not** a substitute
+   for the real bundle measurement above.
+
+### Deviations from the shared design (`footlock_blending.md`)
+
+**None.** Every threshold, hysteresis rule, IK chain (hip 1/2 → knee
+4/5 → ankle 7/8, foot-contact joints 10/11), clamp (0.3m), fade
+duration (0.1s release, 0.2s idle↔move cross-fade) and ordering rule
+(state buffer receives the raw state, post-processing is strictly
+downstream) match the spec exactly, as ported. If a future change
+needs to deviate, update `apps/spec/footlock_blending.md` first (it is
+outside this plugin's write scope) and only then this file.
 
 ## Contract fidelity notes (read before touching the math)
 
@@ -191,3 +283,29 @@ the next actionable step once this code lands in an Unreal project.
   criterion) — needs profiling in an actual project.
 - The full Unity ↔ Unreal parity numeric comparison (see procedure
   above) — needs both plugins running against the same bundle.
+- **B3**: `AInimatorActionComponent.cpp` uses
+  `UEnhancedInputComponent::BindAction`'s variadic payload-forwarding
+  overload (`BindAction(Action, TriggerEvent, Object, Func, ExtraArgs...)`,
+  available since UE 4.25/4.26's Enhanced Input plugin) to pass the
+  triggering `UInputAction*` through to
+  `OnEnhancedInputTriggered(Value, SourceAction)`. This is a real,
+  documented overload, but **verify it against the installed engine's
+  `EnhancedInputComponent.h`** before compiling — the exact template
+  constraints on the payload type(s) have shifted slightly across UE
+  minor versions.
+- **B3**: `FAInimatorActionComponentDetails`'s use of
+  `IAssetTools::CreateAsset` / `CreateUniqueAssetName` and
+  `IDesktopPlatform::OpenDirectoryDialog` — written against the
+  well-documented UE 5.x `AssetTools`/`DesktopPlatform` surface, but
+  not compiled/tested here; verify signatures before building.
+- **B4**: the real (non-synthetic) foot-sliding before/after
+  measurement (see "Foot-sliding metric" above) — needs a real Unreal
+  project with the reference bundle loaded and `UAInimatorPostProcessComponent`
+  wired to an actual pawn/tick loop; only a synthetic walk-cycle smoke
+  test (`AInimatorPostProcessSmokeTest.cpp`) runs in this environment.
+- **B4**: this plugin does not bind `FFootLockIK`'s corrected joint
+  positions onto an actual `USkeletalMeshComponent`/AnimGraph two-bone
+  IK node — that wiring (e.g. via an `AnimGraph` node reading
+  `UAInimatorPostProcessComponent::GetCorrectedAnklePosition`) is host
+  project integration work, left open exactly as the Unity plugin
+  leaves `TwoBoneIkSolver`'s consumer-side rig binding open.

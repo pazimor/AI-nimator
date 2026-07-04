@@ -8,8 +8,10 @@
 /**
  * Editor-only module for the AInimator plugin.
  *
- * Reserved for authoring niceties (asset thumbnails, Details panel
- * customization for UAInimatorControlPreset, an "import bundle" button).
+ * Registers `FAInimatorActionComponentDetails` (the B3 Details panel
+ * customization for `UAInimatorActionComponent`: editable binding
+ * list, "Create Preset" / "Import Presets From Bundle..." buttons) and
+ * `UAInimatorControlPresetFactory` (Content Browser asset creation).
  * Kept strictly separate from the runtime module so it never ships in a
  * cooked/packaged build (ROADMAP_PLUGINS.md architecture note).
  */
@@ -18,4 +20,9 @@ class FAInimatorEditorModule : public IModuleInterface
 public:
 	virtual void StartupModule() override;
 	virtual void ShutdownModule() override;
+
+private:
+	/** Name registered with FPropertyEditorModule — unregistered
+	 *  symmetrically in ShutdownModule(). */
+	static FName ActionComponentClassName;
 };

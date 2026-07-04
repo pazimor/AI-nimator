@@ -23,6 +23,10 @@ public class AInimatorEditor : ModuleRules
 			"Slate",
 			"SlateCore",
 			"PropertyEditor",
+			"AssetTools",
+			"DesktopPlatform",
+			"ApplicationCore",
+			"InputCore",
 		});
 	}
 }

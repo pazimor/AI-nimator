@@ -1,9 +1,9 @@
 {
 	"FileVersion": 3,
 	"Version": 1,
-	"VersionName": "0.2.0-B2",
+	"VersionName": "0.4.0-B4",
 	"FriendlyName": "AInimator Controller Runtime",
-	"Description": "Real-time NNE runtime for the AI-nimator deterministic autoregressive motion controller. Loads a controller bundle (controller.onnx + norm_stats.json + manifest.json + presets) exported by the ainimator Python export pipeline and runs one forward per frame, engine-side autoregression, engine-side normalization. Defines no model; behavioural parity with the Unity/Sentis runtime is required (ROADMAP_PLUGINS.md Goal B vérité #7).",
+	"Description": "Real-time NNE runtime for the AI-nimator deterministic autoregressive motion controller. Loads a controller bundle (controller.onnx + norm_stats.json + manifest.json + presets) exported by the ainimator Python export pipeline and runs one forward per frame, engine-side autoregression, engine-side normalization. Defines no model; behavioural parity with the Unity/Sentis runtime is required (ROADMAP_PLUGINS.md Goal B vérité #7). Includes B3 authoring (UAInimatorActionComponent + Details customization) and B4 post-processing (foot-lock IK + idle/move blending).",
 	"Category": "Animation",
 	"CreatedBy": "AI-nimator",
 	"CreatedByURL": "",
