@@ -79,6 +79,18 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "AInimator|Runtime")
 	bool SetPromptEmbedding(const TArray<float>& PromptEmbedding);
 
+	/** The prompt embedding currently fed to the model every Tick() —
+	 *  either an explicit embedding set via SetPromptEmbedding/SetPreset,
+	 *  or the bundle's learned null embedding by default (never zeros,
+	 *  inference_contract.md §4). Empty when PromptEmbChannels == 0.
+	 *  Added for B3-bis (rig_binding.md §3): the character component's
+	 *  prompt cross-fade needs to read back the resolved "current"
+	 *  embedding (including the resolved null embedding) as its fade
+	 *  start point, without duplicating the null-embedding fallback
+	 *  logic that already lives here. */
+	UFUNCTION(BlueprintPure, Category = "AInimator|Runtime")
+	const TArray<float>& GetActivePromptEmbedding() const { return CurrentPromptEmb; }
+
 	/**
 	 * Runs exactly one forward and integrates the resulting Δstate
 	 * into the running world-space state. Call this once per game

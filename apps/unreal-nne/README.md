@@ -103,6 +103,11 @@ from a validated A6 checkpoint, `apps/spec/inference_contract.md §7`).
 | `FIdleMoveBlender` | **B4** — idle↔move pose-space cross-fade state machine (`footlock_blending.md` §4). |
 | `FFootSlidingMetric` | **B4** — debug-only utility measuring mean planar foot displacement during contact frames (before/after comparison, spec §5). |
 | `UAInimatorPostProcessComponent` | **B4** — wires the above into one component with on/off switches + spec-default thresholds as `UPROPERTY`s; call `TickPostProcess()` **after** `Runtime->Tick()`. |
+| `UAInimatorRigMap` | **B3-bis** — `UDataAsset`, 22 SMPL bones → target rig `FName`s (`rig_binding.md` §2.1), with editor auto-map by common bone names (incl. UE5 Mannequin). |
+| `FRigBinder` | **B3-bis** — pure-math retargeting: bind-time calibration + per-frame `worldRot_target = R_smpl_world * worldRot_rig_rest`, `localRot_target = worldRot_target(parent)⁻¹ · worldRot_target` (`rig_binding.md` §2.2, literal), root-motion scale (§2.3). |
+| `AInimatorPoseableMeshApplier` | **B3-bis** — applies `FRigBinder`'s output onto a `UPoseableMeshComponent` (v1 design decision, see `docs/rig_binding.md` §1). |
+| `UAInimatorCharacterComponent` | **B3-bis** — orchestrates rig calibration/retarget + scaled root motion + the prompt channel (`SetPrompt`/`SetPromptEmbedding`/`ClearPrompt`, embedding-space cross-fade). See `docs/rig_binding.md`. |
+| `FAInimatorRigMapDetails` / `FAInimatorControlPresetDetails` (editor module) | **B3-bis** — "Auto-Map From Skeletal Mesh..." button on `UAInimatorRigMap`; "Import Prompt Embedding (JSON)..." button on `UAInimatorControlPreset` (consumes `ainimator.cli.encode_prompt` output). |
 
 ## Authoring a binding without code (phase B3)
 
@@ -188,6 +193,32 @@ duration (0.1s release, 0.2s idle↔move cross-fade) and ordering rule
 downstream) match the spec exactly, as ported. If a future change
 needs to deviate, update `apps/spec/footlock_blending.md` first (it is
 outside this plugin's write scope) and only then this file.
+
+## Binding a rigged character + piloting by prompt (phase B3-bis)
+
+See `docs/rig_binding.md` for the one-page recipe: attach a
+`UPoseableMeshComponent` + `UAInimatorCharacterComponent`, create/auto-map
+a `UAInimatorRigMap` against your character's `SkeletalMesh` (UE5
+Mannequin naming supported out of the box), calibrate at bind time, and
+drive the prompt channel (`SetPrompt`/`SetPromptEmbedding`/
+`ClearPrompt`) with its 0.3s embedding-space cross-fade. Design is
+**shared and normative** with the Unity plugin —
+`apps/spec/rig_binding.md` is the single source of truth for the
+retargeting math and prompt semantics; this plugin applies it
+literally (no invented numeric choices — see "Deviations" below).
+
+### Deviations from the shared design (`apps/spec/rig_binding.md`)
+
+**None** for the retargeting math or prompt semantics (§2/§3, ported
+literally). One **v1 engineering choice**, explicitly allowed by the
+spec (§2.2 "Application au squelette: v1 via UPoseableMeshComponent OU
+un FAnimNode custom minimal — choisis le plus robuste"): this plugin
+uses **`UPoseableMeshComponent`**, not a custom `FAnimNode` — see
+`docs/rig_binding.md` §1 / `AInimatorPoseableMeshApplier.h` for the
+full rationale and trade-offs. The native **IK Retargeter** path (§2.4)
+is explicitly optional/non-canonical per the spec and is **not
+implemented** here (budget was spent on the canonical `RigMap` path +
+its tests instead).
 
 ## Contract fidelity notes (read before touching the math)
 
@@ -309,3 +340,20 @@ the next actionable step once this code lands in an Unreal project.
   `UAInimatorPostProcessComponent::GetCorrectedAnklePosition`) is host
   project integration work, left open exactly as the Unity plugin
   leaves `TwoBoneIkSolver`'s consumer-side rig binding open.
+- **B3-bis**: `UAInimatorCharacterComponent`'s retargeting/root-motion
+  path, `UPoseableMeshComponent::GetBoneQuaternion`/
+  `SetBoneRotationByName`/`GetBoneLocationByName` call signatures, and
+  `FAInimatorRigMapDetails`'s `FContentBrowserModule::CreateAssetPicker`
+  usage are written against the well-documented UE 5.x surface but not
+  compiled/tested here — verify against the installed engine version.
+- **B3-bis**: the prompt embedding cross-fade's actual visual quality
+  (the "⚠ heuristic, not validated" callout in `docs/rig_binding.md`
+  §5) needs a real bundle + a real character in a running Unreal
+  project to judge; only the pure lerp/alpha math is unit-tested here
+  (`AInimatorPromptCrossFadeTest.cpp`).
+- **B3-bis**: `FRigBinder`'s retarget math is unit-tested against a
+  synthetic 3-bone mini-rig with known offsets
+  (`AInimatorRigBinderTest.cpp`); it has not been validated against a
+  real character mesh (visual "marche upright, membres cohérents, pas
+  de twist d'os aberrant" acceptance criterion, `rig_binding.md` §5)
+  since no Unreal Engine install is available here.

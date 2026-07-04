@@ -27,6 +27,7 @@ public class AInimatorEditor : ModuleRules
 			"DesktopPlatform",
 			"ApplicationCore",
 			"InputCore",
+			"ContentBrowser",
 		});
 	}
 }
