@@ -3,6 +3,7 @@
   "rootNamespace": "AInimator.Controller.Tests",
   "references": [
     "AInimator.Controller.Runtime",
+    "AInimator.Controller.Editor",
     "UnityEngine.TestRunner",
     "UnityEditor.TestRunner"
   ],

@@ -9,10 +9,11 @@ forward pass per frame. The single source of truth for the I/O contract is
 `apps/spec/inference_contract.md` — this plugin implements it, it does not
 redefine it.
 
-Status: **Phases B1–B4** (`doc/ROADMAP_PLUGINS.md` §4) — runtime + WASD demo
-(B1), the authoring `AInimatorActionBinder` (B3), and foot-lock IK + idle/move
-blending post-processing (B4) are implemented. The build orchestrator (B5)
-is the remaining later phase.
+Status: **Phases B1–B4 + B3-bis** (`doc/ROADMAP_PLUGINS.md` §4) — runtime +
+WASD demo (B1), the authoring `AInimatorActionBinder` (B3), foot-lock IK +
+idle/move blending post-processing (B4), and rig binding + prompt-at-runtime
+(B3-bis, `apps/spec/rig_binding.md`) are implemented. The build orchestrator
+(B5) is the remaining later phase.
 
 ## Package layout
 
@@ -27,16 +28,23 @@ apps/unity-sentis/
     │   ├── Normalization/         Normalizer (pure math, unit-testable)
     │   ├── Runtime/               StateBuffer, RootMotionIntegrator, ControllerRuntime, AInimatorController
     │   ├── Presets/               ControlPreset ScriptableObject
-    │   ├── Authoring/             InputBinding, InputBindingResolver, AInimatorActionBinder (B3)
+    │   ├── Authoring/             InputBinding, InputBindingResolver, AInimatorActionBinder (B3),
+    │   │                          AInimatorCharacter (B3-bis "hat" component)
+    │   ├── Prompting/             PromptCrossFader (B3-bis prompt-at-runtime cross-fade)
+    │   ├── Rig/                   RigMap, RigRetargeter, RigBinder, RigScale (B3-bis retargeting)
     │   └── PostProcess/           Smpl22Skeleton, SmplForwardKinematics, FootContactDetector,
     │                              TwoBoneIkSolver, FootLockIk, IdleMoveBlender, AInimatorPostProcess,
     │                              FootSlidingMetric (B4)
     ├── Editor/                    ControlPresetImporter, BundleDeliveryTools (batch-mode pack target),
-    │                              AInimatorActionBinderEditor (B3 custom Inspector)
+    │                              AInimatorActionBinderEditor (B3 custom Inspector), RigMapEditor +
+    │                              RigMapAutoMapper (B3-bis), ControlPresetEditor + PromptEmbeddingImporter
+    │                              (B3-bis encode_prompt JSON loader)
     ├── docs/authoring.md          1-page "create a binding with no code" walkthrough (B3)
+    ├── docs/rig_binding.md        1-page "attach to a rigged character + pilot by prompt" walkthrough (B3-bis)
     ├── Tests/EditMode/            NUnit tests (Normalizer, StateBuffer, BundleLoader, RootMotionIntegrator,
     │                              InputBindingResolver, FootContactDetector, TwoBoneIkSolver,
-    │                              SmplForwardKinematics, FootLockIk, IdleMoveBlender, FootSlidingMetric)
+    │                              SmplForwardKinematics, FootLockIk, IdleMoveBlender, FootSlidingMetric,
+    │                              RigRetargeter, RigScale, RigMap/RigMapAutoMapper, PromptCrossFader)
     └── Samples~/ControllerDemo/   WASD capsule demo (no IK, no skinning — B1 scope)
 ```
 
@@ -247,6 +255,68 @@ section once available:
 | Left  | _TBD_ | _TBD_ | _TBD_ |
 | Right | _TBD_ | _TBD_ | _TBD_ |
 
+## Rig binding + prompt-at-runtime (phase B3-bis)
+
+`apps/spec/rig_binding.md` is normative for this section — it defines the
+shared Unity/Unreal retargeting math and prompt semantics; this package
+implements it, it does not redefine it. See **`docs/rig_binding.md`** for
+the click-by-click walkthrough. Pipeline order (spec §1):
+
+```
+AInimatorController.Tick (raw pose, pushed to StateBuffer)
+  -> AInimatorPostProcess.Process (B4, joint-position corrections only)
+  -> RigBinder.Apply (THIS document): retarget rotation6d -> rig Transforms
+       SmplForwardKinematics.ComputeJointPositions   // world rotations, root-local frame
+       RigRetargeter.RetargetFrame                   // worldTarget = R_smpl_world * worldRot_rig_rest
+                                                      // localTarget = worldTarget(parent)^-1 * worldTarget(bone)
+       RigScale.ScaleGlobalDelta + actorRoot integration
+```
+
+Key types:
+
+- `Rig.RigMap` (`ScriptableObject`) — 22-entry SMPL-22-bone -> rig
+  `Transform` map. An unassigned entry is permanently "ignored" (spec §2.1) —
+  never composed with anything. `Editor/RigMapEditor` + `RigMapAutoMapper`
+  add a 22-row Inspector table and a best-effort name-matching auto-map
+  (Mixamo/Humanoid-style conventions).
+- `Rig.RigRetargeter` — pure math (no `Transform` writes) implementing the
+  exact formula quoted in spec §2.2; unit-tested against a synthetic 2-3
+  bone mini-rig with hand-computed expected rotations
+  (`Tests/EditMode/RigRetargeterTests.cs`).
+- `Rig.RigBinder` (`MonoBehaviour`) — owns calibration (captures each mapped
+  bone's rest-pose world rotation + the pelvis height, once, at `Awake`) and
+  applies `RigRetargeter`'s output to the real rig every frame, writing only
+  `Transform.localRotation` (never `localPosition` — spec §2.2 last line).
+  Also integrates the actor root's position/yaw from the raw global delta,
+  scaled by `Rig.RigScale`.
+- `Rig.RigScale` — `rigScale = rigPelvisRestHeight / 0.91m` (spec §2.3); Δyaw
+  is never scaled (dimensionless).
+- `Prompting.PromptCrossFader` — linear per-channel lerp between two prompt
+  embeddings over a configurable duration (default 0.3s, spec §3). **⚠
+  Heuristic**: the controller was never trained on interpolated embeddings —
+  see the class's XML docs for the documented pose-space fallback if visual
+  quality is poor.
+- `AInimatorController.SetPrompt`/`SetPromptEmbedding`/`ClearPrompt` — the
+  spec §3 API, implemented via an owned `PromptCrossFader`;
+  `ClearPrompt()` fades to the bundle's learned `prompt.null_emb`, never
+  zeros. Calling none of these preserves the exact B1/B3 preset-driven
+  prompt behaviour (backwards-compatible, un-faded).
+- `Authoring.AInimatorCharacter` — the "hat" component wiring
+  `AInimatorController` -> `AInimatorPostProcess` -> (optional) `RigBinder`
+  in one `MonoBehaviour`; omitting `RigBinder` keeps the exact B1 capsule
+  root-transform path (spec §5 last line: capsule path stays functional).
+- `Editor/PromptEmbeddingImporter` + `ControlPresetEditor` — load the JSON
+  produced by `python -m ainimator.cli.encode_prompt` (`{"prompt": str,
+  "prompt_emb": float[]}`) directly into a `ControlPreset`'s
+  `Prompt`/`PromptEmb` fields, from the preset's Inspector or its context menu.
+
+**Not implemented** (scope decision, spec §2.4): the optional native
+Humanoid path via `HumanPoseHandler`. The explicit `RigMap`/`RigBinder` path
+is canonical, covers Humanoid rigs too (via the same name-based auto-map),
+and is the only path covered by cross-engine parity — revisit only if a
+concrete Humanoid-specific need (avatar masks, muscle-space retargeting)
+arises.
+
 ## Testing
 
 EditMode tests (`Tests/EditMode/`) run inside the Unity Test Framework
@@ -282,6 +352,22 @@ a project:
 - `FootSlidingMetricTests` (B4) — the before/after measurement utility:
   zero sliding while stationary, accumulation while sliding, non-contact
   frames excluded, entry-frame not counted, reset semantics.
+- `RigRetargeterTests` (B3-bis) — the canonical retarget formula on a
+  synthetic 2-3 bone mini-rig with hand-computed expected local rotations
+  (identity-parent pass-through, parent-rotation subtraction, a two-bone
+  chain with a non-identity rig rest offset), `FindNearestMappedParent`
+  skipping unmapped ancestors, span-length validation.
+- `RigScaleTests` (B3-bis) — the `rigScale` ratio at matching/double pelvis
+  height, non-positive height rejection, per-channel global-delta scaling
+  (translation channels scaled, Δyaw untouched), length validation.
+- `RigMapTests` (B3-bis) — the 22-entry canonical-order structure,
+  `HasMinimalMapping`'s pelvis-gated semantics, out-of-range `GetRigBone`,
+  and `RigMapAutoMapper`'s best-effort name matching (Mixamo-style
+  hierarchy: matches found and left empty correctly, no-match rig,
+  already-assigned entries never overwritten).
+- `PromptCrossFaderTests` (B3-bis) — snap-to-immediate, lerp at start/
+  halfway/past-duration, mid-fade redirection starting from the current
+  interpolated value (not the original "from"), constructor/length validation.
 
 These tests were written and reviewed but **could not be executed in this
 environment** (no Unity Editor available here) — run them once inside a
@@ -332,6 +418,26 @@ real Unity project before relying on the "green" status.
   not be exercised without a running Editor in this session; the
   unit-tested surface is `InputBindingResolver` (pure logic), not the
   Inspector GUI code itself.
+- **`RigBinder`/`RigMapEditor`/auto-map untested against a live rig**
+  (B3-bis): the retargeting *math* is unit-tested
+  (`RigRetargeterTests`/`RigScaleTests`), but applying it to a real
+  `Animator`/humanoid `Transform` hierarchy, the calibration timing
+  (rig must be posed in its rest pose exactly when `Calibrate()` runs), and
+  the auto-map heuristic's hit rate on a real Mixamo/Humanoid FBX rig all
+  need validation in a live Unity Editor — Pazimor's visual acceptance step
+  (spec §5: "marche upright, membres cohérents, pas de twist d'os aberrant").
+- **Prompt cross-fade quality is unvalidated** (B3-bis, explicit heuristic
+  per spec §3): `PromptCrossFaderTests` verify the interpolation *math*
+  only; whether a 0.3s linear lerp through embedding space produces a
+  visually acceptable transition (vs. limb pops/instability) can only be
+  judged against a real trained bundle in Play mode.
+- **`AInimatorCharacter`'s foot-lock corrections are not fed back into the
+  retargeted rig**: `RigBinder` retargets the *raw* rotation6d frame (its
+  own FK recomputes world rotations from it); `AInimatorPostProcess`'s
+  corrected leg *positions* are exposed via `AInimatorCharacter.
+  LastPostProcessResult` for a renderer to apply through its own IK layer,
+  matching the B4 "not wired to a skinned rig" limitation already
+  documented above.
 
 ## Contract compatibility
 

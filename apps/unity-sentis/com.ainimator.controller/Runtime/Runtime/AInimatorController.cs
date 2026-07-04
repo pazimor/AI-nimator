@@ -1,6 +1,7 @@
 using System;
 using AInimator.Controller.Bundle;
 using AInimator.Controller.Presets;
+using AInimator.Controller.Prompting;
 using Unity.Sentis;
 using UnityEngine;
 
@@ -24,6 +25,15 @@ namespace AInimator.Controller.Runtime
     /// frame). A production integration may instead seed from a real
     /// animation clip snippet for a cleaner warm start — this is left to
     /// the caller since it is content-dependent.
+    /// <para/>
+    /// Prompt-at-runtime (<c>apps/spec/rig_binding.md</c> §3):
+    /// <see cref="SetPrompt"/>/<see cref="SetPromptEmbedding"/>/
+    /// <see cref="ClearPrompt"/> change the <b>active</b> prompt embedding;
+    /// the actual value fed to the graph each frame is cross-faded in
+    /// embedding space over <see cref="PromptCrossFadeSeconds"/> by an owned
+    /// <see cref="PromptCrossFader"/> — see that class for the
+    /// heuristic/fallback caveat. <see cref="ClearPrompt"/> fades toward the
+    /// bundle's learned <c>prompt.null_emb</c>, never zeros.
     /// </remarks>
     public sealed class AInimatorController : IDisposable
     {
@@ -35,6 +45,11 @@ namespace AInimator.Controller.Runtime
         private readonly float[] _rawGlobalDeltaScratch;
         private readonly float[] _rawBoneFrameScratch;
 
+        private readonly PromptCrossFader _promptCrossFader;
+        private readonly float[] _promptEmbScratch;
+        private readonly float[] _activePromptOverride;
+        private bool _hasActivePromptOverride;
+
         public Manifest Manifest => _runtime.Manifest;
         public ControllerBundle Bundle { get; }
 
@@ -43,6 +58,18 @@ namespace AInimator.Controller.Runtime
 
         /// <summary>Current world-space yaw, radians around +Y.</summary>
         public float RootYawRadians => _rootMotion.YawRadians;
+
+        /// <summary>
+        /// This frame's raw (un-scaled) root-local motion delta
+        /// <c>(Δforward, Δlateral, Δheight, Δyaw)</c>, as produced by the
+        /// most recent <see cref="Tick"/> — the same values already folded
+        /// into <see cref="RootPosition"/>/<see cref="RootYawRadians"/> at
+        /// <c>rigScale == 1</c>. A <see cref="Rig.RigBinder"/> reads this to
+        /// apply its own <c>rigScale</c>-corrected root motion instead
+        /// (<c>apps/spec/rig_binding.md</c> §2.3) rather than re-deriving it
+        /// from the (unscaled) integrated total.
+        /// </summary>
+        public ReadOnlySpan<float> LastRawGlobalDelta => _rawGlobalDeltaScratch;
 
         /// <param name="bundle">A bundle already validated by <see cref="BundleLoader"/>.</param>
         /// <param name="seedBoneFrame">
@@ -70,6 +97,95 @@ namespace AInimator.Controller.Runtime
             _rawBoneDeltaScratch = new float[_runtime.Normalizer.BoneFrameLength];
             _rawGlobalDeltaScratch = new float[_runtime.Normalizer.GlobalFrameLength];
             _rawBoneFrameScratch = new float[_runtime.Normalizer.BoneFrameLength];
+
+            if (manifest.HasPrompt)
+            {
+                _promptCrossFader = new PromptCrossFader(manifest.prompt_emb_channels);
+                _promptEmbScratch = new float[manifest.prompt_emb_channels];
+                _activePromptOverride = new float[manifest.prompt_emb_channels];
+                // Start with no active prompt: snap to the learned null_emb
+                // (inference_contract.md §4 — never zeros).
+                _promptCrossFader.SnapTo(bundle.NormStats.PromptNullEmb);
+            }
+        }
+
+        /// <summary>Cross-fade duration (seconds) applied by <see cref="SetPrompt"/>/<see cref="SetPromptEmbedding"/>/<see cref="ClearPrompt"/> (default 0.3s, spec §3).</summary>
+        public float PromptCrossFadeSeconds
+        {
+            get => _promptCrossFader?.CrossFadeSeconds ?? PromptCrossFader.DefaultCrossFadeSeconds;
+            set
+            {
+                if (_promptCrossFader != null)
+                {
+                    _promptCrossFader.CrossFadeSeconds = value;
+                }
+            }
+        }
+
+        /// <summary>True while a prompt cross-fade is in progress.</summary>
+        public bool IsPromptFading => _promptCrossFader?.IsFading ?? false;
+
+        /// <summary>
+        /// Begin cross-fading toward <paramref name="preset"/>'s precomputed
+        /// <c>prompt_emb</c> (rig_binding.md §3). No-op (throws) if the
+        /// manifest declares no prompt channel, or if the preset carries no
+        /// embedding.
+        /// </summary>
+        public void SetPrompt(ControlPreset preset)
+        {
+            if (preset == null)
+            {
+                throw new ArgumentNullException(nameof(preset));
+            }
+
+            if (preset.PromptEmb is not { Length: > 0 } presetEmb)
+            {
+                throw new ArgumentException(
+                    $"ControlPreset '{preset.PresetName}' carries no prompt_emb — cannot SetPrompt from it.",
+                    nameof(preset));
+            }
+
+            SetPromptEmbedding(presetEmb);
+        }
+
+        /// <summary>
+        /// Begin cross-fading toward a raw prompt embedding supplied by the
+        /// game (rig_binding.md §3), length <c>manifest.prompt_emb_channels</c>.
+        /// </summary>
+        public void SetPromptEmbedding(ReadOnlySpan<float> embedding)
+        {
+            RequirePromptSupport();
+            if (embedding.Length != Manifest.prompt_emb_channels)
+            {
+                throw new ArgumentException(
+                    $"embedding length must be {Manifest.prompt_emb_channels}; got {embedding.Length}.");
+            }
+
+            embedding.CopyTo(_activePromptOverride);
+            _hasActivePromptOverride = true;
+            Span<float> current = stackalloc float[_promptEmbScratch.Length];
+            _promptCrossFader.BeginFadeTo(_activePromptOverride, current);
+        }
+
+        /// <summary>
+        /// Begin cross-fading back to the bundle's learned null prompt
+        /// embedding (never zeros — inference_contract.md §4).
+        /// </summary>
+        public void ClearPrompt()
+        {
+            RequirePromptSupport();
+            _hasActivePromptOverride = false;
+            Span<float> current = stackalloc float[_promptEmbScratch.Length];
+            _promptCrossFader.BeginFadeTo(Bundle.NormStats.PromptNullEmb, current);
+        }
+
+        private void RequirePromptSupport()
+        {
+            if (!Manifest.HasPrompt)
+            {
+                throw new InvalidOperationException(
+                    "This bundle's manifest declares prompt_emb_channels == 0 -- prompt-at-runtime is unavailable.");
+            }
         }
 
         /// <summary>
@@ -82,8 +198,14 @@ namespace AInimator.Controller.Runtime
         /// instead of the preset's static aim when the manifest declares
         /// <c>control_channels == 4</c>. Pass <c>(0, 0)</c> to defer to the preset.
         /// </param>
+        /// <param name="deltaTimeSeconds">
+        /// Frame time (seconds), used only to advance the prompt cross-fade
+        /// clock (<see cref="PromptCrossFadeSeconds"/>). Defaults to
+        /// <see cref="Time.deltaTime"/> when called from Unity's main thread;
+        /// pass an explicit value from tests/fixed-step loops.
+        /// </param>
         /// <returns>The new bone-rotation6d frame, row-major (numBones * rotationChannelsPerBone).</returns>
-        public ReadOnlySpan<float> Tick(ControlPreset preset, Vector2 continuousAim = default)
+        public ReadOnlySpan<float> Tick(ControlPreset preset, Vector2 continuousAim = default, float? deltaTimeSeconds = null)
         {
             if (preset == null)
             {
@@ -98,6 +220,7 @@ namespace AInimator.Controller.Runtime
                 rawControl[3] = continuousAim.y;
             }
 
+            _promptCrossFader?.Tick(deltaTimeSeconds ?? Time.deltaTime);
             var promptEmb = ResolvePromptEmb(preset);
 
             _runtime.Tick(
@@ -120,6 +243,16 @@ namespace AInimator.Controller.Runtime
             return _rawBoneFrameScratch;
         }
 
+        /// <summary>
+        /// Resolve this frame's prompt embedding. When the caller has never
+        /// invoked <see cref="SetPrompt"/>/<see cref="SetPromptEmbedding"/>/
+        /// <see cref="ClearPrompt"/>, this transparently falls back to the
+        /// legacy B1 behaviour of reading the active preset's static
+        /// <c>prompt_emb</c> (or the null embedding) directly, un-faded —
+        /// preserving the capsule/B1 code path exactly. Once any prompt API
+        /// call has been made, the <see cref="PromptCrossFader"/> becomes
+        /// the sole source of truth for this frame's embedding (rig_binding.md §3).
+        /// </summary>
         private ReadOnlySpan<float> ResolvePromptEmb(ControlPreset preset)
         {
             if (!Manifest.HasPrompt)
@@ -127,14 +260,20 @@ namespace AInimator.Controller.Runtime
                 return ReadOnlySpan<float>.Empty;
             }
 
-            if (preset.PromptEmb is { Length: > 0 } presetEmb)
+            if (!_hasActivePromptOverride && !_promptCrossFader.IsFading)
             {
-                return presetEmb;
+                // Legacy B1 path: no explicit prompt API call yet this
+                // session -- read the preset directly, un-faded.
+                if (preset.PromptEmb is { Length: > 0 } presetEmb)
+                {
+                    return presetEmb;
+                }
+
+                return Bundle.NormStats.PromptNullEmb;
             }
 
-            // No active prompt: feed the learned null embedding, never zeros
-            // (inference_contract.md §4).
-            return Bundle.NormStats.PromptNullEmb;
+            _promptCrossFader.Evaluate(_promptEmbScratch);
+            return _promptEmbScratch;
         }
 
         public void Dispose()
