@@ -73,6 +73,25 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "AInimator|Runtime")
 	bool SetPreset(UAInimatorControlPreset* Preset);
 
+	/**
+	 * B6 (`apps/spec/text_to_control.md`): resolves free-text Command
+	 * ("cours vers la gauche", "run left"...) into a raw control vector
+	 * via `FTextToControlResolver` and applies it through the exact same
+	 * `SetControl` path as `SetPreset` — zero impact on the preset
+	 * machinery, both remain interchangeable frame by frame
+	 * (ROADMAP_PLUGINS.md §4 B6 acceptance).
+	 *
+	 * ⚠ NOT the prompt channel (rig_binding.md §3): this only writes the
+	 * low-level (vx, vz[, aim_x, aim_z]) control vector, never the text
+	 * encoder / prompt_emb path.
+	 *
+	 * Returns false (logged by the resolver, not this function) when the
+	 * command is unrecognized or ambiguous — the CURRENT control is left
+	 * untouched in that case (spec §2 step 6: never a silent fallback).
+	 */
+	UFUNCTION(BlueprintCallable, Category = "AInimator|Runtime")
+	bool SetTextCommand(const FString& Command);
+
 	/** Sets the active prompt embedding; ignored (with a warning) if
 	 *  the bundle has PromptEmbChannels == 0. Passing an empty array
 	 *  reverts to the learned null embedding (never zeros). */

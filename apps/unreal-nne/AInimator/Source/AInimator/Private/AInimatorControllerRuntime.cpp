@@ -6,6 +6,7 @@
 #include "AInimatorBundleLoader.h"
 #include "AInimatorPresetLoader.h"
 #include "AInimatorRootLocalMath.h"
+#include "AInimatorTextToControlResolver.h"
 #include "Misc/Paths.h"
 #include "Misc/FileHelper.h"
 
@@ -231,6 +232,63 @@ bool UAInimatorControllerRuntime::SetPreset(UAInimatorControlPreset* Preset)
 		return SetPromptEmbedding(Preset->PromptEmb);
 	}
 	return true;
+}
+
+bool UAInimatorControllerRuntime::SetTextCommand(const FString& Command)
+{
+	if (!bIsLoaded)
+	{
+		UE_LOG(LogAInimator, Error,
+			TEXT("AInimator: SetTextCommand called before a bundle was loaded."));
+		return false;
+	}
+
+	const TOptional<FAInimatorResolvedControl> Resolved = FTextToControlResolver::Resolve(Command);
+	if (!Resolved.IsSet())
+	{
+		// FTextToControlResolver::Resolve already logged the specific
+		// reason (unrecognized or ambiguous, text_to_control.md §2 step
+		// 6) — current control is left untouched (never a silent
+		// fallback to some movement).
+		return false;
+	}
+
+	// Map the resolved (vx, vz[, aim_x, aim_z]) onto the manifest's
+	// declared control_layout order, exactly like
+	// UAInimatorControlPreset::BuildControlVector does for presets —
+	// same SetControl path, zero impact on the preset machinery
+	// (ROADMAP_PLUGINS.md §4 B6 acceptance).
+	TArray<float> RawControlVector;
+	RawControlVector.SetNumZeroed(Manifest.ControlLayout.Num());
+	for (int32 Index = 0; Index < Manifest.ControlLayout.Num(); ++Index)
+	{
+		const FString& ChannelName = Manifest.ControlLayout[Index];
+		if (ChannelName == TEXT("vx"))
+		{
+			RawControlVector[Index] = Resolved->Vx;
+		}
+		else if (ChannelName == TEXT("vz"))
+		{
+			RawControlVector[Index] = Resolved->Vz;
+		}
+		else if (ChannelName == TEXT("aim_x"))
+		{
+			RawControlVector[Index] = Resolved->AimX;
+		}
+		else if (ChannelName == TEXT("aim_z"))
+		{
+			RawControlVector[Index] = Resolved->AimZ;
+		}
+		else
+		{
+			UE_LOG(LogAInimator, Error,
+				TEXT("AInimator: unknown control_layout channel '%s' in manifest ")
+				TEXT("— this plugin build does not recognise it (SetTextCommand)."),
+				*ChannelName);
+			return false;
+		}
+	}
+	return SetControl(RawControlVector);
 }
 
 bool UAInimatorControllerRuntime::SetPromptEmbedding(

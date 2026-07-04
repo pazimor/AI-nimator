@@ -99,6 +99,25 @@ void FAInimatorActionComponentDetails::CustomizeDetails(IDetailLayoutBuilder& De
 				"Loads every presets/*.json in a chosen bundle directory (FPresetLoader) and saves each as a versioned project asset."))
 			.OnClicked(this, &FAInimatorActionComponentDetails::OnImportFromBundleClicked)
 		];
+
+	// B6 (apps/spec/text_to_control.md): the "TextCommand" FString
+	// property already gets a default editable text row from its
+	// UPROPERTY (Category "AInimator|Action|Text") — this only adds the
+	// resolve-and-apply button next to it, for a one-click PIE test.
+	IDetailCategoryBuilder& TextCategory =
+		DetailBuilder.EditCategory(TEXT("AInimator|Action|Text"));
+	TextCategory.AddCustomRow(LOCTEXT("TestTextCommandRowFilter", "Test Text Command"))
+		.WholeRowContent()
+		[
+			SNew(SButton)
+			.Text(LOCTEXT("TestTextCommandButton", "Test Text Command (PIE)"))
+			.ToolTipText(LOCTEXT("TestTextCommandTooltip",
+				"Resolves the TextCommand field via FTextToControlResolver and applies it to Runtime "
+				"(UAInimatorActionComponent::ActivateTextCommand) — only meaningful while the game is "
+				"running with a loaded bundle. B6 is NOT the prompt channel: this only writes the "
+				"low-level control vector."))
+			.OnClicked(this, &FAInimatorActionComponentDetails::OnTestTextCommandClicked)
+		];
 }
 
 FReply FAInimatorActionComponentDetails::OnCreatePresetClicked()
@@ -178,6 +197,22 @@ FReply FAInimatorActionComponentDetails::OnImportFromBundleClicked()
 	UE_LOG(LogAInimator, Log,
 		TEXT("AInimator: imported %d/%d preset(s) from '%s' into '%s'."),
 		SavedCount, LoadedCount, *PresetsDirectory, *DefaultPresetPackagePath);
+	return FReply::Handled();
+}
+
+FReply FAInimatorActionComponentDetails::OnTestTextCommandClicked()
+{
+	if (UAInimatorActionComponent* Component = EditedComponent.Get())
+	{
+		if (!Component->ActivateTextCommand(Component->TextCommand))
+		{
+			UE_LOG(LogAInimator, Warning,
+				TEXT("AInimator: 'Test Text Command' could not resolve/apply '%s' ")
+				TEXT("(see preceding log line for the reason — unresolved command, ")
+				TEXT("no Runtime, or Runtime not yet loaded; only meaningful in PIE)."),
+				*Component->TextCommand);
+		}
+	}
 	return FReply::Handled();
 }
 

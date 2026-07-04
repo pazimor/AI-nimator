@@ -180,6 +180,17 @@ bool UAInimatorActionComponent::ActivatePreset(UAInimatorControlPreset* Preset)
 	return Runtime->SetPreset(Preset);
 }
 
+bool UAInimatorActionComponent::ActivateTextCommand(const FString& Command)
+{
+	if (!Runtime)
+	{
+		UE_LOG(LogAInimator, Error,
+			TEXT("AInimator: ActivateTextCommand called with no Runtime assigned."));
+		return false;
+	}
+	return Runtime->SetTextCommand(Command);
+}
+
 UAInimatorControlPreset* UAInimatorActionComponent::ResolvePresetForAction(
 	UInputAction* InAction) const
 {

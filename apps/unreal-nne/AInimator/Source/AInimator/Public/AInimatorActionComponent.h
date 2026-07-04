@@ -80,6 +80,28 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "AInimator|Action")
 	bool ActivatePreset(UAInimatorControlPreset* Preset);
 
+	/** B6 (`apps/spec/text_to_control.md`) authoring/test field: a free
+	 *  text command, editable in the Details panel and resolved via the
+	 *  "Test Text Command" button (`FAInimatorActionComponentDetails`)
+	 *  while the game is running in PIE. Purely a manual test aid — it
+	 *  has no effect until "Test Text Command" (or ActivateTextCommand)
+	 *  is invoked; it does NOT auto-apply on edit. ⚠ Not the prompt
+	 *  channel (rig_binding.md §3): resolves to the low-level control
+	 *  vector only. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AInimator|Action|Text")
+	FString TextCommand;
+
+	/**
+	 * Resolves TextCommand (or an explicit override) via
+	 * `FTextToControlResolver` and applies it to Runtime through
+	 * `UAInimatorControllerRuntime::SetTextCommand` — the same
+	 * `SetControl` path as `ActivatePreset`, zero impact on the preset
+	 * machinery. Returns false (logged) when unresolved/ambiguous or no
+	 * Runtime is assigned.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "AInimator|Action|Text")
+	bool ActivateTextCommand(const FString& Command);
+
 	/** Finds the first binding whose Action matches InAction; returns
 	 *  nullptr if none. Exposed for unit tests and Blueprint
 	 *  introspection — pure lookup, no side effect. */

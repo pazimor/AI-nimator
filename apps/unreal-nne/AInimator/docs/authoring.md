@@ -86,3 +86,54 @@ respond.
 See `AInimatorActionComponent.h` / `AInimatorActionBinding.h` for the
 full API (also exposed to Blueprint: `ActivatePreset`,
 `ResolvePresetForAction`, `ResolvePresetForKey`).
+
+## 5. (Optional) B6 — test a free-text command in PIE
+
+> ⚠ **B6 is NOT the prompt channel.** The prompt (`SetPrompt` /
+> `SetPromptEmbedding` on `UAInimatorCharacterComponent`, see
+> `rig_binding.md §3`) is the model's built-in, always-available "what"
+> channel (dance, sit, wave...) and remains the default way to drive
+> expressive behavior. B6 is a separate, optional convenience that maps
+> free text to the **low-level locomotion control vector**
+> `(vx, vz[, aim_x, aim_z])` only — the exact same numbers a
+> `ControlPreset` or WASD input would produce. It never touches the
+> prompt/embedding path, and the preset path remains the default and is
+> completely unaffected whether or not B6 is used
+> (`apps/spec/text_to_control.md`).
+
+Design source of truth: `apps/spec/text_to_control.md` (algorithm) +
+`apps/spec/text_to_control.json` (canonical keyword table, embedded
+verbatim in `AInimatorTextToControlTable.h`) + the Python reference
+`apps/spec/text_to_control_reference.py`, mirrored value-for-value by
+`FTextToControlResolver` (`AInimatorTextToControlResolver.h/.cpp`).
+
+**In code**, on an already-loaded `UAInimatorControllerRuntime`:
+
+```cpp
+if (!Runtime->SetTextCommand(TEXT("cours vers la gauche")))
+{
+    // Unrecognized or ambiguous (e.g. "gauche droite") — current
+    // control is left untouched, LogAInimator explains why.
+}
+```
+
+**In the editor**, on `UAInimatorActionComponent`'s Details panel:
+
+1. Type a phrase (French or English — e.g. `"run forward and left"`,
+   `"arrête-toi"`) into the **Text Command** field
+   (`AInimator|Action|Text` category).
+2. Click **Test Text Command (PIE)** while the game is running with a
+   loaded bundle. This calls `ActivateTextCommand` for you, which
+   resolves the phrase and applies it through the exact same
+   `Runtime->SetControl(...)` path as `ActivatePreset` — the character
+   responds immediately if the phrase resolved, or `LogAInimator` logs
+   the reason it did not (unrecognized words, or a direction ambiguity
+   like "gauche droite" cancelling itself out).
+
+Recognized keywords (directions, speeds, defaults) are the canonical
+table only — see `apps/spec/text_to_control.md §2` for the exact
+resolution order (sum directions -> unit-normalize; max speed with any
+"stop"-family word always winning; direction-only defaults to walking
+speed; speed-only defaults to forward). This mapper is deliberately
+simple and deterministic; it does not use the text encoder / embedding
+space at all.

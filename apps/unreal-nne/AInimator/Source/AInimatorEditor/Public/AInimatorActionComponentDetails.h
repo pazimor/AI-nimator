@@ -26,6 +26,12 @@ class UAInimatorActionComponent;
  *   path) so bundle-provided presets (idle/forward/backward/
  *   strafe_left/strafe_right) can be promoted to versioned assets
  *   without hand re-entering their values.
+ * - **Test Text Command** (B6, `apps/spec/text_to_control.md`) — resolves
+ *   the component's `TextCommand` field via
+ *   `UAInimatorActionComponent::ActivateTextCommand` for a quick PIE
+ *   test ("cours vers la gauche" -> control applied immediately). Only
+ *   meaningful while the game is running (Runtime must be loaded); a
+ *   no-op warning is logged otherwise.
  *
  * Kept in the editor-only module (`AInimatorEditor`) so none of this
  * — nor its `UnrealEd`/`PropertyEditor` dependencies — ships in a
@@ -42,6 +48,7 @@ public:
 private:
 	FReply OnCreatePresetClicked();
 	FReply OnImportFromBundleClicked();
+	FReply OnTestTextCommandClicked();
 
 	/** The single component instance being customized (Details panels
 	 *  support multi-edit, but bundle import / preset creation only
