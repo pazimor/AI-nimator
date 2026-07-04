@@ -157,9 +157,19 @@ void UAInimatorActionComponent::PollKeyBindings()
 		}
 	}
 
-	if (!bAnyActive && bAnyKeyBindingActiveLastTick && IdlePreset)
+	if (!bAnyActive && bAnyKeyBindingActiveLastTick)
 	{
-		ActivatePreset(IdlePreset);
+		// Normative priority (text_to_control.md §3): a held key wins,
+		// but an active text command RESUMES on release; idle only
+		// when no text command is active.
+		if (!ActiveTextCommand.IsEmpty() && Runtime)
+		{
+			Runtime->SetTextCommand(ActiveTextCommand);
+		}
+		else if (IdlePreset)
+		{
+			ActivatePreset(IdlePreset);
+		}
 	}
 	bAnyKeyBindingActiveLastTick = bAnyActive;
 }
@@ -188,7 +198,17 @@ bool UAInimatorActionComponent::ActivateTextCommand(const FString& Command)
 			TEXT("AInimator: ActivateTextCommand called with no Runtime assigned."));
 		return false;
 	}
-	return Runtime->SetTextCommand(Command);
+	const bool bResolved = Runtime->SetTextCommand(Command);
+	if (bResolved)
+	{
+		ActiveTextCommand = Command;
+	}
+	return bResolved;
+}
+
+void UAInimatorActionComponent::ClearTextCommand()
+{
+	ActiveTextCommand.Reset();
 }
 
 UAInimatorControlPreset* UAInimatorActionComponent::ResolvePresetForAction(

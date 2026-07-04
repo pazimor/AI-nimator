@@ -52,6 +52,11 @@ valeur pour valeur.
 - **Zéro impact preset** : `SetTextCommand` écrit le même état de
   contrôle que `SetPreset` ; les deux chemins restent
   interchangeables frame par frame.
+- **Priorité normative (tranché 2026-07-04)** : binding de touche
+  **maintenu** > commande texte active > idle. Une commande texte
+  résolue reste **active** (stockée) : elle **reprend** au relâchement
+  de la touche, jusqu'à `ClearTextCommand()` ou une nouvelle commande.
+  Identique deux moteurs.
 
 ## 4. Hors scope (v1)
 

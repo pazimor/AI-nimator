@@ -102,6 +102,13 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "AInimator|Action|Text")
 	bool ActivateTextCommand(const FString& Command);
 
+	/** Forgets the active text command: on the next key release the
+	 *  component falls back to IdlePreset instead of resuming it
+	 *  (normative priority: held key > active text command > idle,
+	 *  text_to_control.md §3). */
+	UFUNCTION(BlueprintCallable, Category = "AInimator|Action|Text")
+	void ClearTextCommand();
+
 	/** Finds the first binding whose Action matches InAction; returns
 	 *  nullptr if none. Exposed for unit tests and Blueprint
 	 *  introspection — pure lookup, no side effect. */
@@ -136,4 +143,8 @@ private:
 	UAInimatorControllerRuntime* ResolveRuntime() const;
 
 	bool bAnyKeyBindingActiveLastTick = false;
+
+	/** Last successfully resolved text command; resumed when all key
+	 *  bindings are released (text_to_control.md §3 priority rule). */
+	FString ActiveTextCommand;
 };
