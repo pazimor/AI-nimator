@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using AInimator.Controller.Bundle;
 using AInimator.Controller.Presets;
 using AInimator.Controller.Runtime;
+using AInimator.Controller.TextCommand;
 using UnityEngine;
 
 namespace AInimator.Controller.Authoring
@@ -46,6 +47,8 @@ namespace AInimator.Controller.Authoring
         [SerializeField] private bool autoInitializeFromDefaultBundle = true;
 
         private AInimatorController _controller;
+        private ControlPreset _textCommandPreset;
+        private bool _hasActiveTextCommand;
 
         /// <summary>The bindings list, editable from a custom Inspector (Editor/).</summary>
         public List<InputBinding> Bindings => bindings;
@@ -62,6 +65,14 @@ namespace AInimator.Controller.Authoring
 
         /// <summary>The controller this binder drives, once initialized.</summary>
         public AInimatorController Controller => _controller;
+
+        /// <summary>
+        /// The free-text command most recently accepted by
+        /// <see cref="SetTextCommand"/>, or <c>null</c> once
+        /// <see cref="ClearTextCommand"/> is called / a key binding takes
+        /// over. Exposed for the Inspector test UX.
+        /// </summary>
+        public string ActiveTextCommand { get; private set; }
 
         private Vector2 _continuousAim;
 
@@ -113,6 +124,48 @@ namespace AInimator.Controller.Authoring
             _continuousAim = aim;
         }
 
+        /// <summary>
+        /// Resolve a free-text command (Goal B phase B6,
+        /// <c>apps/spec/text_to_control.md</c>) and, if successful, drive the
+        /// controller with it every frame instead of the key bindings — the
+        /// SAME control-vector write path as a <see cref="ControlPreset"/>
+        /// (<see cref="ControlPreset.WriteRawControl"/>), zero impact on the
+        /// preset path. A held key binding still takes priority over an
+        /// active text command (the preset path stays the default per spec
+        /// §1); call <see cref="ClearTextCommand"/> to release control back
+        /// to bindings/idle.
+        /// </summary>
+        /// <param name="text">Free-text command, French or English.</param>
+        /// <returns>
+        /// <c>true</c> if resolved and now active; <c>false</c> if the text
+        /// could not be resolved (ambiguous or unrecognized — the previous
+        /// active command/preset is left untouched, per spec §2 rule 6). The
+        /// failure is logged via <see cref="Debug.LogWarning(object)"/>,
+        /// never a silent fallback.
+        /// </returns>
+        public bool SetTextCommand(string text)
+        {
+            var resolved = TextToControlResolver.Resolve(text);
+            if (resolved == null)
+            {
+                Debug.LogWarning($"AInimatorActionBinder.SetTextCommand: could not resolve '{text}' (unrecognized or ambiguous) — control unchanged.");
+                return false;
+            }
+
+            _textCommandPreset ??= ScriptableObject.CreateInstance<ControlPreset>();
+            _textCommandPreset.SetRawControl(resolved.Value.Vx, resolved.Value.Vz, resolved.Value.AimX, resolved.Value.AimZ);
+            _hasActiveTextCommand = true;
+            ActiveTextCommand = text;
+            return true;
+        }
+
+        /// <summary>Release the active text command; bindings/idle resolve again next frame.</summary>
+        public void ClearTextCommand()
+        {
+            _hasActiveTextCommand = false;
+            ActiveTextCommand = null;
+        }
+
         private void Update()
         {
             if (_controller == null)
@@ -131,19 +184,38 @@ namespace AInimator.Controller.Authoring
 
         /// <summary>
         /// Resolve the preset to apply this frame from <see cref="bindings"/>
-        /// (first-held-key-wins) falling back to <see cref="idlePreset"/>.
-        /// Exposed as a separate method so it is callable without a live
-        /// <c>Input</c> subsystem in tests via <see cref="InputBindingResolver.Resolve"/>.
+        /// (first-held-key-wins), falling back to the active text command
+        /// (<see cref="SetTextCommand"/>) when no key is held, then
+        /// <see cref="idlePreset"/>. Exposed as a separate method so it is
+        /// callable without a live <c>Input</c> subsystem in tests via
+        /// <see cref="InputBindingResolver.Resolve"/>.
         /// </summary>
         private ControlPreset ResolveActivePreset()
         {
-            return InputBindingResolver.Resolve(bindings, Input.GetKey, idlePreset);
+            var boundPreset = InputBindingResolver.Resolve(bindings, Input.GetKey, null);
+            if (boundPreset != null)
+            {
+                return boundPreset;
+            }
+
+            if (_hasActiveTextCommand)
+            {
+                return _textCommandPreset;
+            }
+
+            return idlePreset;
         }
 
         private void OnDestroy()
         {
             _controller?.Dispose();
             _controller = null;
+
+            if (_textCommandPreset != null)
+            {
+                Destroy(_textCommandPreset);
+                _textCommandPreset = null;
+            }
         }
     }
 }

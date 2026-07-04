@@ -5,6 +5,7 @@ using AInimator.Controller.PostProcess;
 using AInimator.Controller.Presets;
 using AInimator.Controller.Rig;
 using AInimator.Controller.Runtime;
+using AInimator.Controller.TextCommand;
 using UnityEngine;
 
 namespace AInimator.Controller.Authoring
@@ -56,6 +57,16 @@ namespace AInimator.Controller.Authoring
         private AInimatorController _controller;
         private AInimatorPostProcess _postProcess;
         private Vector2 _continuousAim;
+        private ControlPreset _textCommandPreset;
+        private bool _hasActiveTextCommand;
+
+        /// <summary>
+        /// The free-text command most recently accepted by
+        /// <see cref="SetTextCommand"/>, or <c>null</c> once
+        /// <see cref="ClearTextCommand"/> is called / a key binding takes
+        /// over. Exposed for the Inspector test UX.
+        /// </summary>
+        public string ActiveTextCommand { get; private set; }
 
         /// <summary>The bindings list, editable from a custom Inspector.</summary>
         public List<InputBinding> Bindings => bindings;
@@ -142,6 +153,47 @@ namespace AInimator.Controller.Authoring
         /// <summary>Begin cross-fading back to the bundle's learned null prompt embedding (spec §3).</summary>
         public void ClearPrompt() => _controller?.ClearPrompt();
 
+        /// <summary>
+        /// Resolve a free-text command (Goal B phase B6,
+        /// <c>apps/spec/text_to_control.md</c>) and, if successful, drive the
+        /// controller with it every frame instead of the key bindings — the
+        /// SAME control-vector write path as a <see cref="ControlPreset"/>
+        /// (<see cref="ControlPreset.WriteRawControl"/>), zero impact on the
+        /// preset path. A held key binding still takes priority over an
+        /// active text command; call <see cref="ClearTextCommand"/> to
+        /// release control back to bindings/idle.
+        /// </summary>
+        /// <param name="text">Free-text command, French or English.</param>
+        /// <returns>
+        /// <c>true</c> if resolved and now active; <c>false</c> if the text
+        /// could not be resolved (ambiguous or unrecognized — the previous
+        /// active command/preset is left untouched, per spec §2 rule 6),
+        /// logged via <see cref="Debug.LogWarning(object)"/>, never a silent
+        /// fallback.
+        /// </returns>
+        public bool SetTextCommand(string text)
+        {
+            var resolved = TextToControlResolver.Resolve(text);
+            if (resolved == null)
+            {
+                Debug.LogWarning($"AInimatorCharacter.SetTextCommand: could not resolve '{text}' (unrecognized or ambiguous) — control unchanged.");
+                return false;
+            }
+
+            _textCommandPreset ??= ScriptableObject.CreateInstance<ControlPreset>();
+            _textCommandPreset.SetRawControl(resolved.Value.Vx, resolved.Value.Vz, resolved.Value.AimX, resolved.Value.AimZ);
+            _hasActiveTextCommand = true;
+            ActiveTextCommand = text;
+            return true;
+        }
+
+        /// <summary>Release the active text command; bindings/idle resolve again next frame.</summary>
+        public void ClearTextCommand()
+        {
+            _hasActiveTextCommand = false;
+            ActiveTextCommand = null;
+        }
+
         private void Update()
         {
             if (_controller == null)
@@ -195,13 +247,30 @@ namespace AInimator.Controller.Authoring
 
         private ControlPreset ResolveActivePreset()
         {
-            return InputBindingResolver.Resolve(bindings, Input.GetKey, idlePreset);
+            var boundPreset = InputBindingResolver.Resolve(bindings, Input.GetKey, null);
+            if (boundPreset != null)
+            {
+                return boundPreset;
+            }
+
+            if (_hasActiveTextCommand)
+            {
+                return _textCommandPreset;
+            }
+
+            return idlePreset;
         }
 
         private void OnDestroy()
         {
             _controller?.Dispose();
             _controller = null;
+
+            if (_textCommandPreset != null)
+            {
+                Destroy(_textCommandPreset);
+                _textCommandPreset = null;
+            }
         }
     }
 }

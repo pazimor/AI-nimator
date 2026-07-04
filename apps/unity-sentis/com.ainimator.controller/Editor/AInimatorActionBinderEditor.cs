@@ -25,6 +25,7 @@ namespace AInimator.Controller.Editor
         private SerializedProperty _bundleDirectoryOverrideProp;
         private SerializedProperty _seedBoneFrameOverrideProp;
         private SerializedProperty _autoInitializeProp;
+        private string _textCommandInput = "";
 
         private void OnEnable()
         {
@@ -79,6 +80,48 @@ namespace AInimator.Controller.Editor
             EditorGUILayout.PropertyField(_seedBoneFrameOverrideProp, new GUIContent("Seed Bone Frame Override"), true);
 
             serializedObject.ApplyModifiedProperties();
+
+            DrawTextCommandTester();
+        }
+
+        /// <summary>
+        /// Play-mode test UX for the B6 free-text mapper
+        /// (<c>apps/spec/text_to_control.md</c>): a text field + "Resolve"
+        /// button calling <see cref="AInimatorActionBinder.SetTextCommand"/>
+        /// directly on the live component. Only usable while the game is
+        /// running (the component needs an initialized controller).
+        /// </summary>
+        private void DrawTextCommandTester()
+        {
+            EditorGUILayout.Space();
+            EditorGUILayout.LabelField("Free-text command (B6, test in Play)", EditorStyles.boldLabel);
+
+            var binder = (AInimatorActionBinder)target;
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                _textCommandInput = EditorGUILayout.TextField(_textCommandInput);
+                using (new EditorGUI.DisabledScope(!Application.isPlaying))
+                {
+                    if (GUILayout.Button("Resolve", GUILayout.Width(70)))
+                    {
+                        binder.SetTextCommand(_textCommandInput);
+                    }
+
+                    if (GUILayout.Button("Clear", GUILayout.Width(50)))
+                    {
+                        binder.ClearTextCommand();
+                    }
+                }
+            }
+
+            if (!Application.isPlaying)
+            {
+                EditorGUILayout.HelpBox("Enter Play mode to test text-command resolution.", MessageType.Info);
+            }
+            else if (!string.IsNullOrEmpty(binder.ActiveTextCommand))
+            {
+                EditorGUILayout.HelpBox($"Active text command: \"{binder.ActiveTextCommand}\"", MessageType.None);
+            }
         }
 
         private void DrawBindingsList()

@@ -82,11 +82,42 @@ Continuous aim (mouse/stick) is not a binding row: call
 manifest declares `control_channels == 4`; it overrides the active preset's
 static aim for that frame only.
 
+## 5. Free-text control commands (B6) — not the prompt channel
+
+`apps/spec/text_to_control.md` defines a **separate, low-level** mapper: a
+free-text sentence ("cours vers la gauche", "run left") resolves
+deterministically to a raw `(vx, vz[, aimX, aimZ])` control vector — the
+same units and the same write path as a `ControlPreset`
+(`ControlPreset.WriteRawControl`). It is a keyword-table lookup (directions
+summed + unit-normalized, speed = max of present keywords, stop-family
+always wins), **not** an embedding and **not** the `prompt`/`prompt_emb`
+channel described in `rig_binding.md` §3 — the two are unrelated features
+that happen to both start from text.
+
+- Call `AInimatorActionBinder.SetTextCommand(string)` or
+  `AInimatorCharacter.SetTextCommand(string)` — returns `true` once resolved
+  and now driving the controller every frame, `false` if the sentence was
+  unrecognized or ambiguous (e.g. "gauche droite" — direction words cancel
+  out). A failed call **never** changes the current control and logs a
+  warning (never a silent fallback).
+- A held key binding still takes priority over an active text command; the
+  preset/binding path remains the default. Call `ClearTextCommand()` to
+  release control back to bindings/idle.
+- Test it live: select the `AInimatorActionBinder`/`AInimatorCharacter`
+  GameObject in Play mode, type a sentence into the **"Free-text command
+  (B6, test in Play)"** field at the bottom of its Inspector, click
+  **Resolve**.
+- The keyword table (`Runtime/TextCommand/Resources/text_to_control.json`)
+  is a verbatim embedded copy of `apps/spec/text_to_control.json` — the
+  canonical source of truth; do not edit the embedded copy directly, change
+  the spec file and re-copy.
+
 ## Not covered here
 
 - Foot-lock IK / idle↔move blending post-processing — see the B4 section of
   the main `README.md` and `apps/spec/footlock_blending.md`.
-- Mapping a free-text prompt to a preset (`prompt_emb`) — a `ControlPreset`
-  can carry a precomputed `prompt_emb` (imported or hand-authored), but
-  there is no in-Inspector text→embedding tool; that stays a Python-side
-  authoring step (`apps/spec/inference_contract.md` §4).
+- Mapping a free-text prompt to a **preset embedding** (`prompt_emb`) — a
+  `ControlPreset` can carry a precomputed `prompt_emb` (imported or
+  hand-authored), but there is no in-Inspector text→embedding tool; that
+  stays a Python-side authoring step (`apps/spec/inference_contract.md` §4).
+  This is unrelated to the B6 free-text **control** mapper above.

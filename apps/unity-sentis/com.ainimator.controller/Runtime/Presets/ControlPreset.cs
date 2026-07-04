@@ -82,5 +82,24 @@ namespace AInimator.Controller.Presets
             prompt = data.prompt;
             promptEmb = data.promptEmb;
         }
+
+        /// <summary>
+        /// Overwrite only the raw control fields (<see cref="Vx"/>/<see cref="Vz"/>/
+        /// <see cref="AimX"/>/<see cref="AimZ"/>), leaving <see cref="PresetName"/>/
+        /// <see cref="Prompt"/>/<see cref="PromptEmb"/> untouched. Used by
+        /// <c>TextCommand.TextToControlResolver</c> consumers (Goal B phase
+        /// B6) to drive a transient in-memory preset from a resolved
+        /// free-text command through the exact same
+        /// <see cref="WriteRawControl"/> path as an authored asset — zero
+        /// impact on the preset path itself.
+        /// </summary>
+        public void SetRawControl(float rawVx, float rawVz, float rawAimX, float rawAimZ)
+        {
+            vx = rawVx;
+            vz = rawVz;
+            hasAim = true;
+            aimX = rawAimX;
+            aimZ = rawAimZ;
+        }
     }
 }
