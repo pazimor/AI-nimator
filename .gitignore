@@ -1,8 +1,9 @@
 .venv/
 .idea/
-# test/ directory: allow ainimator/ subtree, ignore caches
+# test/ directory: allow ainimator/ + apps/ subtrees, ignore caches
 test/*
 !test/ainimator/
+!test/apps/
 .DS_Store
 
 # coverages
@@ -17,3 +18,9 @@ doc/build/*
 **/__pycache__/*
 *.pyc
 **/output/*
+
+#claude
+.claude/worktrees
+
+#binarys
+*.onnx
