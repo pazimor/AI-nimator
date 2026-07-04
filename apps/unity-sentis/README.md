@@ -9,9 +9,10 @@ forward pass per frame. The single source of truth for the I/O contract is
 `apps/spec/inference_contract.md` — this plugin implements it, it does not
 redefine it.
 
-Status: **Phase B1** (`doc/ROADMAP_PLUGINS.md` §4) — runtime + WASD demo.
-Foot-lock IK/blending (B4), the authoring `AInimatorActionBinder` (B3), and
-the build orchestrator (B5) are later phases.
+Status: **Phases B1–B4** (`doc/ROADMAP_PLUGINS.md` §4) — runtime + WASD demo
+(B1), the authoring `AInimatorActionBinder` (B3), and foot-lock IK + idle/move
+blending post-processing (B4) are implemented. The build orchestrator (B5)
+is the remaining later phase.
 
 ## Package layout
 
@@ -25,9 +26,17 @@ apps/unity-sentis/
     │   ├── Bundle/                Manifest, NormStats, BundleLoader, ControlPresetData, MiniJson
     │   ├── Normalization/         Normalizer (pure math, unit-testable)
     │   ├── Runtime/               StateBuffer, RootMotionIntegrator, ControllerRuntime, AInimatorController
-    │   └── Presets/               ControlPreset ScriptableObject
-    ├── Editor/                    ControlPresetImporter, BundleDeliveryTools (batch-mode pack target)
-    ├── Tests/EditMode/            NUnit tests (Normalizer, StateBuffer, BundleLoader, RootMotionIntegrator)
+    │   ├── Presets/               ControlPreset ScriptableObject
+    │   ├── Authoring/             InputBinding, InputBindingResolver, AInimatorActionBinder (B3)
+    │   └── PostProcess/           Smpl22Skeleton, SmplForwardKinematics, FootContactDetector,
+    │                              TwoBoneIkSolver, FootLockIk, IdleMoveBlender, AInimatorPostProcess,
+    │                              FootSlidingMetric (B4)
+    ├── Editor/                    ControlPresetImporter, BundleDeliveryTools (batch-mode pack target),
+    │                              AInimatorActionBinderEditor (B3 custom Inspector)
+    ├── docs/authoring.md          1-page "create a binding with no code" walkthrough (B3)
+    ├── Tests/EditMode/            NUnit tests (Normalizer, StateBuffer, BundleLoader, RootMotionIntegrator,
+    │                              InputBindingResolver, FootContactDetector, TwoBoneIkSolver,
+    │                              SmplForwardKinematics, FootLockIk, IdleMoveBlender, FootSlidingMetric)
     └── Samples~/ControllerDemo/   WASD capsule demo (no IK, no skinning — B1 scope)
 ```
 
@@ -134,6 +143,110 @@ autoregressive window (`context_frames`), the z-normalization, and the
 `ainimator.model.controller_rollout` byte-for-byte in intent (yaw-relative
 integration formula, control/state/delta normalization).
 
+## Authoring: button → action (phase B3)
+
+`AInimator.Controller.Authoring.AInimatorActionBinder` is the "no-code"
+entry point described in `ROADMAP_PLUGINS.md` §1.1/§4: a list of
+`InputBinding` rows (`KeyCode` → `ControlPreset`), resolved every frame
+(first-held-key-wins) into the preset applied to an owned
+`AInimatorController`. A custom Inspector
+(`Editor/AInimatorActionBinderEditor.cs`) lets you add/remove rows, pick a
+`ControlPreset` asset per row from a project-wide dropdown, create a brand
+new preset asset in one click ("Create New Preset..."), or bulk-import the
+bundle's five default presets ("Import Presets From Bundle...", the same
+`ControlPresetImporter` used by the `AInimator → Import Presets From
+Bundle...` menu item). See **`docs/authoring.md`** for the full
+click-by-click walkthrough (create a binding, press Play, see the character
+respond — no C# file touched).
+
+`InputBindingResolver` holds the pure key→preset resolution logic
+separately from the `MonoBehaviour` so it is unit-testable without a live
+`Input` subsystem (`Tests/EditMode/InputBindingResolverTests.cs`).
+
+## Post-processing: foot-lock IK + idle/move blending (phase B4)
+
+`AInimator.Controller.PostProcess.AInimatorPostProcess` implements
+`apps/spec/footlock_blending.md` verbatim — that document is normative for
+every rule/threshold/order below; this package does not redefine any of it.
+Pipeline order (spec §1, unchanged):
+
+```
+dstate -> state (AInimatorController.Tick, integrates + pushes RAW state into StateBuffer)
+pose   = AInimatorPostProcess.Process(rawBoneFrame, rootWorldPosition, rawVx, rawVz, dt)
+           SmplForwardKinematics.ComputeJointPositions   // root-local FK (ports ops.py::rot6dToJointXYZ)
+           FootContactDetector.Update(footJoint 10/11)    // height<0.05m AND planar speed<0.01 m/frame, +hysteresis
+           FootLockIk.Resolve(per leg: chain 1->4->7 / 2->5->8) // capture, two-bone solve, clamp 0.3m, 0.1s fade-out
+           IdleMoveBlender.Update(rawVx, rawVz, dt)        // move>0.005 m/frame, idle after 0.25s, 0.2s cross-fade
+applyToSkeleton(pose)   // engine-specific, not part of this package
+```
+
+The **state window always receives the raw, pre-post-processing state**
+(`AInimatorController.Tick` already pushes before returning) — post-process
+output is aval-only, exactly per spec §1's hard rule; feeding a corrected
+pose back into the window would contaminate the autoregression and is never
+done here.
+
+Key types (`Runtime/PostProcess/`):
+
+- `Smpl22Skeleton` — SMPL-22 bone order, parent hierarchy and T-pose
+  bone-local offsets, ported from
+  `src/ainimator/core/constants/skeletons.py` (see the file header comment
+  for the exact source symbols — regenerate this file if those constants
+  ever change upstream, never hand-diverge).
+- `SmplForwardKinematics` — the strict-necessary FK subset (`rotation6d` →
+  root-local joint positions), porting
+  `ops.py::sixdToRotationMatrix`/`rot6dToJointXYZ`. Positions are
+  root-local; `RootLocalToWorld` only translates by the engine's integrated
+  root position — no extra yaw is applied because the pelvis's own
+  rotation6d already encodes the skeleton's world-facing orientation
+  (`ainimator/geometry/root_local.py`).
+- `FootContactDetector` — redérives contacts from joints 10 (`leftFoot`) /
+  11 (`rightFoot`); spec's height/speed criterion plus the 2-frame /
+  1.5×-threshold exit hysteresis.
+- `TwoBoneIkSolver` — analytic law-of-cosines two-bone solve, pole vector
+  taken from the controller's own knee direction (never a fixed pole).
+- `FootLockIk` — per-leg capture/hold/clamp(0.3m)/fade(0.1s) state machine
+  built on `TwoBoneIkSolver`.
+- `IdleMoveBlender` — idle↔move cross-fade weight (`0.005` m/frame move
+  threshold on the **raw** control, `0.25s` idle-entry delay, `0.2s`
+  cross-fade).
+- `AInimatorPostProcess` — wires all of the above for one character,
+  exposing an `Options` struct (on/off toggles + every threshold above,
+  Inspector-serializable, defaults = the spec's defaults) and returning
+  corrected left/right leg world joint positions + the idle blend weight.
+  Applying those to an actual skinned rig/`Animator` is intentionally left
+  to the host project (engine/rig-specific — see "Known constraints"
+  below), matching how the B1 sample only visualizes the root transform.
+- `FootSlidingMetric` — the before/after measurement utility for the B4
+  acceptance criterion (see "Measuring foot-sliding" below).
+
+### Measuring foot-sliding (B4 acceptance criterion)
+
+`apps/spec/footlock_blending.md` §5 requires a measurable (>50%) reduction
+in foot-sliding on a 10s `forward` walk with the reference bundle. Procedure:
+
+1. Run the reference bundle's `forward` preset for 10s (`10 * fps` ticks)
+   with `AInimatorPostProcess.Options.enableFootLockIk = false` — feed each
+   frame's raw ankle/foot world positions (before any IK) into one
+   `FootSlidingMetric` per foot, calling `Accumulate(worldPosition,
+   isInContact)` with the **uncorrected** ankle position and the
+   `FootContactDetector`-derived contact state.
+2. Repeat with `enableFootLockIk = true`, this time accumulating the
+   **corrected** ankle position (`AInimatorPostProcess.Process`'s
+   `LegResult.AnkleWorldPosition`) into a second pair of metrics.
+3. Compare `MeanPlanarDisplacementPerContactFrame` before vs. after per
+   foot; record both numbers here once measured against a real bundle in
+   Unity (this session could not run Unity — see "Known constraints").
+
+Before/after numbers: **not yet measured** (requires a real Unity Editor +
+a posed reference bundle — Pazimor's validation step). Record them in this
+section once available:
+
+| Foot | Before (m/frame) | After (m/frame) | Reduction |
+|---|---|---|---|
+| Left  | _TBD_ | _TBD_ | _TBD_ |
+| Right | _TBD_ | _TBD_ | _TBD_ |
+
 ## Testing
 
 EditMode tests (`Tests/EditMode/`) run inside the Unity Test Framework
@@ -149,6 +262,26 @@ a project:
 - `BundleLoaderTests` / `BundleVersionTests` — fail-fast validation: a
   bundle with an incompatible version, wrong frozen dims, or a corrupted
   `prompt.null_emb` must raise `BundleLoadException` loudly.
+- `InputBindingResolverTests` (B3) — first-match-wins key resolution,
+  invalid-row skipping, fallback-to-idle, binding serialization.
+- `FootContactDetectorTests` (B4) — planted/lifted synthetic foot
+  trajectories, speed-criterion rejection, the 2-frame exit hysteresis and
+  its counter reset, the 1.5×-threshold immediate release.
+- `TwoBoneIkSolverTests` (B4) — reachable target (effector lands exactly on
+  target, bone lengths preserved), unreachable target (reports
+  `TargetReachable = false`, fully extends), pole-direction preservation,
+  degenerate target-at-root fallback.
+- `SmplForwardKinematicsTests` (B4) — identity-pose sanity (pelvis at
+  origin, chained hip→knee→ankle offsets), `RootLocalToWorld` translation-only
+  semantics, input-length validation.
+- `FootLockIkTests` (B4) — capture-and-hold under small pose drift, clamp
+  release beyond 0.3m, the 0.1s fade-out curve, pass-through when never
+  locked.
+- `IdleMoveBlenderTests` (B4) — immediate move-exit, the 0.25s idle-entry
+  delay, the 0.2s cross-fade timing, exact-threshold boundary behavior.
+- `FootSlidingMetricTests` (B4) — the before/after measurement utility:
+  zero sliding while stationary, accumulation while sliding, non-contact
+  frames excluded, entry-frame not counted, reset semantics.
 
 These tests were written and reviewed but **could not be executed in this
 environment** (no Unity Editor available here) — run them once inside a
@@ -181,6 +314,24 @@ real Unity project before relying on the "green" status.
   demo target). Mobile/web platforms serve `StreamingAssets` from a
   compressed archive or URL and need a `UnityWebRequest`-based loader
   swapped in; out of scope for B1.
+- **`AInimatorPostProcess` does not apply the corrected pose to a rig**
+  (B4): it returns corrected world joint **positions** for the two legs
+  plus an idle blend weight; wiring those onto an actual skinned
+  `Animator`/humanoid rig (e.g. driving
+  `AnimationRigging.TwoBoneIKConstraint` targets from the returned
+  positions, or blending idle↔move on an `Animator` layer with the
+  returned weight) is host-project/rig-specific and left as an integration
+  step, exactly like the B1 sample only visualizing the root transform on a
+  bare capsule.
+- **Foot-sliding before/after numbers not yet measured** (see "Measuring
+  foot-sliding" above) — requires a real Unity Editor + posed reference
+  bundle, Pazimor's validation step.
+- **Custom Inspector (`AInimatorActionBinderEditor`) untested against a
+  live `SerializedObject`**: the property-drawer code (list add/remove,
+  the "Create New Preset..."/"Import Presets From Bundle..." buttons) could
+  not be exercised without a running Editor in this session; the
+  unit-tested surface is `InputBindingResolver` (pure logic), not the
+  Inspector GUI code itself.
 
 ## Contract compatibility
 

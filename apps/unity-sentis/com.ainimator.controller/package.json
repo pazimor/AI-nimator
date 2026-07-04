@@ -1,8 +1,8 @@
 {
   "name": "com.ainimator.controller",
-  "version": "0.1.0-b1",
+  "version": "0.1.0-b4",
   "displayName": "AI-nimator Controller (Sentis)",
-  "description": "Real-time runtime for the AI-nimator deterministic autoregressive controller, powered by Unity Sentis. Loads a frozen controller bundle (controller.onnx + norm_stats.json + manifest.json + presets) exported by the ainimator Python pipeline and drives it one forward-pass per frame. Defines no model: it consumes the bundle as-is (see apps/spec/inference_contract.md, the single source of truth for the I/O contract).",
+  "description": "Real-time runtime for the AI-nimator deterministic autoregressive controller, powered by Unity Sentis. Loads a frozen controller bundle (controller.onnx + norm_stats.json + manifest.json + presets) exported by the ainimator Python pipeline and drives it one forward-pass per frame. Defines no model: it consumes the bundle as-is (see apps/spec/inference_contract.md, the single source of truth for the I/O contract). Includes button->preset authoring (B3) and foot-lock IK + idle/move blending post-processing (B4).",
   "unity": "2023.2",
   "documentationUrl": "https://github.com/pazimor/AI-nimator/blob/main/apps/unity-sentis/README.md",
   "keywords": [
