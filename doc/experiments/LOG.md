@@ -25,6 +25,9 @@ One line per concluded experiment. Format:
 
 | 2026-07-02 | **Diagnostic « le contrôleur ne réagit pas au prompt » (`controller_full_text_a6bis`)** | run full A6-bis 2026-07-02 (promptEmbChannels=768, SS=0.3, encoder `output/xlm_roberta_artifact`) ; génération OK mécaniquement (prompt encodé, plus de silent-ignore) mais mouvement insensible au texte | Sonde encodeur : cosinus inter-prompts xlm_roberta_artifact = **0.995–0.998** (walk vs sit vs jump indiscernables) → signal de conditionnement texte **constant**, le modèle ne peut pas apprendre à réagir. Cause amont : `ClipTextEncoder` chargeait le backbone via `AutoModel` → un nom CLIP retourne le CLIPModel complet (forward exige `pixel_values`, crash) ; xlm-roberta avait été choisi pour contourner, mais ses embeddings pooled sont anisotropes (dégénérés sans fine-tuning contrastif). | 🔴 **Run 2026-07-02 invalidé pour le texte (encodeur dégénéré), re-train requis.** ✅ Fix : `ClipTextEncoder` prend la tour texte (`.text_model`) d'un checkpoint CLIP ; nouvel artefact canonique `output/clip_text_artifact` (clip-vit-base-patch32, 512) → cosinus inter-prompts **0.66–0.75** (réf. LOG juin 0.65). Profils `full`/`controller_text` alignés sur 512. xlm_roberta_artifact à ne plus utiliser. |
 
+| 2026-07-04 | **B7 livrée (code-complete) : encodage de prompt in-engine** — bundle `A7.1` (bump mineur, gates majeur-`A7` inchangées) : `export_onnx bundle --encoder-artifact` embarque `text_encoder.onnx` (tour CLIP figée + projection + masked-mean pooling DANS le graphe, batch dynamique, T=32 figé) + `tokenizer/` (vocab/merges HF verbatim) + section manifest `text_encoder` | Parité pooled torch↔ORT **1.3e-7** (tol. 1e-3) ; tokenizer normatif `apps/spec/clip_bpe_reference.py` = HF CLIPTokenizerFast sur 20 cas adverses (accents, contractions, troncature) ; 12 vecteurs canoniques `text_encoding_parity.json` partagés pytest/EditMode/Automation ; moteurs : `ClipBpeTokenizer` + `PromptTextEncoder`/`FAInimatorPromptTextEncoder` + API `SetPromptText(string)→bool` (même chemin cross-fade que `SetPromptEmbedding`, échec loggé sur bundle A7.0) | suite pytest verte (605+117, 1 échec préexistant `test_root_translation_zeroing` hors périmètre), lint-imports 4/4 | ⚠ Code moteur **non compilé** (pas d'éditeur Unity/UE dans la session — caveat Sentis/NNE habituel) ; suites moteur à lancer après une livraison `make plugin-{unity,unreal} … ENCODER_ARTIFACT=output/clip_text_artifact`. Aussi : profil `full-long` ajouté (1024 clips, embed 384, 6 couches — capacity probe requis avant les 200 epochs, G-RUNS). |
+| 2026-07-06 | **Nouveau profil `locomotion` (spécialisation locomotion + rollout-loss horizon 16→64)** — `full-long` diverge en rollout long (`cold_start_stability=0.80`, yaw drift 201°, hauteur 0.80 m/400 frames) ; hypothèse : (a) pool 1024 clips trop hétérogène (danse/gestes/assis mélangés à la marche), (b) horizon rollout-loss 16 trop court vs dérive ~400 frames. Ajout d'un filtre de caption optionnel (`caption-filter`, regex, `ControllerProfileDataSchema`) dans `_selectFullIndices`/`train_controller_v2.py`, réutilisé par le nouveau profil `locomotion` (même arch que `full-long` : embed 384/6 layers/contexte 8 ; regex `\b(walk\w*\|run\w*\|jog\w*\|strid\w*\|march\w*\|sprint\w*)\b` ; `num-clips: 4096` / `held-out-clips: 256` ; `rollout-loss-horizon: 64`, `rollout-loss-weight: 1.0`) | Filtre vérifié sur `dataset_preprocessed` : **15818 clips locomotion ≥ 200 frames** (sur 42922 clips ≥200 frames au total) — `num-clips: 4096` largement couvert. `loadControllerProfile('locomotion', None)` résout embed 384/layers 6/horizon 64/filtre actif. 4 tests unitaires dédiés (`test_train_controller_caption_filter.py`) + suite existante verte, lint-imports 4/4. Smoke pipeline (24 clips, 2 epochs, horizon 64, CPU) : OK sans erreur. | ✅ **Profil `locomotion` code-complete, non entraîné** (200 epochs, G-RUNS — run gated Pazimor). Prochaine étape : capacity/smoke probe court (`epochs: 10`) avant le run complet, puis export bundle depuis le checkpoint produit. |
+
 ## Validated recipe (2026-06-12)
 - Denoiser capacity ∝ number of distinct motions (double params when N doubles).
 - `cond-mask-prob 0.10` (else degenerate collapse + no usable CFG).
@@ -33,3 +36,22 @@ One line per concluded experiment. Format:
 
 Root cause of the original mystery ("model ignores the prompt at scale"):
 under-sized denoiser AND sampling without CFG. Both fixed.
+
+## 2026-07-05 — Diagnostic divergence rollout long (in-engine Unity) + fix §3.6
+
+Repro hors moteur (onnxruntime, bundle `controller_full_long`, seed T-pose
+identité, 400 frames) : la validité 6D de l'état accumulé dérive 0.04 → 31.7
+(démembrement), yaw −8.6 rad (tournoiement), hauteur +4.2 m — identique au
+comportement observé dans Unity ⇒ modèle, pas runtime. `rollout_drift` (OK à
+0.46) ne le voyait pas : horizon court, seedé GT. Fixes livrés :
+(1) ré-orthonormalisation Gram-Schmidt normative de la frame bone avant push
+dans la fenêtre (`inference_contract.md` §3.6, Python + Unity + Unreal,
+parité) — validée sur le même bundle : validité 6D parfaite sur 400 frames ;
+restent yaw −6.4 rad / hauteur +1.4 m (biais modèle). (2) Option
+`rollout-loss-horizon` / `rollout-loss-weight` (défaut off) : fenêtre
+closed-loop par step d'optimiseur, feedback projeté — NB : le trainer
+generalization (profil full) ignorait `scheduledSampling` (teacher-forced
+pur), le run full_long n'a donc JAMAIS vu ses propres prédictions.
+(3) Contrat `cold_start_stability` (400 frames depuis T-pose ; OK<0.25,
+CRITICAL>1.0 ; full_long mesuré ≈1.4 = CRITICAL). Re-run à planifier :
+dataset ré-orienté (+ dossiers restants, 84k samples) + rollout loss active.

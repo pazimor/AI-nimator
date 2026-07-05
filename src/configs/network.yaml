@@ -88,6 +88,13 @@ controller_profiles:
       # A4 scheduled sampling: target probability, linearly ramped 0 → 0.3
       # over training (from scratch — no warm-start / --resume).
       scheduled-sampling: 0.3
+      # 2026-07-05 (fix divergence long-horizon, LOG du jour) : fenetre
+      # closed-loop par step d'optimiseur — le modele consomme ses propres
+      # predictions re-orthonormalisees (regime moteur). NB: le trainer
+      # generalization ignorait scheduled-sampling (teacher-forced pur) ;
+      # cette rollout loss est le vrai correctif d'exposure bias ici.
+      rollout-loss-horizon: 16
+      rollout-loss-weight: 1.0
       foot-contact-weight: 0.0
     text:
       # A6-bis: activate the integrated text encoder conditioning.
@@ -97,6 +104,96 @@ controller_profiles:
       # xlm_roberta_artifact is degenerate (cross-prompt cos ~0.998 —
       # prompts indistinguishable, diagnosed 2026-07-02); do not use it.
       # Supply the artifact at runtime via --encoder-artifact.
+      prompt-emb-channels: 512
+      cond-dropout-prob: 0.1
+      encoder-artifact-path: null
+
+  full-long:
+    # Long generalization run — scale-up of `full` (Pazimor, 2026-07-04).
+    # 1024 clips (vs 256) with capacity bumped per the capacity↔N law
+    # (ROADMAP_DETERMINIST §5 / A6): embed-dim 256→384, layers 4→6.
+    # G-RUNS: run a short capacity probe (same profile, epochs: 10)
+    # before committing to the 200-epoch run.
+    data:
+      num-clips: 1024
+      held-out-clips: 64
+      min-frames: 200
+      clip-batch-size: 8
+      eval-sample-clips: 32
+    arch:
+      embed-dim: 384
+      num-heads: 4
+      num-layers: 6
+      context-frames: 8
+      phase: none
+      aim-direction: false
+    training:
+      epochs: 200
+      learning-rate: 0.001
+      weight-decay: 0.0
+      seed: 0
+      device: auto
+      log-every: 50
+      scheduled-sampling: 0.3
+      # 2026-07-05 (fix divergence long-horizon, LOG du jour) : fenetre
+      # closed-loop par step d'optimiseur — le modele consomme ses propres
+      # predictions re-orthonormalisees (regime moteur). NB: le trainer
+      # generalization ignorait scheduled-sampling (teacher-forced pur) ;
+      # cette rollout loss est le vrai correctif d'exposure bias ici.
+      rollout-loss-horizon: 16
+      rollout-loss-weight: 1.0
+      foot-contact-weight: 0.0
+    text:
+      # Same text conditioning as `full` (canonical CLIP artifact,
+      # outputDim=512) — see the `full` profile comment for rationale.
+      prompt-emb-channels: 512
+      cond-dropout-prob: 0.1
+      encoder-artifact-path: null
+
+  locomotion:
+    # Locomotion-specialized generalization run (Pazimor, 2026-07-06).
+    # `full-long` diverges in long rollout (cold_start_stability=0.80,
+    # net yaw drift 201 deg / height 0.80 m over 400 frames) because (a)
+    # the 1024-clip pool is too heterogeneous (dance/gestures/sitting/...
+    # mixed with walking) and (b) rollout-loss-horizon=16 is too short
+    # for drift that develops over ~400 frames. This profile narrows the
+    # data to locomotion-only captions and quadruples the rollout-loss
+    # horizon. Same arch as `full-long` (capacity↔N law already
+    # validated there); caption-filter matches 15818 clips >= 200 frames
+    # in dataset_preprocessed (verified 2026-07-06), well above
+    # num-clips below.
+    data:
+      num-clips: 4096
+      held-out-clips: 256
+      min-frames: 200
+      clip-batch-size: 8
+      eval-sample-clips: 32
+      # Case-insensitive re.search over each clip's raw_text caption.
+      caption-filter: '\b(walk\w*|run\w*|jog\w*|strid\w*|march\w*|sprint\w*)\b'
+    arch:
+      embed-dim: 384
+      num-heads: 4
+      num-layers: 6
+      context-frames: 8
+      phase: none
+      aim-direction: false
+    training:
+      epochs: 200
+      learning-rate: 0.001
+      weight-decay: 0.0
+      seed: 0
+      device: auto
+      log-every: 50
+      scheduled-sampling: 0.3
+      # 2026-07-06: horizon quadrupled vs `full-long` (16 -> 64) to match
+      # the timescale of the observed drift (~400 frames) — the short
+      # horizon was undercorrecting exposure bias for long rollouts.
+      rollout-loss-horizon: 64
+      rollout-loss-weight: 1.0
+      foot-contact-weight: 0.0
+    text:
+      # Same text conditioning as `full` / `full-long` (canonical CLIP
+      # artifact, outputDim=512).
       prompt-emb-channels: 512
       cond-dropout-prob: 0.1
       encoder-artifact-path: null
