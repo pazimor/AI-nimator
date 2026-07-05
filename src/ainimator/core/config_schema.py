@@ -322,9 +322,17 @@ class ControllerTrainingSchema(BaseModel, extra="forbid", populate_by_name=True)
     scheduledSampling : float
         Scheduled-sampling target probability (ramped 0 → target in
         A4).  Stays ``0.0`` until short-rollout validation passes.
+    rolloutLossHorizon : int
+        ``> 0`` adds a closed-loop rollout-loss window of that many
+        transitions per optimizer step (2026-07-05 long-horizon
+        divergence fix).  ``0`` (default) disables it.
+    rolloutLossWeight : float
+        Weight of the rollout-loss term when ``rolloutLossHorizon > 0``.
     """
 
     scheduledSampling: float = Field(0.0, alias="scheduled-sampling")
+    rolloutLossHorizon: int = Field(0, alias="rollout-loss-horizon")
+    rolloutLossWeight: float = Field(1.0, alias="rollout-loss-weight")
 
     @field_validator("scheduledSampling")
     @classmethod
@@ -332,6 +340,22 @@ class ControllerTrainingSchema(BaseModel, extra="forbid", populate_by_name=True)
         """Scheduled-sampling probability must be a valid probability."""
         if not (0.0 <= value <= 1.0):
             raise ValueError("scheduled-sampling must be in [0, 1].")
+        return value
+
+    @field_validator("rolloutLossHorizon")
+    @classmethod
+    def _checkRolloutLossHorizon(cls, value: int) -> int:
+        """The rollout-loss horizon is a transition count (0 = off)."""
+        if value < 0:
+            raise ValueError("rollout-loss-horizon must be >= 0.")
+        return value
+
+    @field_validator("rolloutLossWeight")
+    @classmethod
+    def _checkRolloutLossWeight(cls, value: float) -> float:
+        """A negative rollout-loss weight would reward divergence."""
+        if value < 0.0:
+            raise ValueError("rollout-loss-weight must be >= 0.")
         return value
 
 
@@ -548,6 +572,11 @@ class ControllerProfileDataSchema(
         Clips per optimiser mini-batch for ``full`` profile.
     evalSampleClips : int
         Clips sampled for metrics evaluation in ``full`` profile.
+    captionFilter : str or None
+        Optional regex (case-insensitive, ``re.search``) applied to each
+        candidate clip's caption (``raw_text``); only matching clips are
+        eligible for selection (``full`` profile only).  ``None``
+        (default) disables filtering -- unchanged behaviour.
     """
 
     sampleIndex: int = Field(0, alias="sample-index")
@@ -556,6 +585,7 @@ class ControllerProfileDataSchema(
     heldOutClips: int = Field(32, alias="held-out-clips")
     clipBatchSize: int = Field(8, alias="clip-batch-size")
     evalSampleClips: int = Field(32, alias="eval-sample-clips")
+    captionFilter: Optional[str] = Field(None, alias="caption-filter")
 
 
 class ControllerProfileArchSchema(
@@ -608,6 +638,11 @@ class ControllerProfileTrainingSchema(
         Log a loss line every N epochs.
     scheduledSampling : float
         Target scheduled-sampling probability (A4, ``0`` = off).
+    rolloutLossHorizon : int
+        Closed-loop rollout-loss window length per optimizer step
+        (2026-07-05 divergence fix; ``0`` = off).
+    rolloutLossWeight : float
+        Weight of the rollout-loss term when the horizon is > 0.
     footContactWeight : float
         Anti-skating foot-contact loss weight (``0`` = off).
     """
@@ -619,7 +654,34 @@ class ControllerProfileTrainingSchema(
     device: str = "auto"
     logEvery: int = Field(50, alias="log-every")
     scheduledSampling: float = Field(0.0, alias="scheduled-sampling")
+    rolloutLossHorizon: int = Field(0, alias="rollout-loss-horizon")
+    rolloutLossWeight: float = Field(1.0, alias="rollout-loss-weight")
     footContactWeight: float = Field(0.0, alias="foot-contact-weight")
+
+
+class ControllerProfileTextSchema(
+    BaseModel, extra="forbid", populate_by_name=True
+):
+    """Text-conditioning knobs for a controller profile.
+
+    Attributes
+    ----------
+    promptEmbChannels : int
+        Width of the prompt embedding (must match text_encoder output-dim).
+        ``0`` disables text conditioning.
+    condDropoutProb : float
+        Probability of replacing a prompt embedding with the null embedding
+        during training (classifier-free conditioning dropout).
+    encoderArtifactPath : str or None
+        Path to the frozen encoder artifact directory.  ``None`` means the
+        path is supplied at runtime via ``--encoder-artifact``.
+    """
+
+    promptEmbChannels: int = Field(0, alias="prompt-emb-channels")
+    condDropoutProb: float = Field(0.1, alias="cond-dropout-prob")
+    encoderArtifactPath: Optional[str] = Field(
+        None, alias="encoder-artifact-path"
+    )
 
 
 class ControllerProfileSchema(
@@ -635,6 +697,8 @@ class ControllerProfileSchema(
         Architecture knobs.
     training : ControllerProfileTrainingSchema
         Training hyper-parameters.
+    text : ControllerProfileTextSchema
+        Text-conditioning knobs (``promptEmbChannels=0`` = off by default).
     """
 
     data: ControllerProfileDataSchema = ControllerProfileDataSchema()
@@ -642,6 +706,7 @@ class ControllerProfileSchema(
     training: ControllerProfileTrainingSchema = (
         ControllerProfileTrainingSchema()
     )
+    text: ControllerProfileTextSchema = ControllerProfileTextSchema()
 
 
 class V2TrainingConfigSchema(BaseModel, extra="forbid"):

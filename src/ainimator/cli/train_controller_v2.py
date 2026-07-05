@@ -27,6 +27,7 @@ import argparse
 import json
 import logging
 import random
+import re
 from pathlib import Path
 
 from ainimator.core.config_loader import (
@@ -140,24 +141,98 @@ def _loadDatasetSample(
     return sample.rotation6d, sample.rootTranslation, sample.rawText or ""
 
 
+def _loadCaptionsByTextId(
+    datasetRoot: Path, textIds: set[int]
+) -> dict[int, str]:
+    """Return ``{textId: raw_text}`` for the requested text ids only.
+
+    Reads ``manifest.json`` + ``text_index.json`` to resolve each
+    requested ``textId`` to its shard/offset, then loads every needed
+    text shard exactly once (grouped by shard index) rather than the
+    whole ``text_shards/`` directory.
+    """
+    import torch
+
+    manifest = json.loads(
+        (datasetRoot / "manifest.json").read_text(encoding="utf-8")
+    )
+    textIndexPath = datasetRoot / manifest.get(
+        "textIndexPath", "text_index.json"
+    )
+    textEntries = json.loads(textIndexPath.read_text(encoding="utf-8"))
+
+    neededByShard: dict[int, list[tuple[int, int]]] = {}
+    for position, entry in enumerate(textEntries):
+        textId = int(entry.get("textId", position))
+        if textId not in textIds:
+            continue
+        shardIndex = int(entry["shardIndex"])
+        shardOffset = int(entry["shardOffset"])
+        neededByShard.setdefault(shardIndex, []).append(
+            (textId, shardOffset)
+        )
+
+    captions: dict[int, str] = {}
+    for shardIndex, entries in neededByShard.items():
+        shardPath = datasetRoot / manifest["textShards"][shardIndex]["path"]
+        shard = torch.load(shardPath, map_location="cpu", weights_only=False)
+        for textId, shardOffset in entries:
+            captions[textId] = str(shard[shardOffset].get("raw_text", ""))
+    return captions
+
+
+def _filterLinksByCaption(
+    datasetRoot: Path,
+    links: list[dict[str, object]],
+    captionFilter: str,
+) -> list[dict[str, object]]:
+    """Keep only links whose caption matches ``captionFilter`` (regex).
+
+    The regex is matched case-insensitively against each link's
+    ``raw_text`` (resolved once via :func:`_loadCaptionsByTextId`).
+    """
+    pattern = re.compile(captionFilter, re.IGNORECASE)
+    textIds = {int(link["textId"]) for link in links}
+    captions = _loadCaptionsByTextId(datasetRoot, textIds)
+    return [
+        link
+        for link in links
+        if pattern.search(captions.get(int(link["textId"]), ""))
+    ]
+
+
 def _selectFullIndices(
     datasetRoot: Path,
     numClips: int,
     heldOutClips: int,
     minFrames: int,
     seed: int,
+    captionFilter: str | None = None,
 ) -> tuple[list[int], list[int]]:
-    """Deterministic train / held-out split for the ``full`` profile."""
+    """Deterministic train / held-out split for the ``full`` profile.
+
+    Parameters
+    ----------
+    captionFilter : str or None
+        Optional regex (case-insensitive, ``re.search``) applied to each
+        candidate clip's caption (``raw_text``).  Clips whose caption
+        does not match are excluded before the frame-count sort and
+        ``numClips`` truncation.  ``None`` disables filtering (default,
+        unchanged behaviour for the ``full`` / ``full-long`` profiles).
+    """
     linkIndexPath = datasetRoot / "link_index.json"
     links = json.loads(linkIndexPath.read_text(encoding="utf-8"))
     eligible = [
         link for link in links if link["frames"] >= minFrames
     ]
+    if captionFilter:
+        eligible = _filterLinksByCaption(datasetRoot, eligible, captionFilter)
     eligible.sort(key=lambda link: link["frames"], reverse=True)
     chosen = [int(link["linkId"]) for link in eligible[:numClips]]
     if len(chosen) < heldOutClips + 2:
         raise SystemExit(
-            f"Only {len(chosen)} clips with >= {minFrames} frames; "
+            f"Only {len(chosen)} clips with >= {minFrames} frames"
+            f"{' matching caption-filter' if captionFilter else ''}; "
             f"need >= held-out ({heldOutClips}) + 2 train clips."
         )
     random.Random(seed).shuffle(chosen)
@@ -255,6 +330,7 @@ def _runFull(args: argparse.Namespace, datasetRoot: Path) -> None:
         data.heldOutClips,
         data.minFrames,
         training.seed,
+        captionFilter=data.captionFilter,
     )
     LOGGER.info(
         "Split: %d train / %d held-out clips",
