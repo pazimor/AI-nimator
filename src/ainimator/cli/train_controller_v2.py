@@ -43,7 +43,9 @@ from ainimator.training.controller_training_v2 import (
 LOGGER = logging.getLogger("ainimator.cli.train_controller_v2")
 
 _OVERFIT_PROFILES = ("overfit", "debug", "controller_text")
-_FULL_PROFILE = "full"
+#: Any profile not in :data:`_OVERFIT_PROFILES` is dispatched to the
+#: generalization (train/held-out) loop and trained *as named* (``full``,
+#: ``full-long``, …) -- see :func:`_runFull`.
 
 
 def _parseArgs() -> argparse.Namespace:
@@ -216,6 +218,8 @@ def _runOverfit(
             footContact=training.footContactWeight,
         ),
         scheduledSampling=training.scheduledSampling,
+        rolloutLossHorizon=training.rolloutLossHorizon,
+        rolloutLossWeight=training.rolloutLossWeight,
         resumeCheckpoint=args.resume,
         promptEmbChannels=text.promptEmbChannels,
         condDropoutProb=text.condDropoutProb,
@@ -235,7 +239,11 @@ def _runFull(args: argparse.Namespace, datasetRoot: Path) -> None:
         runControllerGeneralization,
     )
 
-    profile = loadControllerProfile(_FULL_PROFILE, args.config)
+    # Honour the requested profile (e.g. ``full-long``).  Previously this
+    # loaded a hard-coded ``"full"`` unconditionally, so ``--profile
+    # full-long`` silently trained ``full`` (smaller arch, and — before the
+    # rollout-loss field existed — no exposure-bias correction at all).
+    profile = loadControllerProfile(args.profile, args.config)
     arch = profile.arch
     training = profile.training
     data = profile.data
@@ -280,6 +288,8 @@ def _runFull(args: argparse.Namespace, datasetRoot: Path) -> None:
             footContact=training.footContactWeight,
         ),
         scheduledSampling=training.scheduledSampling,
+        rolloutLossHorizon=training.rolloutLossHorizon,
+        rolloutLossWeight=training.rolloutLossWeight,
         resumeCheckpoint=args.resume,
         promptEmbChannels=text.promptEmbChannels,
         condDropoutProb=text.condDropoutProb,
