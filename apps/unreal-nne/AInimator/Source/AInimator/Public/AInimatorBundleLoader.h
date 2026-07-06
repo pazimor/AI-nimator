@@ -53,6 +53,13 @@ private:
 		const FString& ManifestPath,
 		FAInimatorManifest& OutManifest);
 
+	/** Parses the optional B7 `text_encoder` manifest section
+	 *  (apps/spec/text_encoding.md §1); returns false when the section
+	 *  is present but malformed (fail-fast). */
+	static bool LoadTextEncoderSection(
+		const TSharedPtr<class FJsonObject>& Section,
+		struct FAInimatorTextEncoderManifest& OutTextEncoder);
+
 	static bool LoadNormStats(
 		const FString& NormStatsPath,
 		const FAInimatorManifest& Manifest,

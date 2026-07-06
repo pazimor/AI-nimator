@@ -45,7 +45,9 @@ apps/unity-sentis/
     │                              InputBindingResolver, FootContactDetector, TwoBoneIkSolver,
     │                              SmplForwardKinematics, FootLockIk, IdleMoveBlender, FootSlidingMetric,
     │                              RigRetargeter, RigScale, RigMap/RigMapAutoMapper, PromptCrossFader)
-    └── Samples~/ControllerDemo/   WASD capsule demo (no IK, no skinning — B1 scope)
+    ├── Samples~/ControllerDemo/   WASD capsule demo (no IK, no skinning — B1 scope)
+    └── Samples~/RigDemo/          drag-and-drop RigDemo.prefab: procedural SMPL-22 mannequin driven
+                                   through RigBinder/RigMap + hot prompt swap (B3-bis scope; see its README)
 ```
 
 ## Installing the package
@@ -97,6 +99,14 @@ orchestrator. Until that orchestrator exists, pose a bundle manually:
    This path is `AInimator.Controller.Bundle.BundlePaths.DefaultBundleDirectory`
    (`Application.streamingAssetsPath/AInimatorBundle`), read by
    `BundleLoader.Load` at runtime.
+
+   > **`.sentis` conversion is automatic.** Sentis 2.x cannot parse a raw
+   > `.onnx` at runtime; the Editor generates `controller.sentis` (and
+   > `text_encoder.sentis` when present) next to the `.onnx` after the next
+   > domain reload (`BundleSentisConverter`, `[InitializeOnLoadMethod]`),
+   > or on demand via **AInimator > Convert Bundle ONNX to Sentis
+   > (StreamingAssets)**. `BundleLoader` prefers the `.sentis` when it
+   > exists; the `.onnx` stays in the bundle for the Unreal/NNE runtime.
 3. **Never commit this folder.** `apps/unity-sentis/.gitignore` (and the
    repo root `.gitignore`, which blanket-ignores `*.onnx`) exclude it.
 
@@ -132,6 +142,22 @@ incompatible `bundle_version`, wrong frozen dims (`state_channels`,
    sufficient for the B1 acceptance criteria (fps + trajectory parity + no
    NaN over a 60 s rollout). Wiring the full 22-bone pose onto a skinned
    humanoid rig is a natural follow-up sample, not required here.
+
+## Running the rig demo (B3-bis, drag-and-drop)
+
+Import the **Rig Demo (B3-bis)** sample from the package's Package Manager
+entry, drop `RigDemo.prefab` into an empty scene, press Play: it builds a
+procedural SMPL-22 stick-figure mannequin driven through
+`AInimatorCharacter` → `RigBinder`/`RigMap`, with WASD/ZQSD/arrow movement,
+`1..9` hot prompt swap (embedding cross-fade), `0` clear-prompt, a free-text
+prompt field (B7) and a text-command field (B6). Everything is generated at
+Play time — the prefab is intentionally empty in edit mode. Assign your own
+rigged character instance (Mixamo/Humanoid FBX, rest pose) to the prefab's
+**Custom Rig Root** field to drive it instead of the mannequin (bones
+auto-mapped by name via `RigMapAutoMapping`, the FBX's Animator disabled).
+Full setup steps (including copying the bundle to
+`Assets/StreamingAssets/AInimatorBundle/`) are in the sample's own
+`README.md`.
 
 ## Runtime architecture (mirrors `ROADMAP_PLUGINS.md` §3.3)
 

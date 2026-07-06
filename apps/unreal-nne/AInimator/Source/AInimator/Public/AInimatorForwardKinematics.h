@@ -56,6 +56,36 @@ namespace AInimatorForwardKinematics
 	}
 
 	/**
+	 * Project every bone's accumulated 6D rotation back onto the
+	 * manifold of valid representations, in place: the same
+	 * Gram-Schmidt as SixDToRotationMatrix, keeping (b1, b2) as the new
+	 * 6D value. Normative rollout step (apps/spec/inference_contract.md
+	 * §3.6, parity with the Python reference orthonormalizeRot6d and
+	 * the Unity runtime): applied to the accumulated bone frame BEFORE
+	 * it enters the state window — without it, long rollouts drift
+	 * off-manifold and the pose degenerates. Idempotent on valid 6D.
+	 */
+	inline void OrthonormalizeFrame(TArray<float>& BoneFrame)
+	{
+		for (int32 Offset = 0; Offset + 6 <= BoneFrame.Num(); Offset += 6)
+		{
+			const FVector A1(BoneFrame[Offset], BoneFrame[Offset + 1], BoneFrame[Offset + 2]);
+			const FVector A2(BoneFrame[Offset + 3], BoneFrame[Offset + 4], BoneFrame[Offset + 5]);
+
+			const FVector B1 = A1.GetSafeNormal();
+			const float Dot = FVector::DotProduct(B1, A2);
+			const FVector B2 = (A2 - Dot * B1).GetSafeNormal();
+
+			BoneFrame[Offset] = static_cast<float>(B1.X);
+			BoneFrame[Offset + 1] = static_cast<float>(B1.Y);
+			BoneFrame[Offset + 2] = static_cast<float>(B1.Z);
+			BoneFrame[Offset + 3] = static_cast<float>(B2.X);
+			BoneFrame[Offset + 4] = static_cast<float>(B2.Y);
+			BoneFrame[Offset + 5] = static_cast<float>(B2.Z);
+		}
+	}
+
+	/**
 	 * Compute root-local global rotations and positions for every bone
 	 * in BoneFrame (row-major, NumBones * 6), following
 	 * AInimatorSmpl22Skeleton::ParentIndices / BoneOffsets. Both output

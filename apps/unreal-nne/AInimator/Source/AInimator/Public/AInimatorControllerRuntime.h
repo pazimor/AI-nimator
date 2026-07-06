@@ -98,6 +98,23 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "AInimator|Runtime")
 	bool SetPromptEmbedding(const TArray<float>& PromptEmbedding);
 
+	/**
+	 * B7 (`apps/spec/text_encoding.md` §3): encodes free-text Text with
+	 * the bundle's in-engine text encoder (`text_encoder.onnx` +
+	 * `tokenizer/`, A7.1 bundles) into OutEmbedding — the value-parity
+	 * twin of Unity's PromptTextEncoder. Does NOT apply the embedding:
+	 * callers (UAInimatorCharacterComponent::SetPromptText) feed it
+	 * through the normal SetPromptEmbedding / cross-fade path.
+	 *
+	 * ⚠ Distinct from SetTextCommand (B6, low-level control vector):
+	 * this drives the high-level prompt channel.
+	 *
+	 * Returns false (logged, never a silent fallback) when the bundle
+	 * ships no text encoder (A7.0 / exported without --encoder-artifact)
+	 * or the encode fails; OutEmbedding is untouched then.
+	 */
+	bool EncodePromptText(const FString& Text, TArray<float>& OutEmbedding);
+
 	/** The prompt embedding currently fed to the model every Tick() —
 	 *  either an explicit embedding set via SetPromptEmbedding/SetPreset,
 	 *  or the bundle's learned null embedding by default (never zeros,
@@ -178,6 +195,14 @@ private:
 	FAInimatorNormStats NormStats;
 	TUniquePtr<FNormalizer> Normalizer;
 	TUniquePtr<FStateBuffer> StateBuffer;
+
+	/** Bundle directory of the last successful LoadBundle — needed to
+	 *  lazily initialize the B7 prompt text encoder. */
+	FString LoadedBundleDirectory;
+
+	/** Lazily-built in-engine prompt encoder (B7) — only when the
+	 *  bundle ships text_encoder.onnx + tokenizer/ (A7.1+). */
+	TUniquePtr<class FAInimatorPromptTextEncoder> PromptTextEncoder;
 
 	/** Model asset + instance. TObjectPtr keeps the model data alive
 	 *  for the lifetime of this runtime; the instance is created once

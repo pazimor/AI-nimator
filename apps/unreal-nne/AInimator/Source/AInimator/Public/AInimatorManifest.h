@@ -6,6 +6,59 @@
 #include "AInimatorManifest.generated.h"
 
 /**
+ * Optional `text_encoder` manifest section (Goal B phase B7, bundle
+ * A7.1+, `apps/spec/text_encoding.md` §1): the pooled encoder ONNX
+ * file plus its paired CLIP BPE tokenizer assets. Absent (bIsPresent
+ * == false) on embeddings-only bundles (A7.0 behaviour).
+ */
+USTRUCT(BlueprintType)
+struct AINIMATOR_API FAInimatorTextEncoderManifest
+{
+	GENERATED_BODY()
+
+	/** Relative path of the encoder graph ("text_encoder.onnx"). */
+	UPROPERTY(BlueprintReadOnly, Category = "AInimator|Manifest")
+	FString File;
+
+	/** Tokenizer type — this plugin implements "clip-bpe" only. */
+	UPROPERTY(BlueprintReadOnly, Category = "AInimator|Manifest")
+	FString TokenizerType;
+
+	/** Relative path of the verbatim HF vocab.json. */
+	UPROPERTY(BlueprintReadOnly, Category = "AInimator|Manifest")
+	FString TokenizerVocab;
+
+	/** Relative path of the verbatim HF merges.txt. */
+	UPROPERTY(BlueprintReadOnly, Category = "AInimator|Manifest")
+	FString TokenizerMerges;
+
+	/** Fixed token budget of the encoder graph's sequence axis. */
+	UPROPERTY(BlueprintReadOnly, Category = "AInimator|Manifest")
+	int32 MaxLength = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "AInimator|Manifest")
+	int32 BosId = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "AInimator|Manifest")
+	int32 EosId = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "AInimator|Manifest")
+	int32 PadId = 0;
+
+	/** Pooling baked into the graph — "masked_mean" expected. */
+	UPROPERTY(BlueprintReadOnly, Category = "AInimator|Manifest")
+	FString Pooling;
+
+	/** Output width; must equal the manifest's PromptEmbChannels. */
+	UPROPERTY(BlueprintReadOnly, Category = "AInimator|Manifest")
+	int32 EmbeddingChannels = 0;
+
+	/** True when the section was present in manifest.json. */
+	UPROPERTY(BlueprintReadOnly, Category = "AInimator|Manifest")
+	bool bIsPresent = false;
+};
+
+/**
  * Plain data mirror of manifest.json (apps/spec/manifest.schema.json).
  *
  * Deliberately NOT a UDataAsset: the manifest is parsed fresh from the
@@ -67,6 +120,13 @@ struct AINIMATOR_API FAInimatorManifest
 
 	UPROPERTY(BlueprintReadOnly, Category = "AInimator|Manifest")
 	TArray<FString> ReservedInputGroups;
+
+	/** Optional in-engine text encoder (B7, A7.1+) — see the struct doc. */
+	UPROPERTY(BlueprintReadOnly, Category = "AInimator|Manifest")
+	FAInimatorTextEncoderManifest TextEncoder;
+
+	/** True when the bundle ships an in-engine text encoder. */
+	bool HasTextEncoder() const { return TextEncoder.bIsPresent; }
 
 	/** True once all required fields were present and parsed. */
 	bool bIsFullyParsed = false;

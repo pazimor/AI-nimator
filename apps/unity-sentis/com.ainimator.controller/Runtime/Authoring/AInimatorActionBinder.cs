@@ -192,7 +192,7 @@ namespace AInimator.Controller.Authoring
         /// </summary>
         private ControlPreset ResolveActivePreset()
         {
-            var boundPreset = InputBindingResolver.Resolve(bindings, Input.GetKey, null);
+            var boundPreset = InputBindingResolver.Resolve(bindings, KeyInput.GetKey, null);
             if (boundPreset != null)
             {
                 return boundPreset;

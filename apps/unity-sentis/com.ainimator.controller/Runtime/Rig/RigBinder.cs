@@ -137,7 +137,7 @@ namespace AInimator.Controller.Rig
 
             var numBones = Smpl22Skeleton.NumBones;
             SmplForwardKinematics.ComputeJointPositions(
-                correctedBoneFrame, numBones, _smplGlobalRotationsScratch, _smplGlobalPositionsScratch);
+                boneFrame, numBones, _smplGlobalRotationsScratch, _smplGlobalPositionsScratch);
 
             RigRetargeter.RetargetFrame(
                 _smplGlobalRotationsScratch,

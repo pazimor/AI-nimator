@@ -4,7 +4,9 @@
 #include "AInimatorLog.h"
 #include "AInimatorContractConstants.h"
 #include "AInimatorBundleLoader.h"
+#include "AInimatorForwardKinematics.h"
 #include "AInimatorPresetLoader.h"
+#include "AInimatorPromptTextEncoder.h"
 #include "AInimatorRootLocalMath.h"
 #include "AInimatorTextToControlResolver.h"
 #include "Misc/Paths.h"
@@ -69,8 +71,53 @@ bool UAInimatorControllerRuntime::LoadBundle(const FString& BundleDirectory)
 	// never has to special-case "no prompt selected yet".
 	CurrentPromptEmb = NormStats.PromptNullEmb;
 
+	// Remembered for the lazy B7 prompt-encoder init (EncodePromptText).
+	LoadedBundleDirectory = BundleDirectory;
+
 	bIsLoaded = true;
 	return true;
+}
+
+bool UAInimatorControllerRuntime::EncodePromptText(
+	const FString& Text,
+	TArray<float>& OutEmbedding)
+{
+	if (!bIsLoaded)
+	{
+		UE_LOG(LogAInimator, Error,
+			TEXT("AInimator: EncodePromptText called with no loaded bundle."));
+		return false;
+	}
+	if (Manifest.PromptEmbChannels <= 0)
+	{
+		UE_LOG(LogAInimator, Warning,
+			TEXT("AInimator: EncodePromptText — bundle declares ")
+			TEXT("prompt_emb_channels == 0; prompt-at-runtime is unavailable."));
+		return false;
+	}
+	if (!Manifest.HasTextEncoder())
+	{
+		UE_LOG(LogAInimator, Warning,
+			TEXT("AInimator: EncodePromptText — bundle ships no ")
+			TEXT("text_encoder.onnx (A7.0 bundle, or exported without ")
+			TEXT("--encoder-artifact). Re-export with the encoder artifact ")
+			TEXT("(text_encoding.md §1) or use SetPromptEmbedding with a ")
+			TEXT("precomputed embedding; keeping the current prompt."));
+		return false;
+	}
+
+	if (!PromptTextEncoder.IsValid())
+	{
+		TUniquePtr<FAInimatorPromptTextEncoder> Encoder =
+			MakeUnique<FAInimatorPromptTextEncoder>();
+		if (!Encoder->Init(LoadedBundleDirectory, Manifest.TextEncoder))
+		{
+			return false; // Encoder already logged the specific reason.
+		}
+		PromptTextEncoder = MoveTemp(Encoder);
+	}
+
+	return PromptTextEncoder->EncodePrompt(Text, OutEmbedding);
 }
 
 bool UAInimatorControllerRuntime::InitializeModel(const FString& OnnxPath)
@@ -178,6 +225,8 @@ void UAInimatorControllerRuntime::ResetRuntimeState()
 	StateBuffer.Reset();
 	ModelInstance.Reset();
 	ModelData = nullptr;
+	PromptTextEncoder.Reset();
+	LoadedBundleDirectory.Reset();
 	BundledPresets.Reset();
 	CurrentRawControl.Reset();
 	CurrentPromptEmb.Reset();
@@ -352,6 +401,11 @@ bool UAInimatorControllerRuntime::Tick()
 	{
 		NextBoneFrame[Index] = LastBoneFrame[Index] + RawBoneDelta[Index];
 	}
+
+	// Normative re-orthonormalization (inference_contract.md §3.6): keep
+	// the accumulated state on the rotation manifold before it re-enters
+	// the window (parity with the Python reference loop and Unity).
+	AInimatorForwardKinematics::OrthonormalizeFrame(NextBoneFrame);
 
 	IntegrateRootLocalDelta(RawGlobalDelta);
 

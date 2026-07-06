@@ -1,0 +1,17 @@
+{
+  "name": "AInimator.Controller.Samples.RigDemo",
+  "rootNamespace": "AInimator.Controller.Samples.RigDemo",
+  "references": [
+    "AInimator.Controller.Runtime",
+    "Unity.InferenceEngine"
+  ],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": false,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}

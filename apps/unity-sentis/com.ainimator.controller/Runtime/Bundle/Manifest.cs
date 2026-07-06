@@ -30,6 +30,7 @@ namespace AInimator.Controller.Bundle
         public string coord_system = "";
         public string normalization_note = "";
         public List<string> reserved_input_groups = new();
+        public TextEncoderSection text_encoder = new();
 
         /// <summary>True when the manifest declares an aim (2D) channel pair.</summary>
         public bool HasAim => control_channels == 4;
@@ -39,5 +40,39 @@ namespace AInimator.Controller.Bundle
 
         /// <summary>True when the bundle expects a <c>(cos, sin)</c> phase ONNX input.</summary>
         public bool HasPhase => phase_channels == 2;
+
+        /// <summary>
+        /// True when the bundle ships an in-engine text encoder (B7 /
+        /// A7.1+, <c>apps/spec/text_encoding.md</c> §1). The section is
+        /// optional in the schema; JsonUtility leaves the default (empty
+        /// <c>file</c>) when the key is absent.
+        /// </summary>
+        public bool HasTextEncoder => !string.IsNullOrEmpty(text_encoder?.file);
+
+        /// <summary>
+        /// Optional <c>text_encoder</c> manifest section (B7): the pooled
+        /// encoder ONNX file plus its paired CLIP BPE tokenizer assets.
+        /// </summary>
+        [Serializable]
+        public sealed class TextEncoderSection
+        {
+            public string file = "";
+            public TokenizerSection tokenizer = new();
+            public string pooling = "";
+            public int embedding_channels;
+        }
+
+        /// <summary>Tokenizer sub-section of <see cref="TextEncoderSection"/>.</summary>
+        [Serializable]
+        public sealed class TokenizerSection
+        {
+            public string type = "";
+            public string vocab = "";
+            public string merges = "";
+            public int max_length;
+            public int bos_id;
+            public int eos_id;
+            public int pad_id;
+        }
     }
 }

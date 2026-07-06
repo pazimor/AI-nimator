@@ -16,13 +16,18 @@
     "name": "AI-nimator project"
   },
   "dependencies": {
-    "com.unity.sentis": "1.6.0"
+    "com.unity.ai.inference": "2.6.1"
   },
   "samples": [
     {
       "displayName": "Controller Demo (WASD capsule)",
       "description": "A capsule driven by WASD -> ControlPreset bindings (forward/backward/strafe/idle), no IK. Drop CapsuleDemoBootstrap into an empty scene and press Play; it self-configures a capsule + ground + camera and loads the bundle from StreamingAssets/AInimatorBundle.",
       "path": "Samples~/ControllerDemo"
+    },
+    {
+      "displayName": "Rig Demo (B3-bis)",
+      "description": "Drag-and-drop RigDemo.prefab into an empty scene and press Play: a procedural SMPL-22 stick-figure mannequin driven through RigBinder/RigMap (B3-bis), WASD/ZQSD movement presets, 1..9 hot prompt swap (embedding cross-fade), free-text prompt (B7) and text commands (B6). See the sample README for bundle setup.",
+      "path": "Samples~/RigDemo"
     }
   ]
 }

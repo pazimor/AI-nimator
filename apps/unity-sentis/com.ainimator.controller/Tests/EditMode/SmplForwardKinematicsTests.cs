@@ -105,5 +105,43 @@ namespace AInimator.Controller.Tests
             Assert.Throws<System.ArgumentException>(() =>
                 SmplForwardKinematics.ComputeJointPositions(badFrame, NumBones, rotations, positions));
         }
+
+        [Test]
+        public void OrthonormalizeFrame_IsNoOpOnValidRotations()
+        {
+            var frame = IdentityBoneFrame();
+            var expected = (float[])frame.Clone();
+
+            SmplForwardKinematics.OrthonormalizeFrame(frame);
+
+            for (var i = 0; i < frame.Length; i++)
+            {
+                Assert.That(frame[i], Is.EqualTo(expected[i]).Within(1e-6f));
+            }
+        }
+
+        [Test]
+        public void OrthonormalizeFrame_RestoresOrthonormalityOfDriftedInput()
+        {
+            // Drifted 6D: scaled + skewed away from an orthonormal pair,
+            // like an accumulated-delta state after many rollout steps.
+            var frame = IdentityBoneFrame();
+            for (var i = 0; i < frame.Length; i++)
+            {
+                frame[i] = frame[i] * 1.7f + 0.23f * ((i * 37 % 11) - 5) / 5f;
+            }
+
+            SmplForwardKinematics.OrthonormalizeFrame(frame);
+
+            for (var bone = 0; bone < NumBones; bone++)
+            {
+                var offset = bone * Smpl22Skeleton.RotationChannelsPerBone;
+                var b1 = new Vector3(frame[offset], frame[offset + 1], frame[offset + 2]);
+                var b2 = new Vector3(frame[offset + 3], frame[offset + 4], frame[offset + 5]);
+                Assert.That(b1.magnitude, Is.EqualTo(1f).Within(1e-5f), $"|b1| bone {bone}");
+                Assert.That(b2.magnitude, Is.EqualTo(1f).Within(1e-5f), $"|b2| bone {bone}");
+                Assert.That(Vector3.Dot(b1, b2), Is.EqualTo(0f).Within(1e-5f), $"b1.b2 bone {bone}");
+            }
+        }
     }
 }

@@ -2,7 +2,8 @@ using System;
 using AInimator.Controller.Bundle;
 using AInimator.Controller.Presets;
 using AInimator.Controller.Prompting;
-using Unity.Sentis;
+using AInimator.Controller.TextEncoding;
+using Unity.InferenceEngine;
 using UnityEngine;
 
 namespace AInimator.Controller.Runtime
@@ -49,6 +50,10 @@ namespace AInimator.Controller.Runtime
         private readonly float[] _promptEmbScratch;
         private readonly float[] _activePromptOverride;
         private bool _hasActivePromptOverride;
+
+        // Lazily-built in-engine prompt encoder (B7) — only when the
+        // bundle ships text_encoder.onnx + tokenizer/ (A7.1+).
+        private PromptTextEncoder _promptTextEncoder;
 
         public Manifest Manifest => _runtime.Manifest;
         public ControllerBundle Bundle { get; }
@@ -109,6 +114,26 @@ namespace AInimator.Controller.Runtime
             }
         }
 
+        /// <summary>
+        /// Canonical rest-pose seed frame: rotation6d identity
+        /// <c>(1,0,0,0,1,0)</c> for every bone — a valid rotation (the
+        /// all-zero placeholder is degenerate: Gram-Schmidt of zero vectors
+        /// yields a zero matrix). Matches the Unreal runtime's
+        /// <c>InitializeSeedState</c> exactly (Goal B parity, verite #7).
+        /// </summary>
+        public static float[] CreateRestPoseSeed(Manifest manifest)
+        {
+            var channels = manifest.rotation_channels_per_bone;
+            var seed = new float[manifest.num_bones * channels];
+            for (var bone = 0; bone < manifest.num_bones; bone++)
+            {
+                seed[bone * channels + 0] = 1f;
+                seed[bone * channels + 4] = 1f;
+            }
+
+            return seed;
+        }
+
         /// <summary>Cross-fade duration (seconds) applied by <see cref="SetPrompt"/>/<see cref="SetPromptEmbedding"/>/<see cref="ClearPrompt"/> (default 0.3s, spec §3).</summary>
         public float PromptCrossFadeSeconds
         {
@@ -165,6 +190,46 @@ namespace AInimator.Controller.Runtime
             _hasActivePromptOverride = true;
             Span<float> current = stackalloc float[_promptEmbScratch.Length];
             _promptCrossFader.BeginFadeTo(_activePromptOverride, current);
+        }
+
+        /// <summary>
+        /// Encode <paramref name="text"/> with the bundle's in-engine text
+        /// encoder (Goal B phase B7, <c>apps/spec/text_encoding.md</c> §3)
+        /// and begin cross-fading toward the resulting embedding — the SAME
+        /// path as <see cref="SetPromptEmbedding"/>, invisible to the user.
+        /// </summary>
+        /// <returns>
+        /// <c>true</c> when the prompt was encoded and applied; <c>false</c>
+        /// (with an explicit warning, never a silent fallback) when the
+        /// bundle ships no text encoder (A7.0 / exported without
+        /// <c>--encoder-artifact</c>) or declares no prompt channel. The
+        /// currently active prompt is preserved on failure.
+        /// </returns>
+        public bool SetPromptText(string text)
+        {
+            if (!Manifest.HasPrompt)
+            {
+                Debug.LogWarning(
+                    "SetPromptText: bundle declares prompt_emb_channels == 0 — " +
+                    "prompt-at-runtime is unavailable; keeping the current control state.");
+                return false;
+            }
+
+            if (!Bundle.HasTextEncoder)
+            {
+                Debug.LogWarning(
+                    "SetPromptText: bundle ships no text_encoder.onnx (A7.0 bundle, or exported " +
+                    "without --encoder-artifact) — re-export the bundle with the encoder artifact " +
+                    "(text_encoding.md §1) or use SetPrompt/SetPromptEmbedding with precomputed " +
+                    "embeddings; keeping the current prompt.");
+                return false;
+            }
+
+            _promptTextEncoder ??= new PromptTextEncoder(Bundle);
+            Span<float> embedding = stackalloc float[Manifest.prompt_emb_channels];
+            _promptTextEncoder.Encode(text, embedding);
+            SetPromptEmbedding(embedding);
+            return true;
         }
 
         /// <summary>
@@ -237,6 +302,11 @@ namespace AInimator.Controller.Runtime
                 _rawBoneFrameScratch[i] += _rawBoneDeltaScratch[i];
             }
 
+            // Normative re-orthonormalization (inference_contract.md §3.6):
+            // keep the accumulated state on the rotation manifold before it
+            // re-enters the window (parity with the Python reference loop).
+            PostProcess.SmplForwardKinematics.OrthonormalizeFrame(_rawBoneFrameScratch);
+
             _rootMotion.Integrate(_rawGlobalDeltaScratch);
             _stateBuffer.Push(_rawBoneFrameScratch, _rawGlobalDeltaScratch);
 
@@ -278,6 +348,7 @@ namespace AInimator.Controller.Runtime
 
         public void Dispose()
         {
+            _promptTextEncoder?.Dispose();
             _runtime.Dispose();
         }
     }

@@ -1,7 +1,7 @@
 using System;
 using AInimator.Controller.Bundle;
 using AInimator.Controller.Normalization;
-using Unity.Sentis;
+using Unity.InferenceEngine;
 
 namespace AInimator.Controller.Runtime
 {
@@ -86,7 +86,16 @@ namespace AInimator.Controller.Runtime
             _manifest = bundle.Manifest;
             _normalizer = new Normalizer(bundle.NormStats, bundle.Manifest);
 
-            _model = ModelLoader.Load(bundle.OnnxModelBytes);
+            // Sentis 2.x has no ModelLoader.Load(byte[]) overload — only
+            // Stream/string/ModelAsset. Wrap the bundle bytes in a stream.
+            // NOTE: the bytes must be a *serialized Sentis model* (.sentis);
+            // Sentis 2.x cannot parse a raw .onnx at runtime (see README /
+            // BundleLoader — the bundle model must be pre-converted to .sentis).
+            using (var modelStream = new System.IO.MemoryStream(bundle.OnnxModelBytes))
+            {
+                _model = ModelLoader.Load(modelStream);
+            }
+
             _worker = new Worker(_model, backendType);
 
             var boneWindowLen = _manifest.context_frames * _normalizer.BoneFrameLength;
@@ -279,8 +288,11 @@ namespace AInimator.Controller.Runtime
                     "check the loaded controller.onnx output names against the contract.");
             }
 
-            boneDeltaOut.DownloadToArray(_rawBoneDeltaScratch);
-            globalDeltaOut.DownloadToArray(_rawGlobalDeltaScratch);
+            // Sentis 2.x: DownloadToArray() takes no argument and RETURNS a
+            // fresh float[] (blocking readback from GPU included). Copy into
+            // the reused scratch buffers to keep the decode signature.
+            Array.Copy(boneDeltaOut.DownloadToArray(), _rawBoneDeltaScratch, _rawBoneDeltaScratch.Length);
+            Array.Copy(globalDeltaOut.DownloadToArray(), _rawGlobalDeltaScratch, _rawGlobalDeltaScratch.Length);
 
             _normalizer.DecodeBoneDelta(_rawBoneDeltaScratch, rawBoneDelta);
             _normalizer.DecodeGlobalDelta(_rawGlobalDeltaScratch, rawGlobalDelta);

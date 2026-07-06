@@ -74,4 +74,42 @@ bool FAInimatorForwardKinematicsSixDNormalizesNonOrthonormalInputTest::RunTest(c
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FAInimatorForwardKinematicsOrthonormalizeFrameTest,
+	"AInimator.ForwardKinematics.OrthonormalizeFrameProjectsAndIsIdempotent",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilterMask)
+
+bool FAInimatorForwardKinematicsOrthonormalizeFrameTest::RunTest(const FString& Parameters)
+{
+	// Two bones: one already-valid identity 6D (must be a numeric no-op,
+	// inference_contract.md section 3.6), one drifted off-manifold (must come
+	// back to an orthonormal pair).
+	TArray<float> Frame = {
+		1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f,
+		1.7f, 0.2f, -0.4f, 0.9f, 1.3f, 0.1f,
+	};
+	AInimatorForwardKinematics::OrthonormalizeFrame(Frame);
+
+	TestTrue(TEXT("Valid identity 6D is unchanged"),
+		FMath::IsNearlyEqual(Frame[0], 1.0f, 1e-5f) &&
+		FMath::IsNearlyZero(Frame[1], 1e-5f) &&
+		FMath::IsNearlyEqual(Frame[4], 1.0f, 1e-5f));
+
+	const FVector B1(Frame[6], Frame[7], Frame[8]);
+	const FVector B2(Frame[9], Frame[10], Frame[11]);
+	TestTrue(TEXT("Drifted b1 is unit length"), FMath::IsNearlyEqual(B1.Size(), 1.0f, 1e-4f));
+	TestTrue(TEXT("Drifted b2 is unit length"), FMath::IsNearlyEqual(B2.Size(), 1.0f, 1e-4f));
+	TestTrue(TEXT("Drifted b1/b2 are orthogonal"),
+		FMath::IsNearlyZero(FVector::DotProduct(B1, B2), 1e-4f));
+
+	TArray<float> Reprojected = Frame;
+	AInimatorForwardKinematics::OrthonormalizeFrame(Reprojected);
+	for (int32 Index = 0; Index < Frame.Num(); ++Index)
+	{
+		TestTrue(TEXT("Projection is idempotent"),
+			FMath::IsNearlyEqual(Frame[Index], Reprojected[Index], 1e-5f));
+	}
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

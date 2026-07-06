@@ -2,7 +2,8 @@
   "name": "AInimator.Controller.Editor",
   "rootNamespace": "AInimator.Controller.Editor",
   "references": [
-    "AInimator.Controller.Runtime"
+    "AInimator.Controller.Runtime",
+    "Unity.InferenceEngine"
   ],
   "includePlatforms": [
     "Editor"

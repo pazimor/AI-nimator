@@ -42,7 +42,7 @@ namespace AInimator.Controller.Authoring
         [Tooltip("Optional: override the bundle directory. Defaults to BundlePaths.DefaultBundleDirectory.")]
         [SerializeField] private string bundleDirectoryOverride;
 
-        [Tooltip("Rest-pose bone frame (rotation6d, row-major, numBones*6) used to seed the state window. Leave empty for a zero-rotation placeholder seed.")]
+        [Tooltip("Rest-pose bone frame (rotation6d, row-major, numBones*6) used to seed the state window. Leave empty for the canonical identity rest-pose seed (parity with Unreal).")]
         [SerializeField] private float[] seedBoneFrameOverride;
 
         [Tooltip("If true, load the bundle and construct the controller in Awake(). Set false to drive Initialize(bundle) manually.")]
@@ -76,6 +76,19 @@ namespace AInimator.Controller.Authoring
         {
             get => idlePreset;
             set => idlePreset = value;
+        }
+
+        /// <summary>
+        /// Bundle directory consumed by the <see cref="Awake"/>
+        /// auto-initialization (null/empty = <see cref="BundlePaths.DefaultBundleDirectory"/>).
+        /// To take effect it must be set before <see cref="Awake"/> runs —
+        /// e.g. while the GameObject is still inactive, the pattern the
+        /// RigDemo sample bootstrap uses.
+        /// </summary>
+        public string BundleDirectoryOverride
+        {
+            get => bundleDirectoryOverride;
+            set => bundleDirectoryOverride = value;
         }
 
         /// <summary>The preset resolved on the most recent <see cref="Update"/>.</summary>
@@ -127,7 +140,7 @@ namespace AInimator.Controller.Authoring
 
             var seed = seedBoneFrameOverride is { Length: > 0 }
                 ? seedBoneFrameOverride
-                : new float[bundle.Manifest.num_bones * bundle.Manifest.rotation_channels_per_bone];
+                : AInimatorController.CreateRestPoseSeed(bundle.Manifest);
 
             _controller = new AInimatorController(bundle, seed);
             _postProcess = enablePostProcess ? new AInimatorPostProcess(bundle.Manifest) : null;
@@ -152,6 +165,21 @@ namespace AInimator.Controller.Authoring
 
         /// <summary>Begin cross-fading back to the bundle's learned null prompt embedding (spec §3).</summary>
         public void ClearPrompt() => _controller?.ClearPrompt();
+
+        /// <summary>
+        /// Encode a free-text prompt with the bundle's in-engine text
+        /// encoder and cross-fade toward it (Goal B phase B7,
+        /// <c>apps/spec/text_encoding.md</c> §3) — the SAME embedding path
+        /// as <see cref="SetPromptEmbedding"/>. Distinct from
+        /// <see cref="SetTextCommand"/> (B6): this drives the high-level
+        /// prompt channel, not the locomotion control vector.
+        /// </summary>
+        /// <returns>
+        /// <c>true</c> when encoded and applied; <c>false</c> (with a
+        /// warning, never a silent fallback) when the bundle ships no text
+        /// encoder or declares no prompt channel.
+        /// </returns>
+        public bool SetPromptText(string text) => _controller?.SetPromptText(text) ?? false;
 
         /// <summary>
         /// Resolve a free-text command (Goal B phase B6,
@@ -247,7 +275,7 @@ namespace AInimator.Controller.Authoring
 
         private ControlPreset ResolveActivePreset()
         {
-            var boundPreset = InputBindingResolver.Resolve(bindings, Input.GetKey, null);
+            var boundPreset = InputBindingResolver.Resolve(bindings, KeyInput.GetKey, null);
             if (boundPreset != null)
             {
                 return boundPreset;

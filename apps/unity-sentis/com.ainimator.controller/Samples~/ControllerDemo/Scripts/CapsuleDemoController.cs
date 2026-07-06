@@ -1,3 +1,4 @@
+using AInimator.Controller.Authoring;
 using AInimator.Controller.Bundle;
 using AInimator.Controller.Presets;
 using AInimator.Controller.Runtime;
@@ -14,7 +15,7 @@ namespace AInimator.Controller.Samples.ControllerDemo
     /// </summary>
     public sealed class CapsuleDemoController : MonoBehaviour
     {
-        [Tooltip("Forward-facing bind-pose bone frame used to seed the state window (rotation6d, row-major, numBones*6). Leave empty to seed with the frozen T-pose zero rotation, which is only a placeholder for a real bind-pose asset.")]
+        [Tooltip("Forward-facing bind-pose bone frame used to seed the state window (rotation6d, row-major, numBones*6). Leave empty for the canonical identity rest-pose seed (parity with Unreal).")]
         [SerializeField] private float[] seedBoneFrameOverride;
 
         private AInimatorController _controller;
@@ -29,7 +30,7 @@ namespace AInimator.Controller.Samples.ControllerDemo
         {
             var seed = seedBoneFrameOverride is { Length: > 0 }
                 ? seedBoneFrameOverride
-                : new float[bundle.Manifest.num_bones * bundle.Manifest.rotation_channels_per_bone];
+                : AInimatorController.CreateRestPoseSeed(bundle.Manifest);
 
             _controller = new AInimatorController(bundle, seed);
 
@@ -56,22 +57,22 @@ namespace AInimator.Controller.Samples.ControllerDemo
 
         private ControlPreset SelectPresetFromInput()
         {
-            if (Input.GetKey(KeyCode.W) || Input.GetKey(KeyCode.UpArrow))
+            if (KeyInput.GetKey(KeyCode.W) || KeyInput.GetKey(KeyCode.UpArrow))
             {
                 return _forward;
             }
 
-            if (Input.GetKey(KeyCode.S) || Input.GetKey(KeyCode.DownArrow))
+            if (KeyInput.GetKey(KeyCode.S) || KeyInput.GetKey(KeyCode.DownArrow))
             {
                 return _backward;
             }
 
-            if (Input.GetKey(KeyCode.Q))
+            if (KeyInput.GetKey(KeyCode.Q))
             {
                 return _strafeLeft;
             }
 
-            if (Input.GetKey(KeyCode.E))
+            if (KeyInput.GetKey(KeyCode.E))
             {
                 return _strafeRight;
             }

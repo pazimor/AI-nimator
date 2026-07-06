@@ -51,8 +51,10 @@ namespace AInimator.Controller.Bundle
                 throw new BundleLoadException($"preset '{name}': missing required 'control.vz'.");
             }
 
-            var hasAim = control.TryGetValue("aim_x", out var aimXObj) &&
-                         control.TryGetValue("aim_z", out var aimZObj);
+            object aimXObj = null;
+            object aimZObj = null;
+            var hasAim = control.TryGetValue("aim_x", out aimXObj) &&
+                         control.TryGetValue("aim_z", out aimZObj);
             var aimX = hasAim ? (float)(double)aimXObj : 0f;
             var aimZ = hasAim ? (float)(double)aimZObj : 0f;
 

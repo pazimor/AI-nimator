@@ -116,6 +116,21 @@ public:
 	bool ClearPrompt();
 
 	/**
+	 * B7 (`apps/spec/text_encoding.md` §3): encodes a free-text prompt
+	 * with the bundle's in-engine text encoder and starts the SAME
+	 * cross-fade as SetPromptEmbedding — invisible to the user, no
+	 * external `encode_prompt` step. Distinct from SetTextCommand (B6):
+	 * this drives the high-level prompt channel, not the locomotion
+	 * control vector.
+	 *
+	 * Returns false (logged, never a silent fallback) when the bundle
+	 * ships no text encoder (A7.0 / exported without
+	 * --encoder-artifact); the currently active prompt is preserved.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "AInimator|Character|Prompt")
+	bool SetPromptText(const FString& Text);
+
+	/**
 	 * Calibrates FRigBinder against PoseableMesh's CURRENT bone world
 	 * rotations (spec §2.2 "au bind"). Call once after the mesh is in
 	 * its reference/rest pose (typically right after BeginPlay, before

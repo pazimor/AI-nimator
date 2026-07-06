@@ -23,6 +23,17 @@ namespace AInimator.Controller.Bundle
     public static class BundleLoader
     {
         public const string OnnxFileName = "controller.onnx";
+
+        /// <summary>
+        /// Sentis 2.x cannot parse a raw <c>.onnx</c> at runtime — it needs a
+        /// serialized Sentis model. When a <c>controller.sentis</c> sits next
+        /// to (or instead of) <c>controller.onnx</c> in the bundle, it is
+        /// loaded in preference. Produce it once in the Editor by importing
+        /// <c>controller.onnx</c> and clicking "Serialize to StreamingAssets"
+        /// (or via <c>ModelWriter.Save</c>). The raw <c>.onnx</c> stays in the
+        /// bundle for the Unreal/NNE runtime, which loads ONNX directly.
+        /// </summary>
+        public const string SentisFileName = "controller.sentis";
         public const string ManifestFileName = "manifest.json";
         public const string NormStatsFileName = "norm_stats.json";
         public const string PresetsSubdirectory = "presets";
@@ -30,9 +41,10 @@ namespace AInimator.Controller.Bundle
         /// <summary>
         /// The bundle-format version this plugin build was written against.
         /// Loaded bundles must share prefix + major with this value
-        /// (see <see cref="BundleVersion.IsCompatibleWith"/>).
+        /// (see <see cref="BundleVersion.IsCompatibleWith"/>) — A7.0
+        /// bundles (no text encoder) remain loadable.
         /// </summary>
-        public const string SupportedBundleVersion = "A7.0";
+        public const string SupportedBundleVersion = "A7.1";
 
         /// <summary>
         /// Load and validate a controller bundle from <paramref name="bundleDirectory"/>.
@@ -66,7 +78,104 @@ namespace AInimator.Controller.Bundle
             var onnxBytes = LoadOnnxBytes(bundleDirectory);
             var presets = LoadPresets(bundleDirectory, manifest);
 
-            return new ControllerBundle(manifest, normStats, onnxBytes, presets);
+            if (!manifest.HasTextEncoder)
+            {
+                return new ControllerBundle(manifest, normStats, onnxBytes, presets);
+            }
+
+            ValidateTextEncoderSection(manifest);
+            var textEncoderBytes = ReadModelBytesPreferSentis(bundleDirectory, manifest.text_encoder.file);
+            var vocabJson = ReadRequiredText(bundleDirectory, manifest.text_encoder.tokenizer.vocab);
+            var mergesText = ReadRequiredText(bundleDirectory, manifest.text_encoder.tokenizer.merges);
+            return new ControllerBundle(
+                manifest, normStats, onnxBytes, presets,
+                textEncoderBytes, vocabJson, mergesText);
+        }
+
+        /// <summary>
+        /// Fail-fast validation of the optional B7 <c>text_encoder</c>
+        /// manifest section (apps/spec/text_encoding.md §1).
+        /// </summary>
+        private static void ValidateTextEncoderSection(Manifest manifest)
+        {
+            var section = manifest.text_encoder;
+            if (!manifest.HasPrompt)
+            {
+                throw new BundleLoadException(
+                    "manifest.json: text_encoder section present but prompt_emb_channels == 0 — " +
+                    "an encoder cannot condition a promptless controller.");
+            }
+
+            if (section.tokenizer.type != "clip-bpe")
+            {
+                throw new BundleLoadException(
+                    $"manifest.json: unsupported text_encoder.tokenizer.type '{section.tokenizer.type}' " +
+                    "(this plugin build implements 'clip-bpe' only).");
+            }
+
+            if (section.pooling != "masked_mean")
+            {
+                throw new BundleLoadException(
+                    $"manifest.json: unsupported text_encoder.pooling '{section.pooling}' " +
+                    "(pooling is baked into the graph; 'masked_mean' expected).");
+            }
+
+            if (section.embedding_channels != manifest.prompt_emb_channels)
+            {
+                throw new BundleLoadException(
+                    $"manifest.json: text_encoder.embedding_channels ({section.embedding_channels}) " +
+                    $"must equal prompt_emb_channels ({manifest.prompt_emb_channels}).");
+            }
+
+            if (section.tokenizer.max_length < 2)
+            {
+                throw new BundleLoadException(
+                    $"manifest.json: text_encoder.tokenizer.max_length must be >= 2; " +
+                    $"got {section.tokenizer.max_length}.");
+            }
+        }
+
+        /// <summary>
+        /// Same <c>.sentis</c>-over-<c>.onnx</c> preference as
+        /// <see cref="LoadOnnxBytes"/>, for a model file declared by the
+        /// manifest (the B7 text encoder): when a sibling with the
+        /// <c>.sentis</c> extension exists, it wins — Sentis 2.x cannot parse
+        /// a raw <c>.onnx</c> at runtime.
+        /// </summary>
+        private static byte[] ReadModelBytesPreferSentis(string bundleDirectory, string declaredRelativePath)
+        {
+            var sentisSibling = Path.ChangeExtension(declaredRelativePath, ".sentis");
+            var sentisPath = Path.Combine(bundleDirectory, sentisSibling);
+            if (File.Exists(sentisPath))
+            {
+                return File.ReadAllBytes(sentisPath);
+            }
+
+            return ReadRequiredBytes(bundleDirectory, declaredRelativePath);
+        }
+
+        private static byte[] ReadRequiredBytes(string bundleDirectory, string relativePath)
+        {
+            var path = Path.Combine(bundleDirectory, relativePath);
+            if (!File.Exists(path))
+            {
+                throw new BundleLoadException(
+                    $"Bundle manifest declares a text encoder but '{relativePath}' is missing at '{path}'.");
+            }
+
+            return File.ReadAllBytes(path);
+        }
+
+        private static string ReadRequiredText(string bundleDirectory, string relativePath)
+        {
+            var path = Path.Combine(bundleDirectory, relativePath);
+            if (!File.Exists(path))
+            {
+                throw new BundleLoadException(
+                    $"Bundle manifest declares a text encoder but '{relativePath}' is missing at '{path}'.");
+            }
+
+            return File.ReadAllText(path);
         }
 
         private static Manifest LoadManifest(string bundleDirectory)
@@ -235,10 +344,23 @@ namespace AInimator.Controller.Bundle
 
         private static byte[] LoadOnnxBytes(string bundleDirectory)
         {
+            // Prefer the serialized Sentis model (the only format Sentis 2.x
+            // can load at runtime); fall back to the raw .onnx so bundles that
+            // pre-date the .sentis conversion still surface a clear error at
+            // model-load time rather than here.
+            var sentisPath = Path.Combine(bundleDirectory, SentisFileName);
+            if (File.Exists(sentisPath))
+            {
+                return File.ReadAllBytes(sentisPath);
+            }
+
             var path = Path.Combine(bundleDirectory, OnnxFileName);
             if (!File.Exists(path))
             {
-                throw new BundleLoadException($"Bundle is missing '{OnnxFileName}' at '{path}'.");
+                throw new BundleLoadException(
+                    $"Bundle is missing both '{SentisFileName}' and '{OnnxFileName}' at '{bundleDirectory}'. " +
+                    "Sentis 2.x needs a serialized '.sentis' model — in the Editor it is generated " +
+                    "automatically from controller.onnx (menu: AInimator > Convert Bundle ONNX to Sentis).");
             }
 
             return File.ReadAllBytes(path);

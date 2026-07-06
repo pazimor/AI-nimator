@@ -142,6 +142,24 @@ bool UAInimatorCharacterComponent::SetPromptEmbedding(const TArray<float>& Promp
 	return true;
 }
 
+bool UAInimatorCharacterComponent::SetPromptText(const FString& Text)
+{
+	if (!Runtime || !Runtime->IsLoaded())
+	{
+		UE_LOG(LogAInimator, Error,
+			TEXT("AInimator: SetPromptText called with no loaded Runtime."));
+		return false;
+	}
+
+	TArray<float> Embedding;
+	if (!Runtime->EncodePromptText(Text, Embedding))
+	{
+		return false; // Runtime/encoder already logged the specific reason.
+	}
+	StartPromptCrossFade(Embedding);
+	return true;
+}
+
 bool UAInimatorCharacterComponent::ClearPrompt()
 {
 	if (!Runtime || !Runtime->IsLoaded())

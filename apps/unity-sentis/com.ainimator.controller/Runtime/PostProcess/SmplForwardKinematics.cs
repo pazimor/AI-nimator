@@ -51,6 +51,36 @@ namespace AInimator.Controller.PostProcess
         }
 
         /// <summary>
+        /// Project every bone's accumulated 6D rotation back onto the
+        /// manifold of valid representations, in place: the same
+        /// Gram-Schmidt as <see cref="SixDToRotationMatrix"/>, keeping
+        /// <c>(b1, b2)</c> as the new 6D value. Normative rollout step
+        /// (<c>apps/spec/inference_contract.md</c> §3.6, parity with the
+        /// Python reference <c>orthonormalizeRot6d</c> and the Unreal
+        /// runtime): applied to the accumulated bone frame BEFORE it enters
+        /// the state window — without it, long rollouts drift off-manifold
+        /// and the pose degenerates. Idempotent on already-valid 6D.
+        /// </summary>
+        public static void OrthonormalizeFrame(Span<float> boneFrame)
+        {
+            for (var offset = 0; offset + 6 <= boneFrame.Length; offset += 6)
+            {
+                var a1 = new Vector3(boneFrame[offset], boneFrame[offset + 1], boneFrame[offset + 2]);
+                var a2 = new Vector3(boneFrame[offset + 3], boneFrame[offset + 4], boneFrame[offset + 5]);
+
+                var b1 = a1.normalized;
+                var b2 = (a2 - Vector3.Dot(b1, a2) * b1).normalized;
+
+                boneFrame[offset] = b1.x;
+                boneFrame[offset + 1] = b1.y;
+                boneFrame[offset + 2] = b1.z;
+                boneFrame[offset + 3] = b2.x;
+                boneFrame[offset + 4] = b2.y;
+                boneFrame[offset + 5] = b2.z;
+            }
+        }
+
+        /// <summary>
         /// Compute root-local global rotations and positions for every bone
         /// in <paramref name="boneFrame"/> (row-major, <c>numBones * 6</c>),
         /// following <see cref="Smpl22Skeleton.ParentIndices"/> /

@@ -3,7 +3,7 @@
   "rootNamespace": "AInimator.Controller.Samples.ControllerDemo",
   "references": [
     "AInimator.Controller.Runtime",
-    "Unity.Sentis"
+    "Unity.InferenceEngine"
   ],
   "includePlatforms": [],
   "excludePlatforms": [],

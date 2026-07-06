@@ -168,8 +168,56 @@ bool FBundleLoader::LoadManifest(
 		return false;
 	}
 
+	// Optional B7 text_encoder section (text_encoding.md §1) — absent
+	// on A7.0-style bundles, malformed-if-present is fail-fast.
+	const TSharedPtr<FJsonObject>* TextEncoderObject = nullptr;
+	if (Root->TryGetObjectField(TEXT("text_encoder"), TextEncoderObject))
+	{
+		if (!LoadTextEncoderSection(*TextEncoderObject, OutManifest.TextEncoder))
+		{
+			UE_LOG(LogAInimator, Error,
+				TEXT("AInimator: manifest.json at '%s' has a malformed ")
+				TEXT("text_encoder section (text_encoding.md §1)."), *ManifestPath);
+			return false;
+		}
+	}
+
 	OutManifest.bIsFullyParsed = true;
 	return true;
+}
+
+bool FBundleLoader::LoadTextEncoderSection(
+	const TSharedPtr<FJsonObject>& Section,
+	FAInimatorTextEncoderManifest& OutTextEncoder)
+{
+	bool bOk = true;
+	bOk &= Section->TryGetStringField(TEXT("file"), OutTextEncoder.File);
+	bOk &= Section->TryGetStringField(TEXT("pooling"), OutTextEncoder.Pooling);
+	bOk &= Section->TryGetNumberField(
+		TEXT("embedding_channels"), OutTextEncoder.EmbeddingChannels);
+
+	const TSharedPtr<FJsonObject>* Tokenizer = nullptr;
+	if (!Section->TryGetObjectField(TEXT("tokenizer"), Tokenizer))
+	{
+		return false;
+	}
+	bOk &= (*Tokenizer)->TryGetStringField(
+		TEXT("type"), OutTextEncoder.TokenizerType);
+	bOk &= (*Tokenizer)->TryGetStringField(
+		TEXT("vocab"), OutTextEncoder.TokenizerVocab);
+	bOk &= (*Tokenizer)->TryGetStringField(
+		TEXT("merges"), OutTextEncoder.TokenizerMerges);
+	bOk &= (*Tokenizer)->TryGetNumberField(
+		TEXT("max_length"), OutTextEncoder.MaxLength);
+	bOk &= (*Tokenizer)->TryGetNumberField(
+		TEXT("bos_id"), OutTextEncoder.BosId);
+	bOk &= (*Tokenizer)->TryGetNumberField(
+		TEXT("eos_id"), OutTextEncoder.EosId);
+	bOk &= (*Tokenizer)->TryGetNumberField(
+		TEXT("pad_id"), OutTextEncoder.PadId);
+
+	OutTextEncoder.bIsPresent = bOk;
+	return bOk;
 }
 
 bool FBundleLoader::TryParseVersionMajor(const FString& Version, int32& OutMajor)
@@ -296,6 +344,49 @@ bool FBundleLoader::ValidateManifest(const FAInimatorManifest& Manifest)
 			TEXT("AInimator: manifest coord_system='%s', expected ")
 			TEXT("'Y-up right-handed'."), *Manifest.CoordSystem);
 		return false;
+	}
+	if (Manifest.HasTextEncoder())
+	{
+		const FAInimatorTextEncoderManifest& TextEncoder = Manifest.TextEncoder;
+		if (Manifest.PromptEmbChannels <= 0)
+		{
+			UE_LOG(LogAInimator, Error,
+				TEXT("AInimator: text_encoder section present but ")
+				TEXT("prompt_emb_channels == 0 — an encoder cannot condition ")
+				TEXT("a promptless controller."));
+			return false;
+		}
+		if (TextEncoder.TokenizerType != TEXT("clip-bpe"))
+		{
+			UE_LOG(LogAInimator, Error,
+				TEXT("AInimator: unsupported text_encoder.tokenizer.type '%s' ")
+				TEXT("(this plugin build implements 'clip-bpe' only)."),
+				*TextEncoder.TokenizerType);
+			return false;
+		}
+		if (TextEncoder.Pooling != TEXT("masked_mean"))
+		{
+			UE_LOG(LogAInimator, Error,
+				TEXT("AInimator: unsupported text_encoder.pooling '%s' ")
+				TEXT("(pooling is baked into the graph; 'masked_mean' expected)."),
+				*TextEncoder.Pooling);
+			return false;
+		}
+		if (TextEncoder.EmbeddingChannels != Manifest.PromptEmbChannels)
+		{
+			UE_LOG(LogAInimator, Error,
+				TEXT("AInimator: text_encoder.embedding_channels=%d must equal ")
+				TEXT("prompt_emb_channels=%d."),
+				TextEncoder.EmbeddingChannels, Manifest.PromptEmbChannels);
+			return false;
+		}
+		if (TextEncoder.MaxLength < 2)
+		{
+			UE_LOG(LogAInimator, Error,
+				TEXT("AInimator: text_encoder.tokenizer.max_length=%d must be >= 2."),
+				TextEncoder.MaxLength);
+			return false;
+		}
 	}
 	return true;
 }
