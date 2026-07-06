@@ -1,0 +1,53 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "ainimator/control_preset.schema.json",
+  "title": "AI-nimator ControlPreset",
+  "description": "One named control-signal configuration consumed by the engine plugins (Unity ScriptableObject / Unreal UDataAsset are hydrated from these). Values are RAW (unnormalized): vx/vz in meters per frame in the root-local ground frame; the engine applies the z-norm from norm_stats.json. aim is unit-norm by construction.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "control"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-z0-9_]+$",
+      "description": "Preset identifier (snake_case, doubles as the filename stem)."
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vx", "vz"],
+      "properties": {
+        "vx": {
+          "type": "number",
+          "description": "Desired lateral velocity, meters/frame, root-local frame."
+        },
+        "vz": {
+          "type": "number",
+          "description": "Desired forward velocity, meters/frame, root-local frame (+Z = facing)."
+        },
+        "aim_x": {
+          "type": "number",
+          "minimum": -1.0,
+          "maximum": 1.0,
+          "description": "Aim direction X component (unit-norm 2D vector with aim_z)."
+        },
+        "aim_z": {
+          "type": "number",
+          "minimum": -1.0,
+          "maximum": 1.0,
+          "description": "Aim direction Z component (unit-norm 2D vector with aim_x)."
+        }
+      }
+    },
+    "prompt": {
+      "type": ["string", "null"],
+      "description": "Optional authoring-time text prompt this preset was built for (informational; the runtime consumes prompt_emb, not text)."
+    },
+    "prompt_emb": {
+      "type": ["array", "null"],
+      "items": { "type": "number" },
+      "description": "Optional precomputed prompt embedding (length must equal manifest.prompt_emb_channels). B0 packaging decision: prompts ship as precomputed embeddings, not as an in-engine text encoder — see inference_contract.md."
+    }
+  }
+}

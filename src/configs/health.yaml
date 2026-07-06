@@ -1,0 +1,217 @@
+# health.yaml — Probe/Contract configuration for HealthHub
+#
+# Each metric carries a comment with its row from ROADMAP §3.5:
+#   direction | healthy | WARNING | CRITICAL
+#
+# Probes: forward/backward hooks that capture scalar stats only.
+# Contracts: declarative criteria → OK / WARNING / CRITICAL.
+#
+# Guardrail (§3.3): start with 3 probes + 5 contracts only.
+# New additions require an "incident passé détecté" justification.
+# -----------------------------------------------------------------------
+
+# Runtime knobs (wired into full_training_v2 and training_v2)
+health:
+  enabled: true
+  everySteps: 50   # sample 1 step in N (aligned with logEvery default)
+
+# -----------------------------------------------------------------------
+# Probes — scalar stats captured via PyTorch hooks
+# -----------------------------------------------------------------------
+probes:
+  # denoiser.blocks[-1] = last DenoiserBlock hidden states (B, F, D).
+  # Probing the last block gives the most differentiated representation
+  # (all cross-attn + FiLM layers have fired); early collapse shows here
+  # first as rank ≈ 1 / intra_batch_sim → 1.  (ROADMAP §3.5 §3.3)
+  - name: denoiser_blocks
+    module_path: "denoiser.blocks[-1]"
+    capture:
+      - mean          # activation mean
+      - std           # activation std (dead-layer proxy)
+      - norm          # L2 norm
+      - effective_rank  # rank of hidden states (collapse detector)
+      - intra_batch_sim # cosine sim intra-batch (collapse Phase E)
+    hook_type: forward
+
+  # encoder root (CustomTextEncoder) — hooks the pooled hidden states
+  # output tensor; encoder_cond_uncond_sim is set externally by hub.
+  - name: text_encoder_pool
+    module_path: "encoder"
+    capture:
+      - mean
+      - std
+      - norm
+      - encoder_cond_uncond_sim  # pool sim cond vs null (BOS-collapse)
+    hook_type: forward
+
+  # denoiser.outputProjection = final nn.Linear (D → totalOutputDim).
+  # update_ratio here measures whether the output head is learning.
+  - name: output_head
+    module_path: "denoiser.outputProjection"
+    capture:
+      - mean
+      - std
+      - norm
+      - update_ratio  # ||Δw|| / ||w|| per layer (dead/exploding layer)
+    hook_type: forward_and_backward
+
+# -----------------------------------------------------------------------
+# Contracts — declarative criteria per metric
+# -----------------------------------------------------------------------
+contracts:
+  # Metric: cfg_sim
+  # Direction: ↓ towards 0
+  # Healthy: < 0.95  |  WARNING: 0.95–0.99  |  CRITICAL: > 0.99
+  # Incident: Phase E cfg_sim ≈ 0.9995, cond/uncond collapse
+  - name: cond_uncond_sim
+    metric: cfg_sim
+    direction: lower_is_better
+    ok_threshold: 0.95
+    warning_threshold: 0.99
+    critical_above: 0.99
+
+  # Metric: conditioning_sensitivity
+  # Direction: ↑ > 0 (delta loss real-text vs shuffled)
+  # Healthy: nettement > 0  |  WARNING: ≈ 0 on 1 window
+  # CRITICAL: ≈ 0 persistant
+  # Incident: Collapse Phase E (détection tardive)
+  - name: conditioning_sensitivity
+    metric: conditioning_sensitivity
+    direction: higher_is_better
+    ok_threshold: 0.01     # delta > 1% of base loss = healthy
+    warning_threshold: 0.001
+    critical_below: 0.001
+
+  # Metric: update_ratio  (||Δw|| / ||w||)
+  # Direction: stay in [1e-4, 1e-2]
+  # Healthy: 1e-4 – 1e-2  |  WARNING: < 1e-5 or > 1e-1
+  # CRITICAL: ≈ 0 persistant or NaN
+  # Incident: cond_proj AdaLN à zéro (audit)
+  - name: update_ratio
+    metric: update_ratio
+    direction: range
+    ok_min: 1.0e-5
+    ok_max: 1.0e-1
+    warning_min: 1.0e-5
+    warning_max: 1.0e-1
+    critical_below: 1.0e-7
+    critical_above: 1.0
+
+  # Metric: loss_share
+  # Direction: each component 1–70% of total (no dead or dominating)
+  # Healthy: each 1–70%  |  WARNING: < 1% or > 80%
+  # CRITICAL: exactly 0.0
+  # Incident: loss_root_velocity=0.0000 silencieux v1
+  - name: loss_decomposition
+    metric: loss_share
+    direction: range
+    ok_min: 0.01
+    ok_max: 0.70
+    warning_min: 0.01
+    warning_max: 0.80
+    critical_below: 0.001
+
+  # Metric: post_norm_stats
+  # Direction: mean → 0, std → 1
+  # Healthy: |mean| < 0.1 and |std-1| < 0.1
+  # WARNING: < 0.3  |  CRITICAL: beyond (z-norm broken)
+  # Incident: Bug z-normalization v2
+  - name: post_norm_stats
+    metric: post_norm_stats
+    direction: lower_is_better
+    ok_threshold: 0.1
+    warning_threshold: 0.3
+    critical_above: 0.3
+
+  # =====================================================================
+  # Goal A — deterministic controller (ROADMAP_DETERMINIST §4)
+  # =====================================================================
+  # These metrics are produced ONLY by the controller engine; diffusion
+  # runs leave them UNKNOWN (harmless).  effective_rank / intra_batch_sim
+  # are the SAME probes as above, only reinterpreted: collapse here means
+  # the controller ignores the control / regresses to the mean.
+
+  # Metric: control_sensitivity
+  # Direction: ↑ > 0 (output change when control is shuffled)
+  # Healthy: > 0.05  |  WARNING: 0.005–0.05  |  CRITICAL: < 0.005
+  # Detects: the controller ignores the control signal.
+  - name: control_sensitivity
+    metric: control_sensitivity
+    direction: higher_is_better
+    ok_threshold: 0.05
+    warning_threshold: 0.005
+    critical_below: 0.005
+
+  # Metric: mean_collapse_rank (normalized effective_rank in [0,1])
+  # Direction: ↑ (rank high = varied outputs under varied control)
+  # Healthy: > 0.04  |  WARNING: 0.02–0.04  |  CRITICAL: < 0.02
+  # Detects: regression toward the mean motion.
+  #
+  # Calibration (2026-06-23): the original 0.5 threshold was inherited
+  # from the diffusion probe on 384-dim hidden states.  The controller
+  # emits 135-dim MOTION DELTAS, which are intrinsically low-rank (human
+  # motion lives in a small subspace), so a healthy controller sits ~0.05–
+  # 0.15.  Evidence on a converged 16-clip model: control_sensitivity=0.54
+  # (strong response) AND rank rises with control variety (single 0.049 →
+  # varied 0.077) ⇒ rank 0.077 is NOT a collapse.  A real collapse shows
+  # sensitivity≈0 + rank→0 + sim→1; control_sensitivity stays the primary
+  # detector, this is the backup.  Thresholds set to flag genuine
+  # near-zero rank only.
+  - name: mean_collapse_rank
+    metric: mean_collapse_rank
+    direction: higher_is_better
+    ok_threshold: 0.04
+    warning_threshold: 0.02
+    critical_below: 0.02
+
+  # Metric: mean_collapse_sim (intra-batch cosine of outputs)
+  # Direction: ↓ towards 0
+  # Healthy: < 0.5  |  WARNING: 0.5–0.9  |  CRITICAL: > 0.9
+  # Detects: regression toward the mean motion.
+  - name: mean_collapse_sim
+    metric: mean_collapse_sim
+    direction: lower_is_better
+    ok_threshold: 0.5
+    warning_threshold: 0.9
+    critical_above: 0.9
+
+  # Metric: rollout_drift
+  # Direction: ↓ (bounded error over the rollout horizon)
+  # Healthy: < 0.05  |  WARNING: 0.05–0.5  |  CRITICAL: > 0.5
+  # Detects: exposure bias (drift / freeze / explosion).
+  - name: rollout_drift
+    metric: rollout_drift
+    direction: lower_is_better
+    ok_threshold: 0.05
+    warning_threshold: 0.5
+    critical_above: 0.5
+
+  # Metric: cold_start_stability
+  # Direction: ↓ — max( worst 6D-orthonormality deviation,
+  #   |Σ Δyaw|/2π (net full turns), |Σ Δheight| m ) over a 400-frame
+  #   rollout seeded from the cold T-pose identity (the engines' seed).
+  # Healthy: < 0.25  |  WARNING: 0.25–1.0  |  CRITICAL: > 1.0
+  # Detects: long-horizon divergence from a cold start (2026-07-05:
+  #   in-engine dismemberment/spin/lift-off, invisible to rollout_drift's
+  #   short GT-seeded horizon — measured 1.0 turn + 1.4 m on the
+  #   controller_full_long bundle while rollout_drift said OK).
+  # Thresholds are first-pass heuristics (no healthy reference yet).
+  - name: cold_start_stability
+    metric: cold_start_stability
+    direction: lower_is_better
+    ok_threshold: 0.25
+    warning_threshold: 1.0
+    critical_above: 1.0
+
+  # Metric: prompt_sensitivity
+  # Direction: ↑ > 0 (output change when swapping real prompt for null emb)
+  # Healthy: > 0.02  |  WARNING: 0.002–0.02  |  CRITICAL: < 0.002
+  # Detects: text conditioning not reaching the output.
+  # Note: returns 0.0 (reported as UNKNOWN) when promptEmbChannels == 0
+  #       so this contract is transparent for models without text cond.
+  - name: prompt_sensitivity
+    metric: prompt_sensitivity
+    direction: higher_is_better
+    ok_threshold: 0.02
+    warning_threshold: 0.002
+    critical_below: 0.002

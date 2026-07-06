@@ -1,0 +1,82 @@
+[importlinter]
+root_packages =
+    ainimator
+    legacy
+include_external_packages = True
+
+# ---------------------------------------------------------------------------
+# Contract 1 — strict layer ordering within ainimator
+# ---------------------------------------------------------------------------
+# Layer order (top = highest, may import from layers below):
+#   L5: cli
+#   L4: training | health | export
+#       training: uses health (hub.step), data, model — the junction module.
+#       health: uses L0-L3+data for audit/diagnose; never imports training.
+#       export: uses model/text/diffusion for ONNX export.
+#   L3: model | data  (model must not import data — enforced by contract 2)
+#   L3: text | diffusion
+#   L1: geometry
+#   L0: core
+#
+# Key design decisions (2026-06-12):
+# - training > health: training.{full_training_v2,training_v2} call
+#   hub.step(); the dependency flows training→health, not health→training.
+# - health and training at the same L4 layer so they can coexist; the
+#   NO-IMPORT rule health→training is enforced by contract 3 (forbidden).
+# - Phase A5 (2026-06-13): v1 legacy modules removed from ainimator.*;
+#   the circular dep data→training.generation_text_cache is gone.
+[importlinter:contract:layers]
+name = Layer ordering (L0-L5, ascending imports forbidden)
+type = layers
+layers =
+    ainimator.cli
+    ainimator.training
+    ainimator.health | ainimator.export
+    ainimator.model | ainimator.data
+    ainimator.text | ainimator.diffusion
+    ainimator.geometry
+    ainimator.core
+
+# ---------------------------------------------------------------------------
+# Contract 2 — model NEVER imports data
+# ---------------------------------------------------------------------------
+[importlinter:contract:model_no_data]
+name = model must not import data
+type = forbidden
+source_modules =
+    ainimator.model
+forbidden_modules =
+    ainimator.data
+
+# ---------------------------------------------------------------------------
+# Contract 3 — health NEVER imports training
+# ---------------------------------------------------------------------------
+# health and training are peers (L4); training calls hub.step() but health
+# must not call back into training (that would be circular).  The CLI (L5)
+# is the one that loads checkpoints and passes components to hub.audit/diagnose.
+[importlinter:contract:health_no_training]
+name = health must not import training
+type = forbidden
+source_modules =
+    ainimator.health
+forbidden_modules =
+    ainimator.training
+
+# ---------------------------------------------------------------------------
+# Contract 4 — legacy isolation (activated phase A5, 2026-06-13)
+# ---------------------------------------------------------------------------
+# Nothing in ainimator.* may import from legacy.*.
+# legacy/ lives at the repo root (sibling of src/), outside the ainimator
+# package.  It is importable as "legacy.*" on the Python path but must never
+# be imported by the main package.
+#
+# Negative-test demonstration (run then revert):
+#   Add "from legacy.ainimator.core.diagnostics import DiagLogger" to any
+#   ainimator module, run lint-imports → contract 4 reports BROKEN.
+[importlinter:contract:no_legacy_imports]
+name = nothing in ainimator imports legacy
+type = forbidden
+source_modules =
+    ainimator
+forbidden_modules =
+    legacy

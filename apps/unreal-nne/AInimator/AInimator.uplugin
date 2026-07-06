@@ -1,0 +1,36 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.5.0-B3bis",
+	"FriendlyName": "AInimator Controller Runtime",
+	"Description": "Real-time NNE runtime for the AI-nimator deterministic autoregressive motion controller. Loads a controller bundle (controller.onnx + norm_stats.json + manifest.json + presets) exported by the ainimator Python export pipeline and runs one forward per frame, engine-side autoregression, engine-side normalization. Defines no model; behavioural parity with the Unity/Sentis runtime is required (ROADMAP_PLUGINS.md Goal B vérité #7). Includes B3 authoring (UAInimatorActionComponent + Details customization), B4 post-processing (foot-lock IK + idle/move blending), and B3-bis rig binding + prompt-driven pilotage (UAInimatorRigMap/FRigBinder/UAInimatorCharacterComponent).",
+	"Category": "Animation",
+	"CreatedBy": "AI-nimator",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"EngineVersion": "5.3.0",
+	"CanContainContent": true,
+	"IsBetaVersion": true,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "AInimator",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "AInimatorEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "NNE",
+			"Enabled": true
+		}
+	]
+}

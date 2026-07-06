@@ -1,0 +1,23 @@
+{
+  "name": "AInimator.Controller.Runtime",
+  "rootNamespace": "AInimator.Controller",
+  "references": [
+    "Unity.InferenceEngine",
+    "Unity.InputSystem"
+  ],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [
+    {
+      "name": "com.unity.inputsystem",
+      "expression": "1.0.0",
+      "define": "AINIMATOR_INPUTSYSTEM"
+    }
+  ],
+  "noEngineReferences": false
+}

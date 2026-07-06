@@ -1,0 +1,119 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "ainimator/manifest.schema.json",
+  "title": "AI-nimator controller bundle manifest",
+  "description": "Serialization of the frozen deterministic I/O contract. Canonical definition: doc/ROADMAP_DETERMINIST.md section 2.2 — this schema validates the serialization, it does not redefine the contract.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "bundle_version",
+    "state_channels",
+    "num_bones",
+    "rotation_channels_per_bone",
+    "root_local_motion_channels",
+    "control_channels",
+    "control_layout",
+    "phase_channels",
+    "prompt_emb_channels",
+    "context_frames",
+    "output_layout",
+    "coord_system",
+    "normalization_note",
+    "reserved_input_groups"
+  ],
+  "properties": {
+    "bundle_version": {
+      "type": "string",
+      "pattern": "^[A-Z]?[0-9]+\\.[0-9]+$",
+      "description": "Bundle format version (e.g. 'A7.0'). Engines refuse incompatible majors (fail-fast)."
+    },
+    "state_channels": {
+      "const": 136,
+      "description": "Frozen regressed state width: rotation6d (132) + root local motion (4)."
+    },
+    "num_bones": { "const": 22 },
+    "rotation_channels_per_bone": { "const": 6 },
+    "root_local_motion_channels": {
+      "const": 4,
+      "description": "(dforward, dlateral, dheight, dyaw) in the character-local frame."
+    },
+    "control_channels": {
+      "type": "integer",
+      "enum": [2, 4],
+      "description": "2 = (vx, vz) only; 4 = (vx, vz, aim_x, aim_z)."
+    },
+    "control_layout": {
+      "type": "array",
+      "items": { "enum": ["vx", "vz", "aim_x", "aim_z"] },
+      "minItems": 2,
+      "maxItems": 4,
+      "description": "Ordered channel names of the control input."
+    },
+    "phase_channels": {
+      "type": "integer",
+      "enum": [0, 2],
+      "description": "0 = no phase input; 2 = (cos, sin) explicit gait phase."
+    },
+    "prompt_emb_channels": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Width of the prompt embedding ONNX input; 0 = no text conditioning. Embeddings are computed OUTSIDE the per-frame loop (precomputed per preset in B0 — see inference_contract.md)."
+    },
+    "context_frames": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Autoregressive state window length seen by one forward."
+    },
+    "output_layout": {
+      "const": "bone_delta|global_delta",
+      "description": "Normalized delta-state output; integration happens engine-side."
+    },
+    "coord_system": { "const": "Y-up right-handed" },
+    "normalization_note": { "type": "string" },
+    "reserved_input_groups": {
+      "type": "array",
+      "items": {
+        "enum": ["interaction", "perception", "reaction", "morphology"]
+      },
+      "description": "Conditioning groups reserved by the extensibility bus (DETERMINIST 2.2.d) — declared empty until a dataset carries them. The ONNX output signature never changes."
+    },
+    "text_encoder": {
+      "type": "object",
+      "description": "OPTIONAL (B7, bundle A7.1+): in-engine prompt encoding. Absent = embeddings-only bundle (A7.0 behaviour). Spec: apps/spec/text_encoding.md.",
+      "additionalProperties": false,
+      "required": ["file", "tokenizer", "pooling", "embedding_channels"],
+      "properties": {
+        "file": {
+          "const": "text_encoder.onnx",
+          "description": "One-pass pooled encoder graph: input_ids + attention_mask -> prompt_emb."
+        },
+        "tokenizer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type", "vocab", "merges", "max_length",
+            "bos_id", "eos_id", "pad_id"
+          ],
+          "properties": {
+            "type": { "const": "clip-bpe" },
+            "vocab": { "const": "tokenizer/vocab.json" },
+            "merges": { "const": "tokenizer/merges.txt" },
+            "max_length": { "type": "integer", "minimum": 2 },
+            "bos_id": { "type": "integer", "minimum": 0 },
+            "eos_id": { "type": "integer", "minimum": 0 },
+            "pad_id": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "pooling": {
+          "const": "masked_mean",
+          "description": "Pooling baked INTO the ONNX graph — engines never pool."
+        },
+        "embedding_channels": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Output width; must equal prompt_emb_channels."
+        }
+      }
+    }
+  }
+}

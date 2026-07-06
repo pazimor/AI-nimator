@@ -1,0 +1,87 @@
+# ============================================
+# ARCHIVED v1 network profiles (phase A5)
+# Previously in src/configs/network.yaml.
+# Kept here for reference only — not loaded by any live code.
+# ============================================
+
+# ============================================
+# Profile: Mac (32GB RAM, MPS GPU) — v1 default
+# ============================================
+default:
+  embed-dim: 768
+  clip:
+    motion-num-heads: 4
+    motion-num-layers: 4
+    bone-data:
+      rotation6d: true
+      foot-contact: true
+      hand-contact: true
+      root-translation: true
+      root-velocity: true
+      root-yaw: true
+      root-yaw-velocity: true
+      joint-xyz: true
+      joint-velocity: true
+      end-effector-velocity: false
+      pelvis-height: false
+  generation:
+    embed-dim: 512
+    num-heads: 8
+    num-layers: 6
+    num-bones: 22
+    diffusion-steps: 1000
+    num-spatial-layers: 2
+    num-spatio-temporal-layers: 4
+    bone-data:
+      rotation6d: true
+      foot-contact: true
+      hand-contact: false
+      root-translation: true
+      root-velocity: false
+      root-yaw: false
+      root-yaw-velocity: false
+      joint-xyz: true
+      joint-velocity: false
+      end-effector-velocity: false
+      pelvis-height: false
+
+# ============================================
+# Profile: Overfit — v1
+# ============================================
+overfit:
+  embed-dim: 768
+  clip:
+    motion-num-heads: 4
+    motion-num-layers: 4
+    bone-data:
+      rotation6d: true
+      foot-contact: true
+      hand-contact: true
+      root-translation: true
+      root-velocity: true
+      root-yaw: true
+      root-yaw-velocity: true
+      joint-xyz: true
+      joint-velocity: true
+      end-effector-velocity: false
+      pelvis-height: false
+  generation:
+    embed-dim: 768
+    num-heads: 4
+    num-layers: 4
+    num-bones: 22
+    diffusion-steps: 1000
+    num-spatial-layers: 0
+    num-spatio-temporal-layers: 0
+    bone-data:
+      rotation6d: true
+      foot-contact: true
+      hand-contact: false
+      root-translation: true
+      root-velocity: true
+      root-yaw: false
+      root-yaw-velocity: false
+      joint-xyz: true
+      joint-velocity: true
+      end-effector-velocity: true
+      pelvis-height: false

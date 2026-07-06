@@ -1,0 +1,7 @@
+{
+  "name": "strafe_left",
+  "control": {
+    "vx": -0.033,
+    "vz": 0.0
+  }
+}

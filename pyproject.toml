@@ -5,9 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "AI-nimator"
 version = "0.0.1"
-description = "Prompt-to-animation diffusion toolkit with shared training and inference pipelines."
-readme = "AGENT.md"
-requires-python = "^3.12"
+description = "Deterministic autoregressive controller for text/control-driven 3D skeletal animation (SMPL-22)."
+readme = "README.md"
+# PEP 621 requires a PEP 440 specifier here — NOT a Poetry caret ("^3.12"),
+# which breaks Poetry 2.x (it now reads [project] first). Keep in sync with
+# [tool.poetry.dependencies] python below.
+requires-python = ">=3.12,<3.14"
 authors = [{ name = "pazimor" }]
 dependencies = [
   "numpy>=1.25",
@@ -17,6 +20,13 @@ dependencies = [
   "tqdm>=4.66",
   "transformers>=4.35",
   "kornia>=0.7",
+  "pydantic (>=2.13.4,<3.0.0)",
+  "tensorboard (>=2.20.0,<3.0.0)",
+  "onnx (>=1.21.0,<2.0.0)",
+  "onnxruntime (>=1.26.0,<2.0.0)",
+  "streamlit (>=1.35.0,<2.0.0)",
+  "plotly (>=5.20.0,<6.0.0)",
+  "pandas (>=2.0.0,<3.0.0)",
 ]
 
 [project.optional-dependencies]
@@ -24,17 +34,24 @@ test = [
   "pytest>=7.4",
   "pytest-cov>=7",
   "coverage[toml]>=7.4",
+  "import-linter>=2.0",
+  "vulture>=2.10",
 ]
 docs = [
   "sphinx>=7.2",
   "alabaster>=0.7",
 ]
 
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["ainimator*"]
+
 [tool.poetry]
-package-mode = false
-# name = "AI-nimator"
-# version = "0.0.1"
-# packages = [{ include = "ai_nimator", from = "src" }]
+package-mode = true
+packages = [{ include = "ainimator", from = "src" }]
 
 [tool.poetry.dependencies]
 python = ">=3.12,<3.14"
@@ -56,6 +73,10 @@ pretty = true
 [tool.pytest.ini_options]
 addopts = "-ra"
 pythonpath = [".", "src"]
+testpaths = ["src", "test", "apps"]
+markers = [
+  "onnx: ONNX export and parity tests (Phase A8). Must stay green — CI contract §2.10.",
+]
 
 [tool.coverage.run]
 source = ["src/shared"]

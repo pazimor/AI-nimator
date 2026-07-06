@@ -1,48 +1,323 @@
 # ============================================
 # Network Architecture Configuration
 # ============================================
-# This file defines the neural network architecture for both
-# CLIP and Generation models. The top-level embed-dim configures
-# CLIP, while generation.embed-dim can override the denoiser width.
+# v2 stack only (2026-06-13).
+# The v1 "default" and "overfit" profiles have been archived to
+# legacy/configs/network_v1_profiles.yaml and are no longer loaded
+# by any live code.
 # ============================================
 
+# ============================================
+# Profile: v2 (refonte) — sole active profile
+# ============================================
+# Lean representation + compact denoiser:
+# * 4 transformer blocks, embedDim 384, 8 heads
+# * No spatial GCN, no spatio-temporal mix layers
+# * Only rotation6d (132 ch) + root_translation (3 ch) = 135 channels
+#   active.  All FK-derivable signals (joint_xyz, joint_velocity,
+#   foot_contact, end_effector_velocity, pelvis_height) are disabled —
+#   they are computed at the loss stage from rotation6d via FK rather
+#   than predicted as redundant channels.
+#
+# Phase F (2026-05-12) — the SOTA conditioning levers (FiLM + per-block
+# AdaLN) and the learnable null embedding are now ON by default in the
+# Python dataclasses (V2FullTrainingConfig / MotionDenoiserV2Config).
+# ============================================
+# ============================================
+# Controller training profiles (G-PROFILES)
+# ============================================
+# Each profile is a *delta* on top of the base defaults defined in
+# ControllerTrainingConfig (training/controller_training_v2.py).
+# Resolution order: base defaults → profile delta → resolved_config.yaml.
+# All hyperparameter values here REPRODUCE the CLI flag defaults that
+# were in place before the config-first migration (G-HYPERPARAMS).
+#
+# Surface CLI: --profile {overfit|full|debug}
+# Non-config per-invocation args: --dataset-root, --output-dir, --resume
+# ============================================
+controller_profiles:
+  overfit:
+    # Single-clip overfit — A1 smoke test (canonical sanity check, < 2 min).
+    # Reproduces defaults of train_controller_v2.py before migration.
+    data:
+      sample-index: 0            # link index of the overfit clip
+      min-frames: 0              # not used by overfit (single index)
+    arch:
+      embed-dim: 128
+      num-heads: 4
+      num-layers: 3
+      context-frames: 1
+      phase: none                # none | explicit | learned
+      aim-direction: false
+    training:
+      epochs: 300
+      learning-rate: 0.001
+      weight-decay: 0.0
+      seed: 0
+      device: auto
+      log-every: 50
+      scheduled-sampling: 0.0
+      foot-contact-weight: 0.0
+
+  full:
+    # Generalization run — A6/A7 (train/held-out split, many clips).
+    # Reproduces defaults of train_controller_generalization_v2.py, plus
+    # the A6-bis text conditioning + scheduled-sampling (LOG 2026-07-01):
+    # the prior `full` trained promptEmbChannels=0 (prompt silently
+    # ignored) and scheduledSampling=0 (exposure bias). Both fixed below.
+    data:
+      num-clips: 256
+      held-out-clips: 32
+      min-frames: 200
+      clip-batch-size: 8
+      eval-sample-clips: 32
+    arch:
+      embed-dim: 256
+      num-heads: 4
+      num-layers: 4
+      context-frames: 8
+      phase: none
+      aim-direction: false
+    training:
+      epochs: 200
+      learning-rate: 0.001
+      weight-decay: 0.0
+      seed: 0
+      device: auto
+      log-every: 50
+      # A4 scheduled sampling: target probability, linearly ramped 0 → 0.3
+      # over training (from scratch — no warm-start / --resume).
+      scheduled-sampling: 0.3
+      # 2026-07-05 (fix divergence long-horizon, LOG du jour) : fenetre
+      # closed-loop par step d'optimiseur — le modele consomme ses propres
+      # predictions re-orthonormalisees (regime moteur). NB: le trainer
+      # generalization ignorait scheduled-sampling (teacher-forced pur) ;
+      # cette rollout loss est le vrai correctif d'exposure bias ici.
+      rollout-loss-horizon: 16
+      rollout-loss-weight: 1.0
+      foot-contact-weight: 0.0
+    text:
+      # A6-bis: activate the integrated text encoder conditioning.
+      # promptEmbChannels must match the encoder artifact's output-dim.
+      # Canonical artifact: output/clip_text_artifact (frozen CLIP text
+      # tower openai/clip-vit-base-patch32, outputDim=512). The former
+      # xlm_roberta_artifact is degenerate (cross-prompt cos ~0.998 —
+      # prompts indistinguishable, diagnosed 2026-07-02); do not use it.
+      # Supply the artifact at runtime via --encoder-artifact.
+      prompt-emb-channels: 512
+      cond-dropout-prob: 0.1
+      encoder-artifact-path: null
+
+  full-long:
+    # Long generalization run — scale-up of `full` (Pazimor, 2026-07-04).
+    # 1024 clips (vs 256) with capacity bumped per the capacity↔N law
+    # (ROADMAP_DETERMINIST §5 / A6): embed-dim 256→384, layers 4→6.
+    # G-RUNS: run a short capacity probe (same profile, epochs: 10)
+    # before committing to the 200-epoch run.
+    data:
+      num-clips: 1024
+      held-out-clips: 64
+      min-frames: 200
+      clip-batch-size: 8
+      eval-sample-clips: 32
+    arch:
+      embed-dim: 384
+      num-heads: 4
+      num-layers: 6
+      context-frames: 8
+      phase: none
+      aim-direction: false
+    training:
+      epochs: 200
+      learning-rate: 0.001
+      weight-decay: 0.0
+      seed: 0
+      device: auto
+      log-every: 50
+      scheduled-sampling: 0.3
+      # 2026-07-05 (fix divergence long-horizon, LOG du jour) : fenetre
+      # closed-loop par step d'optimiseur — le modele consomme ses propres
+      # predictions re-orthonormalisees (regime moteur). NB: le trainer
+      # generalization ignorait scheduled-sampling (teacher-forced pur) ;
+      # cette rollout loss est le vrai correctif d'exposure bias ici.
+      rollout-loss-horizon: 16
+      rollout-loss-weight: 1.0
+      foot-contact-weight: 0.0
+    text:
+      # Same text conditioning as `full` (canonical CLIP artifact,
+      # outputDim=512) — see the `full` profile comment for rationale.
+      prompt-emb-channels: 512
+      cond-dropout-prob: 0.1
+      encoder-artifact-path: null
+
+  locomotion:
+    # Locomotion-specialized generalization run (Pazimor, 2026-07-06).
+    # `full-long` diverges in long rollout (cold_start_stability=0.80,
+    # net yaw drift 201 deg / height 0.80 m over 400 frames) because (a)
+    # the 1024-clip pool is too heterogeneous (dance/gestures/sitting/...
+    # mixed with walking) and (b) rollout-loss-horizon=16 is too short
+    # for drift that develops over ~400 frames. This profile narrows the
+    # data to locomotion-only captions and quadruples the rollout-loss
+    # horizon. Same arch as `full-long` (capacity↔N law already
+    # validated there); caption-filter matches 15818 clips >= 200 frames
+    # in dataset_preprocessed (verified 2026-07-06), well above
+    # num-clips below.
+    data:
+      num-clips: 4096
+      held-out-clips: 256
+      min-frames: 200
+      clip-batch-size: 8
+      eval-sample-clips: 32
+      # Case-insensitive re.search over each clip's raw_text caption.
+      caption-filter: '\b(walk\w*|run\w*|jog\w*|strid\w*|march\w*|sprint\w*)\b'
+    arch:
+      embed-dim: 384
+      num-heads: 4
+      num-layers: 6
+      context-frames: 8
+      phase: none
+      aim-direction: false
+    training:
+      epochs: 200
+      learning-rate: 0.001
+      weight-decay: 0.0
+      seed: 0
+      device: auto
+      log-every: 50
+      scheduled-sampling: 0.3
+      # 2026-07-06: horizon quadrupled vs `full-long` (16 -> 64) to match
+      # the timescale of the observed drift (~400 frames) — the short
+      # horizon was undercorrecting exposure bias for long rollouts.
+      rollout-loss-horizon: 64
+      rollout-loss-weight: 1.0
+      foot-contact-weight: 0.0
+    text:
+      # Same text conditioning as `full` / `full-long` (canonical CLIP
+      # artifact, outputDim=512).
+      prompt-emb-channels: 512
+      cond-dropout-prob: 0.1
+      encoder-artifact-path: null
+
+  debug:
+    # Ultra-fast smoke test (< 2 min) — zero data required beyond 1 clip.
+    # Used for CI / pre-commit sanity. Same arch as overfit but 10 epochs.
+    data:
+      sample-index: 0
+      min-frames: 0
+    arch:
+      embed-dim: 128
+      num-heads: 4
+      num-layers: 3
+      context-frames: 1
+      phase: none
+      aim-direction: false
+    training:
+      epochs: 10
+      learning-rate: 0.001
+      weight-decay: 0.0
+      seed: 0
+      device: auto
+      log-every: 5
+      scheduled-sampling: 0.0
+      foot-contact-weight: 0.0
+
+  controller_text:
+    # Text-conditioned controller — overfit variant for smoke-testing.
+    # Activates the integrated text encoder conditioning (promptEmbChannels=384
+    # matches text_encoder.yaml output-dim).  Encoder artifact must be
+    # supplied at runtime via --encoder-artifact.
+    #
+    # Usage:
+    #   poetry run python -m ainimator.cli.train_controller_v2 \
+    #     --profile controller_text \
+    #     --encoder-artifact output/text_encoder/ \
+    #     --output-dir output/controller_text_overfit/
+    #
+    # G-HYPERPARAMS: all arch/training values below reproduce the `overfit`
+    # profile; only the text-conditioning fields differ.
+    data:
+      sample-index: 0
+      min-frames: 0
+    arch:
+      embed-dim: 128
+      num-heads: 4
+      num-layers: 3
+      context-frames: 1
+      phase: none
+      aim-direction: false
+    training:
+      epochs: 300
+      learning-rate: 0.001
+      weight-decay: 0.0
+      seed: 0
+      device: auto
+      log-every: 50
+      scheduled-sampling: 0.0
+      foot-contact-weight: 0.0
+    text:
+      # promptEmbChannels must match the encoder artifact's output-dim
+      # (canonical: output/clip_text_artifact, CLIP text tower, 512 —
+      # see the `full` profile note; xlm_roberta_artifact is degenerate).
+      prompt-emb-channels: 512
+      # 10% conditional dropout (replace with null embedding per row).
+      cond-dropout-prob: 0.1
+      # encoder-artifact-path is intentionally null here: supply it at
+      # runtime via --encoder-artifact so the path stays out of VCS.
+      encoder-artifact-path: null
 
 # ============================================
-# Profile: Mac (32GB RAM, MPS GPU)
-# Default profile for local development
+# Diagnose profiles (G-PROFILES, §8.2)
 # ============================================
-default:
-  # CLIP embedding dimension (must match the CLIP checkpoint output size)
-  embed-dim: 768
-  
-  # CLIP Motion Encoder Architecture
+# Profiles for `health diagnose --profile <name> <checkpoint>`.
+# Resolution order: base defaults → profile delta.
+# --profile is required in controller mode; optional in diffusion mode.
+# Keys under `diagnose.*` map to the flags listed in ROADMAP §8.2.
+# ============================================
+diagnose_profiles:
+  controller_default:
+    # Controller diagnose defaults (§8.2).
+    # These reproduce the CLI flag defaults that were proposed in §8.2.
+    diagnose:
+      control: "forward:1.0"          # control spec parsed by _parseControl
+      rollout-frames: 120             # autoregressive rollout length
+      shuffle-control: false          # measure control_sensitivity via shuffle
+      phase-mode: null                # null = read from checkpoint
+      seeds: "0,42,123"              # seed sweep for rollout diversity
+    # Diffusion fields unused; kept null to make routing explicit.
+    diffusion:
+      prompt: null
+      cfg-scales: null
+      num-steps: null
+
+  controller_short:
+    # Fast smoke-test diagnose (< 30 s on MPS).
+    diagnose:
+      control: "forward:1.0"
+      rollout-frames: 30
+      shuffle-control: true
+      phase-mode: null
+      seeds: "0,42"
+
+  diffusion_default:
+    # Diffusion diagnose defaults — mirrors the pre-LOT4 CLI flag defaults.
+    # These are the original defaults for the diffusion path.
+    diagnose:
+      prompt: "a person walks forward"
+      seeds: "0,42,123"
+      cfg-scales: "1.0,4.0,6.0"
+      frames: 120
+      num-steps: 100
+
+v2:
+  # Top-level embed-dim is unused by v2 (no CLIP contrastive pre-train).
+  # Kept for schema compatibility with the loader.
+  embed-dim: 384
+
+  # CLIP block: kept to satisfy the loader schema; the v2 stack does NOT
+  # use this branch (archived in legacy/).
   clip:
     motion-num-heads: 4
-    motion-num-layers: 4
-    # The preprocessed dataset can still store extra motion features
-    # for retrieval and generation.
-    bone-data:
-      rotation6d: true
-      foot-contact: true
-      hand-contact: true
-      root-translation: true
-      root-velocity: true
-      root-yaw: true
-      root-yaw-velocity: true
-      joint-xyz: true
-      joint-velocity: true
-      end-effector-velocity: false
-      pelvis-height: false
-  
-  generation:
-    embed-dim: 768
-    num-heads: 4
-    num-layers: 4
-    num-bones: 22
-    diffusion-steps: 500
-    num-spatial-layers: 4
-    num-spatio-temporal-layers: 4
-
+    motion-num-layers: 2
     bone-data:
       rotation6d: true
       foot-contact: false
@@ -51,54 +326,77 @@ default:
       root-velocity: false
       root-yaw: false
       root-yaw-velocity: false
-      joint-xyz: true
+      joint-xyz: false
       joint-velocity: false
       end-effector-velocity: false
       pelvis-height: false
 
-# ============================================
-# Profile: Overfit
-# Narrower auxiliary supervision to make one-motion memorization stable.
-# Keep the CLIP motion layout identical to the checkpoint, but reduce the
-# generation-side targets to the signals that matter most for locomotion.
-# ============================================
-overfit:
-  embed-dim: 768
-
-  clip:
-    motion-num-heads: 4
-    motion-num-layers: 4
-    bone-data:
-      rotation6d: true
-      foot-contact: true
-      hand-contact: true
-      root-translation: true
-      root-velocity: true
-      root-yaw: true
-      root-yaw-velocity: true
-      joint-xyz: true
-      joint-velocity: true
-      end-effector-velocity: false
-      pelvis-height: false
-
   generation:
-    embed-dim: 768
-    num-heads: 4
-    num-layers: 4
+    # ============================================================
+    # Goal A — engine selector (ROADMAP_DETERMINIST §3.2)
+    # ============================================================
+    # "diffusion" = canonical behaviour (default, nothing changes).
+    # "controller" = Goal A deterministic autoregressive engine.
+    # The training CLI reads this field; defaults keep diffusion.
+    model-type: diffusion          # diffusion | controller
+
+    controller:
+      autoregressive: true
+      phase: explicit              # none | explicit | learned
+      # DEFERRED: the current dataset (AMASS + HumanML3D/KIT captions)
+      # has no style labels (§1/§7).  Must stay false until A3.
+      style-latent: false
+      # Autoregressive context window (frames seen per forward).
+      context-frames: 1            # extended in A4 (long robustness)
+      losses:
+        velocity-loss: true        # flag already present in v2
+        foot-contact-loss: true
+        geodesic-rotation: true
+      training:
+        # Scheduled-sampling ramp 0 → target (fixes exposure bias).
+        # Stays 0 until short-rollout validation passes (A4).
+        scheduled-sampling: 0.0
+
+    # MotionDenoiserV2 (Phase F): compact stack, cross-attn + FiLM +
+    # per-block AdaLN.
+    #
+    # B1-bis frozen recipe (2026-06-13) — the validated 640d/8L denoiser
+    # that solves N=1000 (retrieval 5/5 at cfg=6, LOG.md 2026-06-12).
+    # Capacity↔N law: params ≈ ∝ N (640/8 ≈ 90M holds N=1000).
+    #
+    # ⚠ NOTE: the v2 TRAINING path does NOT read this block.
+    # ``loadNetworkConfig`` (core/config_loader.py) is wired only into
+    # ``preprocess_dataset`` (feature toggles / bone-data).  The denoiser
+    # dims actually used come from the CLI defaults / V2FullTrainingConfig
+    # dataclass (currently 384/4/8) or explicit flags.  The AUTHORITATIVE
+    # B1-bis run config lives in ``scripts/consolidate_n1000_v2.py``.
+    # This block is kept in sync as canonical documentation.
+    embed-dim: 640
+    num-heads: 8
+    num-layers: 8
     num-bones: 22
-    diffusion-steps: 500
-    num-spatial-layers: 4
-    num-spatio-temporal-layers: 4
+    diffusion-steps: 1000
+    # No spatial/spatio-temporal pre-blocks in v2 — removed from
+    # MotionDenoiserV2 entirely.  Both flags must stay at 0.
+    num-spatial-layers: 0
+    num-spatio-temporal-layers: 0
+    # Phase F flags — also defaulted to True in the Python dataclasses.
+    use-film-conditioning: true
+    use-per-block-film: true
+    use-null-embedding: true
 
     bone-data:
-      rotation6d: true
+      rotation6d: true        # primary motion signal (132 ch)
+      root-translation: true  # global trajectory (3 ch)
+      # All other channels are disabled.  FK-derivable signals are
+      # supervised through the auxiliary vel_xyz_loss instead of
+      # being predicted.
       foot-contact: false
       hand-contact: false
-      root-translation: true
       root-velocity: false
       root-yaw: false
       root-yaw-velocity: false
-      joint-xyz: true
+      joint-xyz: false
       joint-velocity: false
       end-effector-velocity: false
       pelvis-height: false
