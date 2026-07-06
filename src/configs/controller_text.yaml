@@ -1,0 +1,58 @@
+# controller_text.yaml — Text-conditioned controller profile
+#
+# Canonical knobs for the text-conditioned controller.  Consumed by
+# ControllerTrainingConfig when the user passes --profile controller_text.
+#
+# Resolution order (G-PROFILES):
+#   ControllerTrainingConfig defaults  →  this file  →  resolved_config.yaml
+#
+# promptEmbChannels MUST match the output-dim in text_encoder.yaml (384).
+# encoder-artifact-path is left null: supply it at runtime via
+#   --encoder-artifact <path>
+# so the absolute path to the trained encoder stays out of VCS.
+#
+# Quick-start command sequence (ordered; G-RUNS: each step is < 30 min):
+#
+#   # 1. Build the tokenizer corpus (uses rawText from the preprocessed dataset)
+#   poetry run python -m ainimator.cli.build_dataset \
+#     --output-dir output/dataset/
+#
+#   # 2. Train the custom BPE tokenizer
+#   poetry run python -m ainimator.cli.train_custom_tokenizer \
+#     --dataset-root output/dataset/ \
+#     --output-dir output/tokenizer/
+#
+#   # 3. Train the standalone text encoder (smoke: --epochs 5 --debug)
+#   poetry run python -m ainimator.cli.train_text_encoder \
+#     --tokenizer output/tokenizer/ \
+#     --output-dir output/text_encoder/ \
+#     --epochs 5
+#
+#   # 4. Smoke-test the text-conditioned controller (overfit 1 clip, ~5 min)
+#   poetry run python -m ainimator.cli.train_controller_v2 \
+#     --profile controller_text \
+#     --encoder-artifact output/text_encoder/ \
+#     --output-dir output/controller_text_overfit/
+#
+#   # 5. Full generalization run (run only after smoke-test passes; > 30 min
+#   #    → let Pazimor launch; prepare the command only)
+#   # poetry run python -m ainimator.cli.train_controller_generalization_v2 \
+#   #   --profile controller_text \
+#   #   --encoder-artifact output/text_encoder/ \
+#   #   --output-dir output/controller_text_full/
+#
+#   # 6. Generate with a text prompt
+#   poetry run python -m ainimator.cli.generate_controller_v2 \
+#     --checkpoint output/controller_text_overfit/checkpoints/best.pt \
+#     --dataset-root output/dataset/ \
+#     --sample-index 0 \
+#     --output output/rollout_text.pt \
+#     --prompt "a person dances" \
+#     --encoder-artifact output/text_encoder/ \
+#     --dae output/rollout_text.dae
+# -----------------------------------------------------------------------
+
+text:
+  prompt-emb-channels: 384      # must match text_encoder.yaml output-dim
+  cond-dropout-prob: 0.1        # 10% null-embedding replacement per row
+  encoder-artifact-path: null   # supply at runtime via --encoder-artifact

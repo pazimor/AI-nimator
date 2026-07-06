@@ -1,0 +1,30 @@
+# Preprocessing config for the UPRIGHT-canonicalised dataset
+# (2026-06-17 orientation fix — see canonicalizeMotionUpright).
+#
+# Full re-preprocess (2026-07-05): the ACCAD/BMLmovi/NTroje validation
+# subset passed; this config now covers ALL dataset folders (exact
+# on-disk names — note lowercase BMLhandball).  Run WITH
+# --canonicalize-facing.  ~11 GB output, keeps the old mis-oriented
+# dataset_preprocessed/ untouched for comparison.
+paths:
+  input-root: "/Users/pazimor/dataset"
+  output-root: "/Users/pazimor/dataset_preprocessed_canon"
+  network-config: "network.yaml"
+  # Subset for fast end-to-end validation of the orientation fix
+  # (~13k samples ≈ 15 GB; fits the free disk).  Swap to the full list
+  # for the real run once validated.
+  include-folders: ["ACCAD", "BMLhandball", "BMLmovi", "BioMotionLab_NTroje", "CMU", "DFaust_67", "EKUT", "Eyes_Japan_Dataset", "HumanEva", "KIT", "MPI_HDM05", "MPI_Limits", "MPI_mosh", "SFU", "SSM_synced", "TotalCapture", "Transitions_mocap"]
+
+processing:
+  model-name: xlm-roberta-base
+  max-length: 256
+  sample-shard-size: 256
+  text-shard-size: 2048
+  text-batch-size: 64
+
+  # Choose one: split-frames OR downsample-target-frames
+  split-frames: 512
+  downsample-target-frames: null
+
+  # Drop samples whose final frame count exceeds this limit
+  max-segment-frames: 512
