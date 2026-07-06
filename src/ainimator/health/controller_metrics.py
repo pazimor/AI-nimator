@@ -35,6 +35,7 @@ from ainimator.health.probe import (
 )
 from ainimator.model.controller_rollout import (
     RolloutResult,
+    rolloutController,
     rolloutControllerClosedLoop,
 )
 from ainimator.model.controller_v2 import ControllerOutput, MotionController
@@ -49,7 +50,13 @@ CONTROLLER_CONTRACT_NAMES: tuple[str, ...] = (
     "rollout_drift",
     "post_norm_stats",
     "prompt_sensitivity",
+    "cold_start_stability",
 )
+
+#: Default horizon (frames) for the cold-start stability rollout --
+#: ~13 s @ 30 fps, the horizon at which the 2026-07-05 in-engine
+#: divergence (dismemberment + spin) was fully developed.
+COLD_START_FRAMES: int = 400
 
 _EPS = 1e-8
 
@@ -272,6 +279,78 @@ def closedLoopDriftByPeriod(
             rollout, groundTruthRotation6d, groundTruthRootTranslation
         )
     return curve
+
+
+
+def coldStartStability(
+    model: MotionController,
+    stateNormalizer: MotionNormalizer,
+    deltaNormalizer: MotionNormalizer,
+    controlSequence: torch.Tensor,
+    phaseSequence: torch.Tensor | None = None,
+    promptEmb: torch.Tensor | None = None,
+) -> float:
+    """Long-horizon instability of a rollout from the cold T-pose seed.
+
+    Deployment-regime contract (2026-07-05): the engines seed the state
+    window with the identity rest pose (``inference_contract.md``), a
+    state no training clip contains -- ``rollout_drift``'s GT-seeded
+    short horizon cannot see the resulting divergence (dismemberment /
+    spin / lift-off diagnosed in-engine while ``rollout_drift`` was OK).
+
+    Rolls the controller for ``controlSequence.shape[1]`` frames from
+    the identity 6D seed and returns the max of three normalized
+    instability terms (lower is better):
+
+    * worst per-bone 6D orthonormality deviation over the rollout
+      (0 when the normative §3.6 projection is active -- regression
+      guard);
+    * ``|Σ Δyaw| / 2π`` -- net spin, in full turns;
+    * ``|Σ Δheight|`` -- net vertical drift, in meters.
+
+    Parameters
+    ----------
+    controlSequence : torch.Tensor
+        ``(1, N, controlChannels)`` normalized control driving the
+        rollout (N = the evaluation horizon).
+    phaseSequence, promptEmb :
+        Forwarded to :func:`rolloutController`.
+    """
+    window = model.config.contextFrames
+    numBones = model.config.numBones
+    device = controlSequence.device
+    dtype = controlSequence.dtype
+
+    identity = torch.tensor(
+        [1.0, 0.0, 0.0, 0.0, 1.0, 0.0], device=device, dtype=dtype
+    )
+    seedBone = identity.expand(1, window, numBones, 6).contiguous()
+    seedRoot = torch.zeros(1, window, 3, device=device, dtype=dtype)
+
+    rollout = rolloutController(
+        model, stateNormalizer, deltaNormalizer,
+        seedBone, seedRoot, controlSequence,
+        phaseSequence=phaseSequence, promptEmb=promptEmb,
+    )
+
+    predicted = rollout.rotation6d[:, window:]
+    a1 = predicted[..., :3]
+    a2 = predicted[..., 3:]
+    sixdInvalidity = float(
+        torch.maximum(
+            torch.maximum(
+                (a1.norm(dim=-1) - 1.0).abs().amax(),
+                (a2.norm(dim=-1) - 1.0).abs().amax(),
+            ),
+            (a1 * a2).sum(dim=-1).abs().amax(),
+        ).item()
+    )
+    localMotion = rollout.rootLocalMotion[:, window:]
+    netTurns = float(localMotion[..., 3].sum().abs().item()) / (
+        2.0 * torch.pi
+    )
+    netHeight = float(localMotion[..., 2].sum().abs().item())
+    return max(sixdInvalidity, netTurns, netHeight)
 
 
 def postNormStats(normalized: torch.Tensor) -> float:

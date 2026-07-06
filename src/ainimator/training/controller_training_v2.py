@@ -39,6 +39,8 @@ from ainimator.data.controller_sequences import (
 from ainimator.health.contract import Verdict
 from ainimator.health.controller_health_writer import ControllerHealthWriter
 from ainimator.health.controller_metrics import (
+    COLD_START_FRAMES,
+    coldStartStability,
     controlSensitivity,
     loadControllerContracts,
     meanCollapse,
@@ -66,6 +68,7 @@ from ainimator.model.motion_normalizer import (
     normalizeStepDelta,
 )
 from ainimator.training.controller_scheduled_sampling import (
+    rolloutLossWindow,
     scheduledSamplingProbability,
     scheduledSamplingStep,
 )
@@ -112,6 +115,14 @@ class ControllerTrainingConfig:
         Target scheduled-sampling probability (A4).  ``0`` keeps the fast
         parallel teacher-forced loop; ``> 0`` enables the sequential
         scheduled-sampling loop with a linear ramp ``0 → target``.
+    rolloutLossHorizon : int
+        ``> 0`` adds a closed-loop rollout-loss window of that many
+        transitions per optimizer step (the model consumes only its own
+        re-orthonormalized predictions — deployment regime; 2026-07-05
+        long-horizon divergence fix).  ``0`` (default) keeps the previous
+        behavior.
+    rolloutLossWeight : float
+        Weight of the rollout-loss term when ``rolloutLossHorizon > 0``.
     resumeCheckpoint : Optional[Path]
         Warm-start: load model + normalizers + control stats from this
         checkpoint instead of building fresh.  The architecture and
@@ -137,6 +148,14 @@ class ControllerTrainingConfig:
         default_factory=ControllerLossWeights
     )
     scheduledSampling: float = 0.0
+    # ---- Closed-loop rollout loss (2026-07-05, long-horizon divergence
+    # fix). ``rolloutLossHorizon`` > 0 adds, at every optimizer step, a
+    # closed-loop window of that many transitions where the model consumes
+    # only its own re-orthonormalized predictions (the deployment regime),
+    # weighted by ``rolloutLossWeight``. 0 keeps the previous behavior
+    # (default OFF — enabling it is a run-level decision, G-HYPERPARAMS).
+    rolloutLossHorizon: int = 0
+    rolloutLossWeight: float = 1.0
     resumeCheckpoint: Optional[Path] = None
     # ---- Text encoder conditioning (Goal A, LOT-2) ----
     # Width of the pooled prompt embedding injected into the conditioning
@@ -588,18 +607,43 @@ def _trainStep(
     epoch: int,
     promptEmb: torch.Tensor | None = None,
 ) -> ControllerLossResult:
-    """Dispatch to the teacher-forced or scheduled-sampling step."""
+    """Dispatch to the teacher-forced or scheduled-sampling step.
+
+    When ``config.rolloutLossHorizon > 0`` a closed-loop rollout-loss
+    window (:func:`rolloutLossWindow`) is added on top of the base step,
+    weighted by ``config.rolloutLossWeight``.
+    """
     if config.scheduledSampling <= 0.0:
-        return _forwardLosses(
+        result = _forwardLosses(
             model, batch, tensors, controlNorm, deltaNormalizer,
             config.lossWeights, promptEmb=promptEmb,
         )
-    probability = scheduledSamplingProbability(
-        epoch, config.epochs, config.scheduledSampling
-    )
-    return scheduledSamplingStep(
+    else:
+        probability = scheduledSamplingProbability(
+            epoch, config.epochs, config.scheduledSampling
+        )
+        result = scheduledSamplingStep(
+            model, batch, stateNormalizer, deltaNormalizer, controlNorm,
+            tensors, probability, config.lossWeights,
+        )
+
+    if config.rolloutLossHorizon <= 0:
+        return result
+
+    rollout = rolloutLossWindow(
         model, batch, stateNormalizer, deltaNormalizer, controlNorm,
-        tensors, probability, config.lossWeights,
+        tensors, config.lossWeights, config.rolloutLossHorizon,
+        promptEmb=promptEmb,
+    )
+    return ControllerLossResult(
+        total=result.total + config.rolloutLossWeight * rollout.total,
+        components={
+            **result.components,
+            **{
+                f"rollout_{name}": value
+                for name, value in rollout.components.items()
+            },
+        },
     )
 
 
@@ -757,6 +801,18 @@ def _evaluate(
         "mean_collapse_sim": sim,
         "rollout_drift": drift,
         "post_norm_stats": postNorm,
+        "cold_start_stability": coldStartStability(
+            model, stateNormalizer, deltaNormalizer,
+            _tileToHorizon(controlNorm, COLD_START_FRAMES).unsqueeze(0),
+            phaseSequence=(
+                None
+                if batch.phase is None
+                else _tileToHorizon(
+                    batch.phase, COLD_START_FRAMES
+                ).unsqueeze(0)
+            ),
+            promptEmb=None if promptEmb is None else promptEmb[:1],
+        ),
     }
     if promptEmb is not None:
         metrics["prompt_sensitivity"] = promptSensitivity(
@@ -769,6 +825,18 @@ def _evaluate(
         )
     verdicts = _evaluateContracts(metrics, healthPath)
     return metrics, verdicts, driftCurve, rollout
+
+
+
+def _tileToHorizon(sequence: torch.Tensor, frames: int) -> torch.Tensor:
+    """Cycle a per-transition sequence ``(N, C)`` up to ``frames`` rows.
+
+    The cold-start stability rollout (:func:`coldStartStability`) is much
+    longer than one clip; recycling the clip's own control/phase keeps
+    the evaluation self-contained (no extra stats needed).
+    """
+    repeats = (frames + sequence.shape[0] - 1) // sequence.shape[0]
+    return sequence.repeat(repeats, *([1] * (sequence.dim() - 1)))[:frames]
 
 
 def _driftHorizons(totalFrames: int) -> list[int]:

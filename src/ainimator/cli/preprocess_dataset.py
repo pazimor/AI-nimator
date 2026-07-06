@@ -47,10 +47,11 @@ def buildArgumentParser() -> argparse.ArgumentParser:
         dest="canonicalizeFacing",
         action="store_true",
         help=(
-            "Phase 1.3 — rotate every clip so the pelvis at frame 0 "
-            "faces +Z.  Eliminates the heading ambiguity the denoiser "
-            "would otherwise have to learn from data.  Requires a "
-            "full preprocessing pass (the normaliser fit changes too)."
+            "Rotate every clip so frame 0 stands UPRIGHT (Y-up) and "
+            "faces +Z (canonicalizeMotionUpright).  Fixes the AMASS Z-up "
+            "root orientation applied to the Y-up rest skeleton that "
+            "stored bodies lying down.  Mandatory for correct geometry; "
+            "requires a full preprocessing pass + from-scratch retrain."
         ),
     )
     parser.add_argument(

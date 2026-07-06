@@ -84,6 +84,8 @@ from ainimator.model.losses_v2 import (
     jointPositionLossV2,
     poolTextEmbedding,
     textMotionContrastiveLoss,
+    accelerationXyzLossV2,
+    rotationJerkLossV2,
     velocityXyzLossV2,
 )
 from ainimator.model.motion_normalizer import MotionNormalizer
@@ -155,6 +157,21 @@ class V2FullTrainingConfig:
     weightDecay: float = 3e-4
     minSnrGamma: float = DEFAULT_MIN_SNR_GAMMA
     velocityXyzWeight: float = 0.0
+    # 2026-06-18 — schedule for the velocity (and acceleration) geometric
+    # losses.  "timestep" multiplies by ᾱ_t (fades smoothness supervision
+    # at high noise — the historical default, but it crippled the loss to
+    # <1% share and let generations tremble).  "none" supervises
+    # smoothness at every noise level, like MDM's geometric losses.
+    velocitySchedule: str = "timestep"
+    # 2026-06-18 — MDM-style acceleration/jerk penalty on FK joints.
+    # Directly targets the high-frequency trembling (Δ² ~30× AMASS).
+    # 0.0 disables.  Uses ``velocitySchedule``.
+    accelerationXyzWeight: float = 0.0
+    # 2026-06-18 — smoothness penalty DIRECTLY in rot6d space (Δ²).  The
+    # trembling lives in rotation6d, which the FK-joint losses above
+    # cannot see; this is the only training-side lever that targets it.
+    # 0.0 disables.  Uses ``velocitySchedule``.
+    rotationJerkWeight: float = 0.0
     # Phase 1.1 (2026-05-17) — MDM-style geometric loss on FK-derived
     # joint positions.  Supervises the *positions* of the 22 SMPL joints
     # so small rotation errors near the root (hips, spine) cannot
@@ -1154,6 +1171,8 @@ def trainStepBatch(
     # + joint position) so we do not invert the prediction twice.
     needsX0 = (
         config.velocityXyzWeight > 0.0
+        or config.accelerationXyzWeight > 0.0
+        or config.rotationJerkWeight > 0.0
         or config.jointPositionWeight > 0.0
         or config.footContactWeight > 0.0
         or config.x0ContrastiveWeight > 0.0
@@ -1177,10 +1196,39 @@ def trainStepBatch(
             targetRotation6d=rotationRaw,
             timesteps=timesteps,
             alphasCumprod=schedule.alphasCumprod,
+            schedule=config.velocitySchedule,
             motionMask=motionMask,
         )
         total = total + config.velocityXyzWeight * velLoss
         velLossValue = float(velLoss.detach().item())
+
+    accelerationLossValue = 0.0
+    if config.accelerationXyzWeight > 0.0:
+        assert x0PredRaw is not None
+        accelLoss = accelerationXyzLossV2(
+            predictedRotation6d=x0PredRaw,
+            targetRotation6d=rotationRaw,
+            timesteps=timesteps,
+            alphasCumprod=schedule.alphasCumprod,
+            schedule=config.velocitySchedule,
+            motionMask=motionMask,
+        )
+        total = total + config.accelerationXyzWeight * accelLoss
+        accelerationLossValue = float(accelLoss.detach().item())
+
+    rotationJerkLossValue = 0.0
+    if config.rotationJerkWeight > 0.0:
+        assert x0PredRaw is not None
+        jerkLoss = rotationJerkLossV2(
+            predictedRotation6d=x0PredRaw,
+            targetRotation6d=rotationRaw,
+            timesteps=timesteps,
+            alphasCumprod=schedule.alphasCumprod,
+            schedule=config.velocitySchedule,
+            motionMask=motionMask,
+        )
+        total = total + config.rotationJerkWeight * jerkLoss
+        rotationJerkLossValue = float(jerkLoss.detach().item())
 
     jointPositionLossValue = 0.0
     if config.jointPositionWeight > 0.0:
@@ -1293,6 +1341,8 @@ def trainStepBatch(
         boneLoss=boneLoss,
         globalLoss=globalLoss,
         velLossValue=velLossValue,
+        accelerationLossValue=accelerationLossValue,
+        rotationJerkLossValue=rotationJerkLossValue,
         jointPositionLossValue=jointPositionLossValue,
         footContactLossValue=footContactLossValue,
         clipGuidanceLossValue=clipGuidanceLossValue,
@@ -1307,6 +1357,8 @@ def _weightedComponents(
     boneValue: float,
     globalValue: float,
     velLossValue: float,
+    accelerationLossValue: float,
+    rotationJerkLossValue: float,
     jointPositionLossValue: float,
     footContactLossValue: float,
     clipGuidanceLossValue: float,
@@ -1322,6 +1374,10 @@ def _weightedComponents(
         ("bone", boneValue, 1.0),
         ("global", globalValue, 1.0),
         ("vel_xyz", velLossValue, config.velocityXyzWeight),
+        ("acceleration", accelerationLossValue,
+         config.accelerationXyzWeight),
+        ("rotation_jerk", rotationJerkLossValue,
+         config.rotationJerkWeight),
         ("joint_xyz", jointPositionLossValue,
          config.jointPositionWeight),
         ("foot_contact", footContactLossValue,
@@ -1361,6 +1417,8 @@ def _buildStepMetrics(
     boneLoss: "torch.Tensor",
     globalLoss: "torch.Tensor",
     velLossValue: float,
+    accelerationLossValue: float,
+    rotationJerkLossValue: float,
     jointPositionLossValue: float,
     footContactLossValue: float,
     clipGuidanceLossValue: float,
@@ -1377,7 +1435,8 @@ def _buildStepMetrics(
     globalValue = float(globalLoss.detach().item())
     comps = _weightedComponents(
         config, clipWeight, boneValue, globalValue,
-        velLossValue, jointPositionLossValue,
+        velLossValue, accelerationLossValue, rotationJerkLossValue,
+        jointPositionLossValue,
         footContactLossValue, clipGuidanceLossValue,
         auxPoolLossValue, x0ContrastiveValue,
     )
@@ -1386,6 +1445,8 @@ def _buildStepMetrics(
         "loss_bone": boneValue,
         "loss_global": globalValue,
         "loss_vel_xyz": velLossValue,
+        "loss_acceleration": accelerationLossValue,
+        "loss_rotation_jerk": rotationJerkLossValue,
         "loss_joint_xyz": jointPositionLossValue,
         "loss_foot_contact": footContactLossValue,
         "loss_clip_guidance": clipGuidanceLossValue,
@@ -1770,6 +1831,8 @@ def validateEpoch(
         # Phase 1.1 — share x0 reconstruction between FK losses (val).
         needsX0 = (
             config.velocityXyzWeight > 0.0
+            or config.accelerationXyzWeight > 0.0
+            or config.rotationJerkWeight > 0.0
             or config.jointPositionWeight > 0.0
             or config.footContactWeight > 0.0
             or config.x0ContrastiveWeight > 0.0

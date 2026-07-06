@@ -89,6 +89,54 @@ def test_contracts_evaluate_healthy_metrics() -> None:
         "rollout_drift": 0.001,
         "post_norm_stats": 0.02,
         "prompt_sensitivity": 0.05,
+        "cold_start_stability": 0.05,
     }
     for name, contract in contracts.items():
         assert contract.evaluate(healthy).verdict is Verdict.OK, name
+
+
+def test_cold_start_stability_runs_from_identity_seed() -> None:
+    """The metric rolls out from the cold T-pose seed and stays finite.
+
+    The 6D-invalidity term must be ~0: the normative §3.6 projection in
+    the reference rollout keeps every fed-back frame on the manifold.
+    """
+    import math
+
+    from ainimator.health.controller_metrics import coldStartStability
+    from ainimator.model.motion_normalizer import MotionNormalizer
+
+    torch.manual_seed(0)
+    model = _model()
+    state = MotionNormalizer(numBones=22, motionChannels=6, globalChannels=4)
+    state.fitFromTensors(
+        boneSamples=[torch.randn(8, 1, 22, 6)],
+        globalSamples=[torch.randn(8, 1, 4)],
+    )
+    delta = MotionNormalizer(numBones=22, motionChannels=6, globalChannels=4)
+    delta.fitFromTensors(
+        boneSamples=[torch.randn(8, 22, 6)],
+        globalSamples=[torch.randn(8, 4)],
+    )
+    control = torch.zeros(1, 24, 2)
+
+    value = coldStartStability(model, state, delta, control)
+
+    assert math.isfinite(value)
+    assert value >= 0.0
+
+
+def test_cold_start_contract_flags_the_diagnosed_divergence() -> None:
+    """The 2026-07-05 in-engine divergence (1.0 turn + 1.4 m over 400
+    frames on controller_full_long) must be CRITICAL; a mild residual
+    drift must be OK."""
+    contracts = loadControllerContracts(_HEALTH_YAML)
+    contract = contracts["cold_start_stability"]
+    assert (
+        contract.evaluate({"cold_start_stability": 0.05}).verdict
+        is Verdict.OK
+    )
+    assert (
+        contract.evaluate({"cold_start_stability": 1.4}).verdict
+        is Verdict.CRITICAL
+    )

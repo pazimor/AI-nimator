@@ -100,6 +100,32 @@ def cosineSim(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(torch.dot(a, b).item()) / denom
 
 
+def alignVectors(vectors: list[torch.Tensor]) -> list[torch.Tensor]:
+    """Truncate FK vectors to their common length (frame-aligned).
+
+    Generated motions have a fixed frame count while ground-truth
+    motions vary (and may be shorter than the generation length), so the
+    flat FK descriptors differ in size.  Cross-probe metrics (retrieval,
+    distinctness) require a uniform length; truncating every vector to
+    the global minimum compares the shared temporal prefix.  All vectors
+    are ``frames × jointDims`` so the minimum falls on a frame boundary.
+
+    Parameters
+    ----------
+    vectors : list[torch.Tensor]
+        1-D FK descriptors, possibly of differing length.
+
+    Returns
+    -------
+    list[torch.Tensor]
+        The same vectors truncated to the shortest length.
+    """
+    if not vectors:
+        return vectors
+    minLen = min(int(vector.numel()) for vector in vectors)
+    return [vector[:minLen] for vector in vectors]
+
+
 def pickProbes(
     dataset: Any,
     candidateIndices: list[int],
@@ -230,6 +256,12 @@ def evaluateAtCfg(
             )
 
     numProbes = len(probeIndices)
+    # GT motions vary in length (and may be shorter than the generation
+    # frame count); align every descriptor to the common length so the
+    # pairwise cosine comparisons below are well-defined.
+    aligned = alignVectors(gtVectors + genVectors)
+    gtVectors = aligned[:numProbes]
+    genVectors = aligned[numProbes:]
     fidelity = sum(
         cosineSim(genVectors[i], gtVectors[i])
         for i in range(numProbes)

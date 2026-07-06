@@ -98,6 +98,28 @@ def sixdToRotationMatrix(sixd: torch.Tensor) -> torch.Tensor:
     return torch.stack([b1, b2, b3], dim=-1)
 
 
+def orthonormalizeRot6d(sixd: torch.Tensor) -> torch.Tensor:
+    """
+    Project a (possibly drifted) 6D rotation back onto the manifold of
+    valid representations: Gram-Schmidt identical to
+    :func:`sixdToRotationMatrix`, returning the two orthonormal vectors
+    ``(b1, b2)`` as a 6D vector.
+
+    Normative inference step (``apps/spec/inference_contract.md`` §3.6):
+    applied to the accumulated bone frame each rollout step, BEFORE it
+    enters the state window. Idempotent (a no-op on already-valid 6D)
+    and differentiable away from degenerate inputs, so it is also safe
+    inside a training-time rollout loss.
+    """
+    a1 = sixd[..., :3]
+    a2 = sixd[..., 3:6]
+
+    b1 = F.normalize(a1, dim=-1)
+    dot = (b1 * a2).sum(dim=-1, keepdim=True)
+    b2 = F.normalize(a2 - dot * b1, dim=-1)
+    return torch.cat([b1, b2], dim=-1)
+
+
 def rot6dToJointXYZ(rot6d: torch.Tensor) -> torch.Tensor:
     """
     Convert local 6D rotations to global joint XYZ via forward kinematics.

@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 import torch
 
+from ainimator.geometry.components import orthonormalizeRot6d
 from ainimator.geometry.root_local import pelvisYawFromRot6d
 from ainimator.model.controller_v2 import MotionController
 from ainimator.model.motion_normalizer import (
@@ -75,6 +76,7 @@ def rolloutController(
     controlSequence: torch.Tensor,
     phaseSequence: torch.Tensor | None = None,
     seedRootLocalMotion: torch.Tensor | None = None,
+    promptEmb: torch.Tensor | None = None,
 ) -> RolloutResult:
     """Roll the controller autoregressively under a control sequence.
 
@@ -94,6 +96,10 @@ def rolloutController(
         ``(B, N, phaseChannels)`` per-frame phase, or ``None``.
     seedRootLocalMotion : torch.Tensor or None
         ``(B, K, 4)`` seed window for the global (root-local) branch.
+    promptEmb : torch.Tensor or None
+        ``(B, promptEmbChannels)`` pre-computed prompt embedding from the
+        frozen text encoder, computed UPSTREAM.  ``None`` delegates to the
+        model's learnable null embedding when ``promptEmbChannels > 0``.
 
     Returns
     -------
@@ -104,7 +110,8 @@ def rolloutController(
     state = _initRolloutState(model, seedRotation6d, seedRootTranslation,
                               seedRootLocalMotion)
     _runRolloutLoop(model, stateNormalizer, deltaNormalizer,
-                    controlSequence, phaseSequence, state)
+                    controlSequence, phaseSequence, state,
+                    promptEmb=promptEmb)
     return _buildResult(state)
 
 
@@ -119,6 +126,7 @@ def rolloutControllerClosedLoop(
     reinjectEvery: int,
     phaseSequence: torch.Tensor | None = None,
     groundTruthRootLocalMotion: torch.Tensor | None = None,
+    promptEmb: torch.Tensor | None = None,
 ) -> RolloutResult:
     """Roll out with periodic ground-truth state re-injection.
 
@@ -141,6 +149,9 @@ def rolloutControllerClosedLoop(
         ``(B, N, phaseChannels)`` per-frame phase.
     groundTruthRootLocalMotion : torch.Tensor or None
         ``(B, K + N, 4)`` reference root-local motion deltas.
+    promptEmb : torch.Tensor or None
+        ``(B, promptEmbChannels)`` pre-computed prompt embedding.
+        ``None`` delegates to the model's learnable null embedding.
 
     Returns
     -------
@@ -154,7 +165,7 @@ def rolloutControllerClosedLoop(
         model, stateNormalizer, deltaNormalizer, state,
         groundTruthRotation6d, groundTruthRootTranslation,
         groundTruthRootLocalMotion, controlSequence, phaseSequence,
-        reinjectEvery,
+        reinjectEvery, promptEmb=promptEmb,
     )
     return _buildResult(state)
 
@@ -227,6 +238,7 @@ def _runRolloutLoop(
     controlSequence: torch.Tensor,
     phaseSequence: torch.Tensor | None,
     state: _RolloutState,
+    promptEmb: torch.Tensor | None = None,
 ) -> None:
     """Advance the rollout state in-place for all steps."""
     for step in range(controlSequence.shape[1]):
@@ -236,6 +248,7 @@ def _runRolloutLoop(
         nextBone, nextDelta = _stepOnce(
             model, stateNormalizer, deltaNormalizer,
             boneWin, globalWin, controlSequence[:, step, :], phase,
+            promptEmb=promptEmb,
         )
         nextPos, nextYaw = _integrateOneStep(
             state.currentWorldPos, state.currentYaw, nextDelta
@@ -290,6 +303,7 @@ def _runClosedLoopBody(
     controlSequence: torch.Tensor,
     phaseSequence: torch.Tensor | None,
     reinjectEvery: int,
+    promptEmb: torch.Tensor | None = None,
 ) -> None:
     """Closed-loop rollout with optional GT re-injection."""
     for step in range(controlSequence.shape[1]):
@@ -299,6 +313,7 @@ def _runClosedLoopBody(
         nextBone, nextDelta = _stepOnce(
             model, stateNormalizer, deltaNormalizer,
             boneWin, globalWin, controlSequence[:, step, :], phase,
+            promptEmb=promptEmb,
         )
         nextPos, nextYaw = _integrateOneStep(
             state.currentWorldPos, state.currentYaw, nextDelta
@@ -401,16 +416,24 @@ def _stepOnce(
     globalWindow: torch.Tensor,
     control: torch.Tensor,
     phase: torch.Tensor | None,
+    promptEmb: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Advance one frame; return the next raw bone delta and global delta."""
     normBone = stateNormalizer.normalizeBone(boneWindow)
     normGlobal = stateNormalizer.normalizeGlobal(globalWindow)
-    output = model(normBone, control, globalWindow=normGlobal, phase=phase)
+    output = model(
+        normBone, control, globalWindow=normGlobal, phase=phase,
+        promptEmb=promptEmb,
+    )
 
     rawBoneDelta, rawGlobalDelta = denormalizeStepDelta(
         deltaNormalizer, output.boneDelta, output.globalDelta
     )
-    nextBone = boneWindow[:, -1, :, :] + rawBoneDelta
+    # Normative re-orthonormalization (inference_contract.md §3.6): keep
+    # the accumulated state on the rotation manifold before it re-enters
+    # the window — without it, long rollouts drift off-manifold and
+    # diverge (2026-07-05 diagnostic).
+    nextBone = orthonormalizeRot6d(boneWindow[:, -1, :, :] + rawBoneDelta)
     return nextBone, rawGlobalDelta
 
 

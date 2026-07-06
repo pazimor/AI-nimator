@@ -242,8 +242,12 @@ def velocityXyzLossV2(
         )
     predictedXyz = rot6dToJointXYZ(predictedRotation6d)
     targetXyz = rot6dToJointXYZ(targetRotation6d)
-    predictedVel = temporalDifference(predictedXyz)
-    targetVel = temporalDifference(targetXyz)
+    # FK output is (batch, frames, bones, 3) — difference over the FRAME
+    # axis (dim=1), NOT the default dim=0 (batch).  The historical default
+    # silently differenced across batch samples, so velocity smoothness
+    # was never actually supervised (root cause of the trembling).
+    predictedVel = temporalDifference(predictedXyz, dim=1)
+    targetVel = temporalDifference(targetXyz, dim=1)
 
     perSample = perSampleMse(
         predictedVel, targetVel, motionMask=motionMask
@@ -251,6 +255,100 @@ def velocityXyzLossV2(
     if schedule == VELOCITY_SCHEDULE_NONE:
         return perSample.mean()
 
+    alphasCumprod = alphasCumprod.to(device=timesteps.device)
+    alphaT = alphasCumprod.gather(0, timesteps.long()).to(torch.float32)
+    return (perSample * alphaT).mean()
+
+
+def accelerationXyzLossV2(
+    predictedRotation6d: torch.Tensor,
+    targetRotation6d: torch.Tensor,
+    timesteps: torch.Tensor,
+    alphasCumprod: torch.Tensor,
+    schedule: str = VELOCITY_SCHEDULE_NONE,
+    motionMask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Per-frame acceleration (jerk) loss in joint XYZ space.
+
+    Computes ``|| Δ²(FK(predicted)) − Δ²(FK(target)) ||²`` averaged over
+    valid frames.  Real motion has near-zero high-frequency acceleration;
+    diffusion samples tremble (Δ² ~30× the AMASS reference).  Matching the
+    target's second temporal difference directly penalises that trembling.
+
+    Defaults to ``schedule="none"`` (uniform over timesteps) because — like
+    MDM's geometric losses — smoothness must be supervised at every noise
+    level, not faded out at high t.
+
+    Parameters mirror :func:`velocityXyzLossV2`.
+    """
+    if schedule not in SUPPORTED_VELOCITY_SCHEDULES:
+        raise ValueError(
+            f"schedule must be one of {SUPPORTED_VELOCITY_SCHEDULES}; "
+            f"got {schedule!r}."
+        )
+    if predictedRotation6d.shape != targetRotation6d.shape:
+        raise ValueError(
+            "predicted and target rotation6d shapes must match; got "
+            f"{tuple(predictedRotation6d.shape)} vs "
+            f"{tuple(targetRotation6d.shape)}."
+        )
+    # Second difference over the FRAME axis (dim=1) — see velocity note.
+    predictedAcc = temporalDifference(
+        temporalDifference(rot6dToJointXYZ(predictedRotation6d), dim=1),
+        dim=1,
+    )
+    targetAcc = temporalDifference(
+        temporalDifference(rot6dToJointXYZ(targetRotation6d), dim=1),
+        dim=1,
+    )
+    perSample = perSampleMse(predictedAcc, targetAcc, motionMask=motionMask)
+    if schedule == VELOCITY_SCHEDULE_NONE:
+        return perSample.mean()
+    alphasCumprod = alphasCumprod.to(device=timesteps.device)
+    alphaT = alphasCumprod.gather(0, timesteps.long()).to(torch.float32)
+    return (perSample * alphaT).mean()
+
+
+def rotationJerkLossV2(
+    predictedRotation6d: torch.Tensor,
+    targetRotation6d: torch.Tensor,
+    timesteps: torch.Tensor,
+    alphasCumprod: torch.Tensor,
+    schedule: str = VELOCITY_SCHEDULE_TIMESTEP,
+    motionMask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Smoothness penalty applied DIRECTLY in rotation-6D space.
+
+    Computes ``|| Δ²(predicted_rot6d) − Δ²(target_rot6d) ||²`` over the
+    frame axis.  Unlike the FK-joint velocity/acceleration losses, this
+    acts on the *same* quantity that visibly trembles — the per-frame
+    rotation6d — so it is the only training-side lever that directly
+    targets the high-frequency rotational jitter (the joint-space losses
+    cannot see it).  Matching the target's (smooth) second difference
+    drives the prediction smooth without flattening intended fast motion.
+
+    Parameters mirror :func:`velocityXyzLossV2`.
+    """
+    if schedule not in SUPPORTED_VELOCITY_SCHEDULES:
+        raise ValueError(
+            f"schedule must be one of {SUPPORTED_VELOCITY_SCHEDULES}; "
+            f"got {schedule!r}."
+        )
+    if predictedRotation6d.shape != targetRotation6d.shape:
+        raise ValueError(
+            "predicted and target rotation6d shapes must match; got "
+            f"{tuple(predictedRotation6d.shape)} vs "
+            f"{tuple(targetRotation6d.shape)}."
+        )
+    predictedJerk = temporalDifference(
+        temporalDifference(predictedRotation6d, dim=1), dim=1
+    )
+    targetJerk = temporalDifference(
+        temporalDifference(targetRotation6d, dim=1), dim=1
+    )
+    perSample = perSampleMse(predictedJerk, targetJerk, motionMask=motionMask)
+    if schedule == VELOCITY_SCHEDULE_NONE:
+        return perSample.mean()
     alphasCumprod = alphasCumprod.to(device=timesteps.device)
     alphaT = alphasCumprod.gather(0, timesteps.long()).to(torch.float32)
     return (perSample * alphaT).mean()
@@ -432,8 +530,8 @@ def footContactLossV2(
 
     # temporalDifference operates on the time axis (dim=1) and returns
     # zero-padded first frame so the temporal length matches the input.
-    predictedFootVel = temporalDifference(predictedFoot)  # (B, F, K, 3)
-    targetFootVel = temporalDifference(targetFoot)
+    predictedFootVel = temporalDifference(predictedFoot, dim=1)  # (B,F,K,3)
+    targetFootVel = temporalDifference(targetFoot, dim=1)
 
     targetSpeedSq = (targetFootVel ** 2).sum(dim=-1)  # (B, F, K)
     contactMask = (targetSpeedSq < contactThreshold).to(

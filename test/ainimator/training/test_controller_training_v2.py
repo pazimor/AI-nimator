@@ -36,6 +36,12 @@ def _syntheticClip(frames: int = 64) -> tuple[torch.Tensor, torch.Tensor]:
             rotation6d[:, bone, channel] = math.cos(bone + channel) + (
                 0.3 * torch.sin(phase + 0.2 * bone + 0.5 * channel)
             )
+    # Project onto valid 6D rotations: real (AMASS) states are always on
+    # the rotation manifold, and the normative inference loop
+    # (inference_contract.md §3.6) assumes it.
+    from ainimator.geometry.components import orthonormalizeRot6d
+
+    rotation6d = orthonormalizeRot6d(rotation6d)
     rootTranslation = torch.zeros(frames, 3)
     rootTranslation[:, 0] = 0.02 * torch.arange(frames)
     rootTranslation[:, 1] = 0.10 * torch.sin(phase)
@@ -46,7 +52,10 @@ def _syntheticClip(frames: int = 64) -> tuple[torch.Tensor, torch.Tensor]:
 def _overfitConfig(outputDir: Path) -> ControllerTrainingConfig:
     return ControllerTrainingConfig(
         outputDir=outputDir,
-        epochs=250,
+        # 600 epochs: the manifold-projected synthetic clip (valid 6D,
+        # lower variance) converges slower than the pre-§3.6 raw one —
+        # reaches < 0.02 at 600 (probe 2026-07-05), vs 0.17 at 250.
+        epochs=600,
         device="cpu",
         embedDim=128,
         numHeads=4,

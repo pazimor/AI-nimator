@@ -186,6 +186,23 @@ contracts:
     warning_threshold: 0.5
     critical_above: 0.5
 
+  # Metric: cold_start_stability
+  # Direction: ↓ — max( worst 6D-orthonormality deviation,
+  #   |Σ Δyaw|/2π (net full turns), |Σ Δheight| m ) over a 400-frame
+  #   rollout seeded from the cold T-pose identity (the engines' seed).
+  # Healthy: < 0.25  |  WARNING: 0.25–1.0  |  CRITICAL: > 1.0
+  # Detects: long-horizon divergence from a cold start (2026-07-05:
+  #   in-engine dismemberment/spin/lift-off, invisible to rollout_drift's
+  #   short GT-seeded horizon — measured 1.0 turn + 1.4 m on the
+  #   controller_full_long bundle while rollout_drift said OK).
+  # Thresholds are first-pass heuristics (no healthy reference yet).
+  - name: cold_start_stability
+    metric: cold_start_stability
+    direction: lower_is_better
+    ok_threshold: 0.25
+    warning_threshold: 1.0
+    critical_above: 1.0
+
   # Metric: prompt_sensitivity
   # Direction: ↑ > 0 (output change when swapping real prompt for null emb)
   # Healthy: > 0.02  |  WARNING: 0.002–0.02  |  CRITICAL: < 0.002

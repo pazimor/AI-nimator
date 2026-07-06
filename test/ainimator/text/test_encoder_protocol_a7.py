@@ -121,7 +121,7 @@ def _buildMockClipEncoder(outputDim: int = 32) -> ClipTextEncoder:
     mockClipModel = nn.Linear(4, 4, bias=False)
     mockClipModel.eval()
     with patch(
-        "transformers.CLIPTextModel.from_pretrained",
+        "transformers.AutoModel.from_pretrained",
         return_value=mockClipModel,
     ):
         return ClipTextEncoder(
@@ -330,10 +330,10 @@ def test_swap_encoder_type_by_config_only() -> None:
         mockTower = nn.Linear(4, 4, bias=False)
         mockTower.eval()
         with patch(
-            "transformers.CLIPTextModel.from_pretrained",
+            "transformers.AutoModel.from_pretrained",
             return_value=mockTower,
         ), patch(
-            "transformers.CLIPTokenizerFast.from_pretrained",
+            "transformers.AutoTokenizer.from_pretrained",
             return_value=mockTokenizerBackend,
         ):
             loadedClip, _ = loadEncoderArtifact(

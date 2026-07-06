@@ -17,6 +17,7 @@ from .kinematics import (
 )
 from .ops import (
     maskedMean,
+    orthonormalizeRot6d,
     rot6dToJointXYZ,
     sixdToRotationMatrix,
     temporalAngleDifference,
@@ -49,6 +50,7 @@ __all__ = [
     "FootContactComponent",
     "HandContactComponent",
     "buildMotionFeatureTensors",
+    "orthonormalizeRot6d",
     "rot6dToJointXYZ",
     "RootTranslationComponent",
     "RootVelocityComponent",

@@ -54,7 +54,13 @@ from ainimator.health.controller_metrics import (
 )
 from ainimator.model.controller_rollout import rolloutController
 from ainimator.model.controller_v2 import MotionController
-from ainimator.model.losses_controller_v2 import geodesicRotationLoss
+from ainimator.model.losses_controller_v2 import (
+    ControllerLossResult,
+    geodesicRotationLoss,
+)
+from ainimator.training.controller_scheduled_sampling import (
+    rolloutLossWindow,
+)
 from ainimator.model.motion_normalizer import (
     MotionNormalizer,
     denormalizeStepDelta,
@@ -443,6 +449,10 @@ def _trainEpoch(
             model, merged, tensors, controlNorm, deltaNormalizer,
             config.lossWeights, promptEmb=promptEmb,
         )
+        result = _maybeAddRolloutLoss(
+            result, model, trainClips, indices, sequenceConfig,
+            norms, controlStats, config, device,
+        )
         result.total.backward()
         optimizer.step()
         total += float(result.total.item())
@@ -457,6 +467,55 @@ def _trainEpoch(
         name: value / divisor for name, value in componentSums.items()
     }
     return total / divisor, meanComponents
+
+
+def _maybeAddRolloutLoss(
+    result: ControllerLossResult,
+    model: MotionController,
+    trainClips: list[Clip],
+    indices: list[int],
+    sequenceConfig: ControllerSequenceConfig,
+    norms: tuple[MotionNormalizer, MotionNormalizer],
+    controlStats: tuple[torch.Tensor, torch.Tensor],
+    config: ControllerTrainingConfig,
+    device: torch.device,
+) -> ControllerLossResult:
+    """Add the closed-loop rollout-loss term when enabled (see
+    :func:`ainimator.training.controller_scheduled_sampling.rolloutLossWindow`).
+
+    The rollout window is sequential (single clip), so one clip of the
+    minibatch is drawn at random per optimizer step — bounded cost
+    (``rolloutLossHorizon`` extra forwards), closed-loop signal at every
+    step.  ``rolloutLossHorizon == 0`` (default) returns ``result``
+    untouched.
+    """
+    if config.rolloutLossHorizon <= 0:
+        return result
+    stateNormalizer, deltaNormalizer = norms
+    controlMean, controlStd = controlStats
+    clipIndex = indices[int(torch.randint(len(indices), ()))]
+    clipBatch, _ = _mergedMinibatch(
+        trainClips, [clipIndex], sequenceConfig, device
+    )
+    clipTensors = _normalizeTensors(
+        clipBatch, stateNormalizer, deltaNormalizer
+    )
+    clipControlNorm = (clipBatch.control - controlMean) / controlStd
+    rollout = rolloutLossWindow(
+        model, clipBatch, stateNormalizer, deltaNormalizer,
+        clipControlNorm, clipTensors, config.lossWeights,
+        config.rolloutLossHorizon,
+    )
+    return ControllerLossResult(
+        total=result.total + config.rolloutLossWeight * rollout.total,
+        components={
+            **result.components,
+            **{
+                f"rollout_{name}": value
+                for name, value in rollout.components.items()
+            },
+        },
+    )
 
 
 def _maybeBuildPromptEmb(

@@ -131,7 +131,7 @@ def _buildMockClipEncoder(outputDim: int = 32) -> ClipTextEncoder:
 
     # CLIPTextModel is imported lazily inside ClipTextEncoder.__init__,
     # so we patch the `transformers` namespace directly.
-    with patch("transformers.CLIPTextModel.from_pretrained",
+    with patch("transformers.AutoModel.from_pretrained",
                return_value=mockClipModel):
         config = ClipTextEncoderConfig(
             modelName="mock/clip",
@@ -405,10 +405,10 @@ def test_old_clip_checkpoint_backward_compat(tmp_path: Path) -> None:
     mockTokenizerBackend.pad_token_id = 0
 
     with patch(
-        "transformers.CLIPTextModel.from_pretrained",
+        "transformers.AutoModel.from_pretrained",
         return_value=mockClipTower,
     ), patch(
-        "transformers.CLIPTokenizerFast.from_pretrained",
+        "transformers.AutoTokenizer.from_pretrained",
         return_value=mockTokenizerBackend,
     ):
         (
@@ -521,10 +521,10 @@ def test_missing_trainable_key_raises(tmp_path: Path) -> None:
     mockTokenizerBackend.pad_token_id = 0
 
     with patch(
-        "transformers.CLIPTextModel.from_pretrained",
+        "transformers.AutoModel.from_pretrained",
         return_value=mockClipTower,
     ), patch(
-        "transformers.CLIPTokenizerFast.from_pretrained",
+        "transformers.AutoTokenizer.from_pretrained",
         return_value=mockTokenizerBackend,
     ):
         with pytest.raises(RuntimeError) as excInfo:
@@ -601,10 +601,10 @@ def test_only_clip_keys_missing_loads_fine(tmp_path: Path) -> None:
     mockTokenizerBackend.pad_token_id = 0
 
     with patch(
-        "transformers.CLIPTextModel.from_pretrained",
+        "transformers.AutoModel.from_pretrained",
         return_value=mockClipTower,
     ), patch(
-        "transformers.CLIPTokenizerFast.from_pretrained",
+        "transformers.AutoTokenizer.from_pretrained",
         return_value=mockTokenizerBackend,
     ):
         (

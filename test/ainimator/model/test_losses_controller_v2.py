@@ -1,4 +1,4 @@
-"""Phase C1 tests — controller loss functions."""
+"""Phase A1 tests — controller loss functions."""
 
 from __future__ import annotations
 

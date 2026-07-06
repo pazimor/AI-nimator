@@ -27,6 +27,9 @@ RIGHT_FOOT_INDEX = SMPL22_BONE_ORDER.index("rightFoot")
 LEFT_WRIST_INDEX = SMPL22_BONE_ORDER.index("leftWrist")
 RIGHT_WRIST_INDEX = SMPL22_BONE_ORDER.index("rightWrist")
 PELVIS_INDEX = SMPL22_BONE_ORDER.index("pelvis")
+NECK_INDEX = SMPL22_BONE_ORDER.index("neck")
+LEFT_HIP_INDEX = SMPL22_BONE_ORDER.index("leftHip")
+RIGHT_HIP_INDEX = SMPL22_BONE_ORDER.index("rightHip")
 FOOT_CONTACT_INDICES = (
     LEFT_ANKLE_INDEX,
     LEFT_FOOT_INDEX,
@@ -298,6 +301,115 @@ def canonicalizeMotionFacing(
         extrasOut[ROOT_TRANSLATION_KEY] = translationCanon
 
     return motion, extrasOut
+
+
+def _normalize(vector: torch.Tensor) -> torch.Tensor:
+    """Return ``vector`` scaled to unit length (eps-guarded)."""
+    return vector / (vector.norm() + EPSILON)
+
+
+def _buildUprightFrame(joints: torch.Tensor) -> torch.Tensor:
+    """Build the frame-0 body rotation that maps the body to Y-up/+Z.
+
+    The body axes are derived from the rest-stable skeleton structure at
+    frame 0: ``up`` = pelvis→neck (torso), ``right`` = left→right hip
+    (orthogonalised against ``up``), ``forward`` = right × up.  The
+    returned matrix has these axes as ROWS, so left-multiplying the
+    pelvis rotation by it sends body-up → world +Y and body-forward →
+    world +Z.
+
+    Parameters
+    ----------
+    joints : torch.Tensor
+        Forward-kinematics joint positions, shape ``(F, 22, 3)``.
+
+    Returns
+    -------
+    torch.Tensor
+        A ``(3, 3)`` rotation matrix.
+    """
+    first = joints[0]
+    up = _normalize(first[NECK_INDEX] - first[PELVIS_INDEX])
+    right = first[RIGHT_HIP_INDEX] - first[LEFT_HIP_INDEX]
+    right = _normalize(right - (right @ up) * up)
+    forward = _normalize(torch.cross(right, up, dim=0))
+    return torch.stack([right, up, forward], dim=0)
+
+
+def _applyRootRotation(
+    motion: torch.Tensor,
+    extras: Mapping[str, object],
+    rotation: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """Left-multiply the pelvis rotation + root translation by ``rotation``.
+
+    Parameters
+    ----------
+    motion : torch.Tensor
+        Rotation6d motion, shape ``(F, 22, 6)``.
+    extras : Mapping[str, object]
+        Extras possibly holding ``"trans"`` (F, 3).
+    rotation : torch.Tensor
+        World rotation matrix ``(3, 3)`` to apply.
+
+    Returns
+    -------
+    tuple[torch.Tensor, dict[str, object]]
+        Rotated ``(motion, extras)``.
+    """
+    motion = motion.clone()
+    pelvisMatrix = sixdToRotationMatrix(motion[:, PELVIS_INDEX, :])
+    pelvisCanon = rotation.unsqueeze(0) @ pelvisMatrix
+    motion[:, PELVIS_INDEX, :] = torch.cat(
+        [pelvisCanon[..., 0], pelvisCanon[..., 1]], dim=-1
+    )
+    extrasOut: dict[str, object] = dict(extras)
+    raw = extrasOut.get(ROOT_TRANSLATION_KEY)
+    if raw is not None:
+        translation = torch.as_tensor(raw, dtype=motion.dtype)
+        extrasOut[ROOT_TRANSLATION_KEY] = translation @ rotation.t()
+    return motion, extrasOut
+
+
+def canonicalizeMotionUpright(
+    motion: torch.Tensor,
+    extras: MutableMapping[str, object] | Mapping[str, object],
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """Rotate a clip so frame 0 stands upright (Y-up) and faces +Z.
+
+    Root cause fix (2026-06-17): the AMASS→rot6d conversion applied the
+    raw AMASS root orientation (Z-up world) to the Y-up rest skeleton, so
+    preprocessed bodies were stored lying down in arbitrary directions.
+    This supersedes the yaw-only :func:`canonicalizeMotionFacing` by
+    building a full body frame from the hips + spine at frame 0 and
+    rotating the global (pelvis) rotation + root translation so the body
+    is canonical: up → world +Y, facing → world +Z.  All downstream
+    joints inherit the new frame via forward kinematics.
+
+    Parameters
+    ----------
+    motion : torch.Tensor
+        Rotation6d tensor shaped ``(frames, 22, 6)``.
+    extras : Mapping[str, object]
+        Top-level extras (may include ``"trans"``).
+
+    Returns
+    -------
+    tuple[torch.Tensor, dict[str, object]]
+        Canonicalised ``(motion, extras)``.
+    """
+    if (
+        motion.dim() != 3
+        or motion.shape[1] != len(SMPL22_BONE_ORDER)
+        or motion.shape[2] != 6
+    ):
+        raise ValueError(
+            "canonicalizeMotionUpright expects motion of shape "
+            f"(frames, 22, 6); got {tuple(motion.shape)}."
+        )
+    joints = rot6dToJointXYZ(motion.unsqueeze(0).float()).squeeze(0)
+    rotation = _buildUprightFrame(joints).to(motion.dtype)
+    return _applyRootRotation(motion, extras, rotation)
 
 
 def _computeRootYaw(motion: torch.Tensor) -> torch.Tensor:

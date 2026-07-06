@@ -325,7 +325,7 @@ class MotionNormalizer(nn.Module):
 
 
 # ---------------------------------------------------------------------
-# Single-frame delta helpers (Goal C controller)
+# Single-frame delta helpers (Goal A controller)
 # ---------------------------------------------------------------------
 # The controller works with per-step deltas of shape ``(B, numBones, C)``
 # (bone) and ``(B, C)`` (global) — i.e. *frame-less*.  The normalizer

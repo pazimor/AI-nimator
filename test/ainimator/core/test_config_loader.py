@@ -46,7 +46,7 @@ def test_load_network_config_parses_bone_data(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------
-# defaultPreprocessedDatasetRoot (Goal C controller CLIs)
+# defaultPreprocessedDatasetRoot (Goal A controller CLIs)
 # ---------------------------------------------------------------------
 def test_default_preprocessed_root_reads_output_root(tmp_path) -> None:
     from ainimator.core.config_loader import defaultPreprocessedDatasetRoot

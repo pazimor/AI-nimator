@@ -37,15 +37,17 @@ from ainimator.geometry.components import (
     buildMotionFeatureTensors,
 )
 from ainimator.geometry.components.feature_builder import (
-    canonicalizeMotionFacing,
+    canonicalizeMotionUpright,
 )
 
-# Phase 1.3 (2026-05-17) — facing-direction canonicalisation toggle.
-# Off by default for backwards compatibility with existing preprocessed
-# datasets.  When set (any non-empty value), every window is rotated so
-# the pelvis at frame 0 faces world +Z before features are built.  This
-# changes the data distribution, so a new normaliser fit and a full
-# from-scratch retrain are required when flipping the flag.
+# Orientation canonicalisation toggle.  2026-06-17 — upgraded from the
+# yaw-only facing fix to the full upright canonicalisation
+# (canonicalizeMotionUpright): the AMASS→rot6d conversion stored bodies
+# lying down in arbitrary directions (raw Z-up root orientation applied
+# to the Y-up rest skeleton).  When set (any non-empty value), every
+# window is rotated so frame 0 stands upright (Y-up) and faces +Z before
+# features are built.  This changes the data distribution, so a new
+# normaliser fit and a full from-scratch retrain are required.
 _CANONICALIZE_FACING_ENV = "AINIMATOR_CANONICALIZE_FACING"
 from ainimator.geometry.components.base import MotionComponent
 from ainimator.core.types import (
@@ -259,7 +261,7 @@ class DatasetPreprocessor:
             ):
                 continue
             if os.environ.get(_CANONICALIZE_FACING_ENV):
-                motionSlice, slicedExtras = canonicalizeMotionFacing(
+                motionSlice, slicedExtras = canonicalizeMotionUpright(
                     motion=motionSlice,
                     extras=slicedExtras,
                 )

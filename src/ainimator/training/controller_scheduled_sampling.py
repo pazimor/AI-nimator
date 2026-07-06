@@ -23,6 +23,7 @@ from __future__ import annotations
 import torch
 
 from ainimator.data.controller_sequences import ControllerSequenceBatch
+from ainimator.geometry.components import orthonormalizeRot6d
 from ainimator.model.controller_v2 import MotionController
 from ainimator.model.losses_controller_v2 import (
     ControllerLossResult,
@@ -109,6 +110,68 @@ def scheduledSamplingStep(
         nextBone, nextGlobal = _nextWorkingFrame(
             output, batch, deltaNormalizer, boneWindow, globalWindow,
             step, probability,
+        )
+        workingBone.append(nextBone.detach())
+        workingGlobal.append(nextGlobal.detach())
+
+    return accumulator.result(weights)
+
+
+def rolloutLossWindow(
+    model: MotionController,
+    batch: ControllerSequenceBatch,
+    stateNormalizer: MotionNormalizer,
+    deltaNormalizer: MotionNormalizer,
+    controlNorm: torch.Tensor,
+    deltaTensors: dict[str, torch.Tensor],
+    weights: ControllerLossWeights,
+    horizon: int,
+    promptEmb: torch.Tensor | None = None,
+) -> ControllerLossResult:
+    """Closed-loop rollout loss over a random window of ``horizon`` steps.
+
+    The inference-regime counterpart of :func:`scheduledSamplingStep`
+    (2026-07-05, long-horizon divergence fix): starting from a random
+    ground-truth window, the model consumes ONLY its own (detached,
+    re-orthonormalized — ``inference_contract.md`` §3.6) predictions for
+    ``horizon`` consecutive transitions, with the same per-step losses
+    against ground truth.  This teaches recovery from its own compounded
+    drift — the deployment regime the engines run in, where no ground
+    truth is ever re-injected.
+
+    The window start is drawn from torch's global RNG (seeded by the
+    trainer), uniformly over the clip's valid range; a ``horizon``
+    longer than the clip is clamped.
+    """
+    numSteps = min(horizon, batch.numTransitions)
+    maxStart = batch.numTransitions - numSteps
+    start = int(torch.randint(maxStart + 1, ())) if maxStart > 0 else 0
+
+    window = model.config.contextFrames
+    workingBone = list(batch.boneWindow[start].unbind(dim=0))
+    workingGlobal = list(batch.globalWindow[start].unbind(dim=0))
+    accumulator = _LossAccumulator()
+
+    for step in range(start, start + numSteps):
+        boneWindow = torch.stack(workingBone[-window:], dim=0).unsqueeze(0)
+        globalWindow = torch.stack(
+            workingGlobal[-window:], dim=0
+        ).unsqueeze(0)
+        output = model(
+            stateNormalizer.normalizeBone(boneWindow),
+            controlNorm[step : step + 1],
+            globalWindow=stateNormalizer.normalizeGlobal(globalWindow),
+            phase=_phaseAt(batch, step),
+            promptEmb=(
+                None if promptEmb is None else promptEmb[step : step + 1]
+            ),
+        )
+        _accumulateStepLoss(
+            accumulator, output, batch, deltaTensors, step, weights,
+            deltaNormalizer, boneWindow,
+        )
+        nextBone, nextGlobal = _predictedNextFrame(
+            output, deltaNormalizer, boneWindow, globalWindow
         )
         workingBone.append(nextBone.detach())
         workingGlobal.append(nextGlobal.detach())
@@ -225,18 +288,36 @@ def _nextWorkingFrame(
     usePrediction = bool(torch.rand(()) < probability)
     if not usePrediction:
         return batch.targetBoneNext[step], _gtNextGlobal(batch, step)
+    return _predictedNextFrame(
+        output, deltaNormalizer, boneWindow, globalWindow
+    )
+
+
+def _predictedNextFrame(
+    output: object,
+    deltaNormalizer: MotionNormalizer,
+    boneWindow: torch.Tensor,
+    globalWindow: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The model's own next frame, as the inference loop would build it.
+
+    Re-orthonormalizes the accumulated bone frame exactly like the
+    normative rollout (``inference_contract.md`` §3.6) so training-time
+    feedback matches what the engines actually feed back at runtime.
+    """
     rawBoneDelta, rawGlobalDelta = denormalizeStepDelta(
         deltaNormalizer,
         output.boneDelta,  # type: ignore[attr-defined]
         output.globalDelta,  # type: ignore[attr-defined]
     )
-    nextBone = (boneWindow[:, -1, :, :] + rawBoneDelta)[0]
+    nextBone = orthonormalizeRot6d(
+        boneWindow[:, -1, :, :] + rawBoneDelta
+    )[0]
     if rawGlobalDelta is None:
         # Keep the last global frame (zero delta = no motion).
         return nextBone, globalWindow[0, -1, :]
     # The next frame in the global context window is the predicted delta.
-    nextGlobal = rawGlobalDelta[0]
-    return nextBone, nextGlobal
+    return nextBone, rawGlobalDelta[0]
 
 
 def _gtNextGlobal(
