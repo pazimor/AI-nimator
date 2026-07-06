@@ -1,148 +1,162 @@
 # AI_nimator
-Research project: train a diffusion model to generate 3D skeletal
-animations (SMPL-22) from text prompts, based on the AMASS dataset.
+Research project: train a **deterministic autoregressive controller** (with
+an integrated text encoder) to generate 3D skeletal animations (SMPL-22)
+from text prompts and/or control signals, based on the AMASS dataset.
 
-> **READ FIRST: `doc/ROADMAP.md`** is the canonical roadmap (refactor plan,
-> scaling protocol, settled decisions, role split). Follow its phases and
-> acceptance criteria; do not re-litigate its "Vérités canoniques".
+> **READ FIRST: `doc/ROADMAP.md`** is the canonical project frame (vérités,
+> layered architecture, health, roles). Execution lives in
+> `doc/ROADMAP_DETERMINIST.md` (the model: controller + integrated text
+> encoder) and `doc/ROADMAP_PLUGINS.md` (Unity/Unreal plugins).
+> Do not re-litigate the "Vérités canoniques".
 
 ## Stack
-- Language: python (poetry — see pyproject.toml for dependencies)
-- Framework: pytorch, device MPS (Mac 32GB) — batch 2–8 + grad accumulation
-- Dataset paths: src/configs/dataset.yaml
+- Language: python (poetry — see pyproject.toml for dependencies), CPP (unreal engine plugin), C# (unity plugin)
+- Framework: pytorch
+- hardware: device MPS (Mac 24GB) — device AMD 7900xtx (GPU 24GB not for developpements) 
 - Testing: pytest
 
+> ⚠ **Environnement (MANDATORY — `G-ENV`).** Tout passe par Poetry
+> (`poetry install`, `poetry run …`), Python 3.12/3.13. `pyproject.toml` est
+> PEP 621 : `[project].requires-python` doit être un spécificateur **PEP 440**
+> (`>=3.12,<3.14`), **jamais** un caret Poetry (`^3.12`) — celui-ci casse
+> Poetry 2.x. Les `testpaths`/coverage ne pointent que des dossiers existants
+> (`src`, `test`, `apps`). Après toute édition de `pyproject.toml` :
+> `poetry lock` puis `poetry install`. (Fix appliqué le 2026-06-24 :
+> caret→PEP 440, `tools`→`apps`.)
+
 ## Canonical decisions (summary — full list in ROADMAP §2)
-- **v2 stack only**: v-prediction + cosine β + DDIM 100 + Min-SNR-γ=5.
+- **Full deterministic** (pivot 2026-06-23): the engine is the autoregressive
+  controller `f(state, control, [prompt], [phase]) → Δstate`. No diffusion,
+  no sampling loop. (Diffusion truths kept as history only.)
+- **All-in-one model with integrated text encoder** (ROADMAP_DETERMINIST
+  §2.4, §3.0 schema): the controller takes a **control signal** (real-time)
+  and/or a **text prompt** (high-level), the prompt encoded by the reused
+  custom BPE encoder. Text encoder stays **decoupled** (`TextEncoderProtocol`,
+  versioned artifact) — never redefined by the controller.
 - **Lean representation**: 135 channels (rotation6d 132 + root_translation 3).
   FK-derivable signals are supervised at the loss, never predicted.
-- **Text encoder**: custom BPE 8k + transformer 4L/256d is the target.
-  Frozen CLIP (`textEncoderType="clip"`) = diagnostic baseline only.
-- **Encoder is DECOUPLED from generation** (ROADMAP §2.9, phase A7):
-  standalone module + artifact, consumed via `TextEncoderProtocol`;
-  training regime (joint vs pre-trained) is decided experimentally (B2).
-- **ONNX exportability is a design constraint** (ROADMAP §2.10, phase A8):
-  never block the Mac NPU path. No data-dependent control flow or
-  `.item()` in `forward()`; DDIM loop stays outside the graph; dynamic
-  axes (batch, frames, text length). CI export test must stay green.
-- **Conditioning**: cross-attn + FiLM + per-block AdaLN + learnable null
-  embedding — all flags stay ON by default.
-- **Z-normalization is mandatory and asserted** (post-norm ≈ N(0,1));
-  CFG dropout mandatory when sampling with cfgScale > 1.
+- **ONNX exportability is a design constraint**: never block the NPU path.
+  No data-dependent control flow or `.item()` in `forward()`; the
+  autoregressive loop + text-encoder pass stay outside the per-frame graph
+  (one forward = one step); dynamic axes declared. CI export test stays green.
+- **Conditioning**: FiLM + per-block AdaLN + learnable null embedding — ON by
+  default (control + text embedding both enter the same conditioning block).
+- **Z-normalization is mandatory and asserted** (post-norm ≈ N(0,1) on state
+  and deltas).
 - **`health/` is THE single debug tool** (Probe/Contract/HealthHub).
-  Score reference table (direction, targets, thresholds): ROADMAP §3.5.
-  Sanity criteria: cfg_sim < 0.95, seed_sim < 0.90, encoder
-  cond↔uncond sim < 0.5.
-- **Capacity↔N scaling law** (established 2026-06-12, memorization
-  regime): denoiser params ≈ ∝ N (384/4→N≤50, 512/6→N≤500,
-  640/8→N=1000 ✓). Validated recipe: cond-mask-prob 0.10, **CFG 4–6 at
-  inference** (mandatory at scale), ~600 exposures/sample. Evaluate
-  retrieval/fidelity at cfg ∈ {1,4,6}. Details: ROADMAP §5.2, LOG.md.
+  Deterministic contracts: `control_sensitivity`, `mean_collapse`,
+  `rollout_drift` (ROADMAP_DETERMINIST §4). Score table: ROADMAP §4.1.
+- **Capacity↔N law** (hypothesis inherited from the diffusion runs, retested
+  on the controller in A6): scale capacity with the number of clips; do a
+  capacity probe before any large run. Details: ROADMAP_DETERMINIST §5 (A6).
+
+## Code conventions
+Conventions live in **`doc/GUIDELINES.md`**, one self-contained paragraph per
+guideline with a stable ID (`G-XXX`). Retrieve a single one without reading
+the whole file:
+
+```bash
+grep -A8 'G-DOCSTRING' doc/GUIDELINES.md     # or: rg -A8 'G-DOCSTRING'
+```
 
 ## Directory Structure
-Current layout (post-A5):
-- `src/ainimator/` — single installable package in dependency layers:
-    - `core/` (L0) — types, constants, config schema, device, logging
-    - `geometry/` (L1) — quaternion, rot6d, FK, SMPL-22 skeleton,
-      motion components
-    - `data/` (L2) — preprocessed dataset, dataset builder, augmentation
-    - `text/` (L3) — BPE tokenizer, custom encoder, CLIP wrapper
-    - `diffusion/` (L3) — cosine schedule, DDIM math, noise schedule
-    - `model/` (L3, above text/diffusion) — denoiser v2, losses v2,
-      sampler v2, motion normalizer, layers
-    - `health/` (L4) — Probe/Contract/HealthHub (A3)
-    - `training/` (L4) — v2 training loops (full + overfit)
-    - `export/` (L4) — postprocess/Collada (ONNX in A8)
-    - `cli/` (L5) — entrypoints, zero logic
-- `src/configs/` — YAML configurations (outside the package);
-  `network.yaml` now has the `v2` profile only (v1 profiles archived)
-- `legacy/` — v1 code archived in phase A5, importable by nothing
-    - `ainimator/` — archived v1 modules (training, model/clip, cli, core)
-    - `configs/` — archived v1 network profiles
-    - `test/` — archived v1 tests
-- `scripts/` — experiment orchestrators (scaling sweeps)
-- `output/` — generated files and run outputs
-- `test/ainimator/` — mirrors src/ainimator/ layer tree
-- `doc/` — internal documentation (ROADMAP.md, experiments/LOG.md)
-
-Import rules enforced by `import-linter` (`.importlinter`):
-- Imports point DOWN only (ascending imports are FORBIDDEN).
-- `model` never imports `data`.
-- `training` is the only module that sees both `data` and `model`.
-- `cli` has zero logic.
-- `legacy/` is importable by nothing in `ainimator.*` (contract active
-  since phase A5).
+**Single recap of the repo tree: `doc/ROADMAP.md` §3.1.** Do not duplicate
+it elsewhere. In short: `src/ainimator/` is one package in dependency layers
+(core → geometry → data / text / diffusion → model → health / training /
+export → cli), `src/configs/` holds YAML, `apps/` holds the engine apps
+(spec / build / unity-sentis / unreal-nne) plus the decoupled health
+`monitor/`, all outside the Python package; `legacy/` is archived. Import rules (imports DOWN only, `model` never imports
+`data`, `training` is the sole data↔model junction, `cli` zero logic,
+`legacy/` importable by nothing) are enforced by `import-linter` — see
+guideline `G-IMPORTS`.
 
 ## Commands
-All commands use the new `ainimator.*` package path (phase A2+).
+All commands use the new `ainimator.*` package path.
 `poetry install` registers `ainimator` as an editable package
 (no manual `.pth` setup required).
 
+> **Post-pivot (2026-06-23) : la diffusion n'est plus à l'ordre du jour.**
+> Le **contrôleur déterministe est la voie produit** (phases A, voir
+> `doc/ROADMAP_DETERMINIST.md`). Les CLI diffusion ci-dessous sont
+> **conservées mais inactives** (default `model-type: diffusion` non encore
+> rebasculé — arbitrage Pazimor) ; ne pas y investir.
+
+**Voie produit — contrôleur déterministe** (config-first : un run se pilote
+par un **profil** YAML `--profile {overfit|full|debug}`, pas par des flags
+d'hyperparamètre — cf. `ROADMAP_DETERMINIST.md` §3.2 ; cible A7) **:**
+- `poetry run python -m ainimator.cli.train_controller_v2` — entraînement
+  contrôleur, overfit 1 clip (smoke test canonique, A1)
+- `poetry run python -m ainimator.cli.train_controller_multiclip_v2` —
+  validation A2/A4 (multi-clips, sans split) *(à archiver en A7)*
+- `poetry run python -m ainimator.cli.train_controller_generalization_v2` —
+  A6 : split train / held-out, eval de généralisation *(devient le profil
+  `full` unifié en A7)*
+- `poetry run python -m ainimator.cli.generate_controller_v2` — rollout +
+  export anim
+- `poetry run python -m ainimator.cli.export_onnx controller` — export d'un
+  **seul forward** contrôleur (A5)
+
+**Partagé (data, encodeur, santé, qualité) :**
 - `poetry run python -m ainimator.cli.build_dataset` — match prompts
 - `poetry run python -m ainimator.cli.preprocess_dataset` — preprocess
 - `poetry run python -m ainimator.cli.train_custom_tokenizer` — BPE
-- `poetry run python -m ainimator.cli.train_generation_v2 --profile {overfit,full,debug}`
-  — v2 training (overfit = sanity check, full = real run, debug = fast
-  end-to-end < 2 min); equivalent shorthand: `--debug` flag
-- `poetry run python -m ainimator.cli.train_generation_v2 --debug --dataset-root <path> --tokenizer-dir <path> --output-dir output/debug_run`
-  — fast debug run: reduced 64d/1L model, 50 steps, health every step,
-  one `.dae` generated; target < 2 min on MPS
-- `make smoke-test` — overfit-1-batch sanity check (no real dataset needed,
-  runs on synthetic data via pytest)
-- `poetry run python -m ainimator.cli.generate_animation_v2` — sample + export .dae
-- `poetry run python -m ainimator.cli.diagnose_generation_v2` — conditioning
-  diagnostics (absorbed into `ainimator.cli.health` after phase A3)
-- `poetry run python -m ainimator.cli.health {watch|audit|diagnose|report}` —
-  global debug tool (available from phase A3)
 - `poetry run python -m ainimator.cli.train_text_encoder` — standalone encoder
-  training (available from phase A7)
-- `poetry run python -m ainimator.cli.export_onnx {encoder|denoiser}` — ONNX
-  export, NPU path (available from phase A8)
+  (encodeur intégré au modèle tout-en-un)
+- `poetry run python -m ainimator.cli.health {watch|audit|diagnose|report}` —
+  outil de debug global (`diagnose` route selon `model-type`)
+- `poetry run pytest test/ainimator/training/test_controller_training_v2.py -v`
+  — smoke test overfit contrôleur (sanity check canonique, vérité #7)
+- `poetry run streamlit run apps/monitor/app.py` — moniteur santé Streamlit
+  (`ROADMAP_MONITOR.md`)
 - `poetry run pytest` — test suite
 - `poetry run lint-imports` — verify layer contracts (must be green)
 
-Legacy v1 (archived in phase A5 — see `legacy/`): `train_clip`,
+> **Makefile supprimé (2026-06-24).** Les raccourcis (`smoke-test`,
+> `debug-run`, `monitor`, futurs `plugin-unity/unreal`) étaient périmés
+> post-pivot ; ils sont remplacés par les commandes Poetry ci-dessus. Un
+> Makefile sera **refait** avec l'orchestrateur de build `apps/build/`
+> (Goal B / phase B5, cf. `ROADMAP_PLUGINS.md §3.4`).
+
+> ⚠ **Export NON migré.** `export_onnx` reste centré
+> `{encoder|denoiser|controller}` (un forward). Le **bundle contrôleur**
+> attendu par le Goal B (`--bundle` : onnx + `norm_stats.json` +
+> `manifest.json` + `presets/`, cf. `ROADMAP_PLUGINS.md` B0) **n'existe pas
+> encore** — trou de code à combler avant tout packaging plugin.
+
+**Voie diffusion (inactive, non migrée — conservée pour référence) :**
+- `poetry run python -m ainimator.cli.train_generation_v2 --profile {overfit,full,debug}`
+  (équivalent : flag `--debug`)
+- `poetry run python -m ainimator.cli.generate_animation_v2` — sample + .dae
+- `poetry run python -m ainimator.cli.diagnose_generation_v2` — diagnostics
+  conditionnement (absorbé dans `ainimator.cli.health`)
+- `poetry run python -m ainimator.cli.export_onnx {encoder|denoiser}`
+
+Legacy v1 (archived — see `legacy/`): `train_clip`,
 `train_generation`, `generate_animation` v1, `precompute_generation_text_cache`.
 Do NOT import from `legacy/` in any `src/ainimator/` module — enforced by
 `lint-imports` contract `no_legacy_imports`.
 
-## Conventions
-- Document every method with full **DOCString** (NumPy Style).
-- Be compliant with Pylance (strict types).
-- Avoid **magic numbers** and strings: always use named constants or enums.
-- Use **explicit functions** (pure and reusable).
-- Avoid shortcuts: no `i`, `m`, etc. in anonymous functions or methods.
-- No method should exceed 25 lines.
-- No column should exceed 80 characters.
-- Try to keep max file length around 500 lines.
-- Dataclasses go inside `ainimator/core/types`.
-- Refactor into private functions when necessary.
-- Use **isolated unit tests** (no cross-module dependencies).
-
 ## Rules for agents working on this repo
-Three project agents are defined in `.claude/agents/`: **implementer**
-(Sonnet, phases A1–A8 + data-extraction requests), **experimenter**
-(Opus, protocol B0–B4, files requests in `doc/experiments/requests/`),
-**reviewer** (read-only acceptance-criteria gate). Role split: ROADMAP §6.
+Five project agents are defined in `.claude/agents/`, **scoped by function /
+filesystem boundary** (the phase is only a cursor):
+- **orchestrator** (Opus, global vision — decomposes a prompt, routes to the right specialist, owns run/regression analysis, and relays data-extraction requests to dev-python-neural; reads everything, writes no code),
+- **dev-python-neural** (Sonnet, Python / neural-network specialist — the network under `src/ainimator/`: controller + integrated text encoder + health/ + export; also data-extraction requests in `doc/experiments/requests/`),
+- **reviewer** (Sonnet, read-only QA / acceptance + conventions gate),
+- **dev-unity-plugin** (C#/Sentis, `apps/unity-sentis/` only),
+- **dev-unreal-plugin** (C++/NNE, `apps/unreal-nne/` only).
 
-- Follow ROADMAP phases **in order**; a phase is done only when ALL its
-  acceptance criteria pass.
-- **Never change existing hyperparameter defaults** without an explicit
-  instruction from Pazimor.
-- Every training run must write `resolved_config.yaml` in its outputDir
-  (from phase A1 on).
-- Run the overfit-1-sample smoke test before any long run; never launch
-  runs > 30 min without asking.
-- Atomic commits per coherent change; ask instead of choosing silently
-  when a requirement is ambiguous.
-- Every concluded experiment adds one line to `doc/experiments/LOG.md`
-  (date, run, config, metrics, verdict); new decisions are reported into
-  ROADMAP.md with a date.
+Role split: ROADMAP §5. Agents are routed by their file `name:`
+(`orchestrator`, `dev-python-neural`, `reviewer`, `dev-unity-plugin`,
+`dev-unreal-plugin`). The former `experimenter` role was removed (2026-06-25):
+run/regression analysis folds onto the orchestrator (Opus) + Pazimor; the
+`doc/experiments/requests/` workflow stays, fulfilled by dev-python-neural.
 
-## Skills & external tools
-- **pytorch-auditor** (skill): quantitative checkpoint audit (weights,
-  NaN, dead layers, optimizer). `hub.audit()` is its level 3–4 adapter.
-- **ai-debugging** (skill): debugging methodology loop (collect → review
-  → hypotheses → test) — use it for any "model behaves wrong" issue.
-- Blender: manual visual validation of generated .dae on the probe set
-  (walk/jump/sit/wave/run) — Pazimor's responsibility.
+- Follow the phases of the relevant fiche **in order**; a phase is done only
+  when ALL its acceptance criteria pass.
+- Conventions are in `doc/GUIDELINES.md`, also packaged as the **`guidelines`
+  skill** (`.claude/skills/guidelines/`) that agents load on any code /
+  review task. See "Code conventions" above for how to retrieve one paragraph. Key ones: `G-HYPERPARAMS` (never change
+  defaults without Pazimor), `G-RESOLVEDCONFIG` (every run writes
+  `resolved_config.yaml`), `G-RUNS` (smoke test before any long run; never
+  > 30 min without asking), `G-COMMITS` (atomic commits, ask when ambiguous),
+  `G-LOG` (one LOG.md line per experiment; new decisions dated in ROADMAP*).

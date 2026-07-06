@@ -56,6 +56,6 @@ poetry run lint-imports
 
 ## Notes
 
-- All commands use `ainimator.cli.*` (post phase A2).
+- All commands use `ainimator.cli.*`.
 - Legacy v1 commands (`src.cli.*`) are archived and should not be extended.
 - `doc/ROADMAP.md` is the canonical reference for phases and decisions.
