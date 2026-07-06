@@ -445,6 +445,54 @@ une fois B0 figé.
   canoniques) ; parité pooled torch↔ORT ≤ 1e-3 ; `SetPromptText` échoue
   proprement sur un bundle A7.0 ; zéro régression presets.
 
+### Phase B8 — Boucle visuelle & itération outillée (décidée 2026-07-06)
+*(élaborée avec Pazimor ; ordre d'exécution V1 → V2 → G1 → G2 → U1/UE1 → U2.
+Les fiches V*/G* vivent côté repo `ainimator`, les U*/UE* côté plugins.)*
+
+- **V1 — `render_rollout` (visualisation sans Blender)** : à partir d'un
+  rollout sauvé (`generate_controller_v2 --output`), produire (a) un
+  contact-sheet PNG (keyframes multi-vues + trajectoire racine, rendu PIL —
+  pas de dépendance nouvelle) et (b) un viewer HTML autonome (canvas,
+  play/pause/scrub, animation embarquée). Logique dans
+  `health/` (outil de debug), CLI mince.
+  *Acceptation* : une commande transforme un `.pt` de rollout en PNG + HTML ;
+  un agent peut diagnostiquer visuellement un rollout en lisant le PNG.
+- **V2 — boucle overfit une-commande** : enchaîner train overfit →
+  generate → render en une commande (interpréteur venv direct tant que
+  poetry est cassé). *Acceptation* : une commande, < 10 min, sortie
+  visuelle V1 en bout de chaîne.
+- **G1 — contrôle synthétique scriptable** : piste de contrôle définie par
+  fichier (segments vitesse/direction/prompt, l'équivalent d'une séquence
+  clavier) en alternative au contrôle dérivé du GT dans
+  `generate_controller_v2` — c'est le vrai test de parité avec le moteur.
+  *Acceptation* : un rollout piloté 100 % sans dataset (hors état initial).
+- **G2 — post-process correcteur (sortie de rollout)** : module Python
+  déterministe grounder (projection sol / anti-pénétration) + foot-lock par
+  détection de contact (miroir du B4 moteur) + lissage existant. **Hors
+  graphe ONNX** (post-process pur) ; les métriques `health/` se mesurent
+  sur le rollout **brut** (le correcteur ne doit pas maquiller les
+  régressions). *Acceptation* : rendu brut vs corrigé côte à côte ;
+  contacts pieds stables sur un cycle de marche corrigé.
+- **U1 — prefab Unity tout-en-Inspector** : prefab posé en scène (pas
+  d'instanciation runtime) avec bonhomme bâton SMPL-22 procédural par
+  défaut, **slot `Model` drag-and-drop** (si renseigné : RigMap/retarget,
+  bâton masqué), bindings WASD par défaut pré-câblés via
+  `AInimatorActionBinder` (éditables Inspector, zéro code), prompt piloté
+  par script (`SetPromptText`/`SetPrompt`) + champ prompt initial.
+  *Acceptation* : drag du prefab + bundle → personnage animé au WASD en
+  Play mode sans écrire une ligne de code.
+- **UE1 — parité Unreal** : même surface que U1 sur `apps/unreal-nne/`
+  (le miroir existe déjà : `AInimatorDemoPawn`, `AInimatorActionBinding`,
+  `AInimatorSmpl22Skeleton`) : pawn/Blueprint prêt-à-poser, bâton
+  procédural, slot mesh, bindings par défaut Enhanced Input éditables en
+  Details panel, prompt par Blueprint/C++. Le **bundle est partagé tel
+  quel** (même ONNX + manifest) ; quand G2 fige un correcteur, il se
+  réplique dans les deux runtimes (comme le fix §3.6). *Acceptation* :
+  parité fonctionnelle avec U1, checklist commune.
+- **U2 — recette host project (Pazimor)** : prefab U1 + rig Mixamo dans le
+  projet de test Unity ; checklist de recette visuelle. *Acceptation* :
+  verdict Pazimor consigné dans LOG.md.
+
 ---
 
 ## 5. Répartition des rôles
