@@ -23,4 +23,4 @@ doc/build/*
 .claude/worktrees
 
 #binarys
-*.onnx
+*.onnx.mcp-memory/
