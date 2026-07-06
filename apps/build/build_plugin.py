@@ -103,7 +103,11 @@ class BuildError(SystemExit):
         super().__init__(f"build_plugin: {message}")
 
 
-def exportBundle(checkpoint: Path, bundleDir: Path) -> None:
+def exportBundle(
+    checkpoint: Path,
+    bundleDir: Path,
+    encoderArtifact: Path | None = None,
+) -> None:
     """Run the export CLI to produce a fresh bundle (step 1).
 
     Parameters
@@ -112,9 +116,17 @@ def exportBundle(checkpoint: Path, bundleDir: Path) -> None:
         Controller checkpoint (mandatory, validated to exist).
     bundleDir : Path
         Destination directory for the bundle.
+    encoderArtifact : Path | None
+        Frozen CLIP text-encoder artifact.  When given the bundle
+        ships the in-engine text encoder (B7 / A7.1 —
+        ``apps/spec/text_encoding.md``).
     """
     if not checkpoint.exists():
         raise BuildError(f"checkpoint not found: {checkpoint}")
+    if encoderArtifact is not None and not encoderArtifact.exists():
+        raise BuildError(
+            f"encoder artifact not found: {encoderArtifact}"
+        )
     resolvedConfig = checkpoint.parent.parent / "resolved_config.yaml"
     command = [
         sys.executable, "-m", "ainimator.cli.export_onnx", "bundle",
@@ -123,6 +135,8 @@ def exportBundle(checkpoint: Path, bundleDir: Path) -> None:
     ]
     if resolvedConfig.exists():
         command += ["--resolved-config", str(resolvedConfig)]
+    if encoderArtifact is not None:
+        command += ["--encoder-artifact", str(encoderArtifact)]
     LOGGER.info("[1/4] export: %s", " ".join(command))
     result = subprocess.run(command, cwd=REPO_ROOT)
     if result.returncode != 0:
@@ -267,6 +281,14 @@ def _parseArgs(argv: list[str] | None = None) -> argparse.Namespace:
         "--skip-engine-build", action="store_true",
         help="Stop after delivery (machine without the engine).",
     )
+    parser.add_argument(
+        "--encoder-artifact", type=Path, default=None, metavar="DIR",
+        dest="encoderArtifact",
+        help=(
+            "Frozen CLIP text-encoder artifact.  Ships the in-engine "
+            "text encoder in the bundle (B7 / A7.1). Optional."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -277,7 +299,7 @@ def main(argv: list[str] | None = None) -> None:
     target = TARGETS[args.target]
     with tempfile.TemporaryDirectory(prefix="ainimator_bundle_") as tmp:
         bundleDir = Path(tmp) / "bundle"
-        exportBundle(args.checkpoint, bundleDir)
+        exportBundle(args.checkpoint, bundleDir, args.encoderArtifact)
         validateBundle(bundleDir, target)
         delivered = deliverBundle(bundleDir, target)
     if args.skip_engine_build:

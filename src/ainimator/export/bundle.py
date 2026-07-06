@@ -50,13 +50,23 @@ from ainimator.model.motion_normalizer import MotionNormalizer
 LOGGER = logging.getLogger(__name__)
 
 # Bundle format version — bump on breaking manifest changes.
-BUNDLE_VERSION = "A7.0"
+# A7.1 (B7, 2026-07-04): optional text_encoder.onnx + tokenizer/ for
+# in-engine prompt encoding — minor bump, engine gates filter on the
+# major only (apps/spec/text_encoding.md §1).
+BUNDLE_VERSION = "A7.1"
 
 # Canonical filenames inside the bundle directory.
 ONNX_FILENAME = "controller.onnx"
 NORM_STATS_FILENAME = "norm_stats.json"
 MANIFEST_FILENAME = "manifest.json"
 PRESETS_SUBDIR = "presets"
+TEXT_ENCODER_FILENAME = "text_encoder.onnx"
+TOKENIZER_SUBDIR = "tokenizer"
+
+# Special-token strings of the CLIP vocabulary — resolved to ids from
+# the exported vocab.json (never hardcoded ids).
+_BOS_TOKEN = "<|startoftext|>"
+_EOS_TOKEN = "<|endoftext|>"
 
 # Default preset walking speed, meters per frame in the root-local
 # ground frame (~1 m/s at the 30 fps dataset rate).  Presets are
@@ -142,6 +152,9 @@ class BundleManifest:
         Human-readable note about what is z-normalized.
     reservedInputGroups : list[str]
         Bus groups reserved for future extension (§2.2.d).
+    textEncoder : dict[str, Any] | None
+        Optional in-engine text-encoder section (B7, bundle A7.1) —
+        ``None`` for embedding-only bundles (A7.0 behaviour).
     """
 
     bundleVersion: str
@@ -158,6 +171,7 @@ class BundleManifest:
     coordSystem: str
     normalizationNote: str
     reservedInputGroups: list[str] = field(default_factory=list)
+    textEncoder: dict[str, Any] | None = None
 
     def toDict(self) -> dict[str, Any]:
         """Convert to a JSON-serialisable dictionary.
@@ -167,7 +181,7 @@ class BundleManifest:
         dict[str, Any]
             Plain dict with all fields (lists preserved as lists).
         """
-        return {
+        payload: dict[str, Any] = {
             "bundle_version": self.bundleVersion,
             "state_channels": self.stateChannels,
             "num_bones": self.numBones,
@@ -183,15 +197,23 @@ class BundleManifest:
             "normalization_note": self.normalizationNote,
             "reserved_input_groups": self.reservedInputGroups,
         }
+        if self.textEncoder is not None:
+            payload["text_encoder"] = self.textEncoder
+        return payload
 
 
-def _buildManifest(controller: MotionController) -> BundleManifest:
+def _buildManifest(
+    controller: MotionController,
+    textEncoderSection: dict[str, Any] | None = None,
+) -> BundleManifest:
     """Build the manifest from the controller's frozen config.
 
     Parameters
     ----------
     controller : MotionController
         Trained controller (config is authoritative for the manifest).
+    textEncoderSection : dict[str, Any] | None
+        Optional ``text_encoder`` manifest section (B7 bundles).
 
     Returns
     -------
@@ -226,6 +248,7 @@ def _buildManifest(controller: MotionController) -> BundleManifest:
             "reaction",
             "morphology",
         ],
+        textEncoder=textEncoderSection,
     )
 
 
@@ -296,6 +319,7 @@ def exportControllerBundle(
     resolvedConfigPath: Path | None = None,
     presets: dict[str, dict[str, Any]] | None = None,
     batchSize: int = 1,
+    encoderArtifactPath: Path | None = None,
 ) -> Path:
     """Assemble a complete controller bundle in ``outputDir``.
 
@@ -333,6 +357,12 @@ def exportControllerBundle(
         for an explicitly preset-free bundle.
     batchSize : int
         Concrete batch size for the ONNX trace example.
+    encoderArtifactPath : Path | None
+        Frozen text-encoder artifact directory.  When provided the
+        bundle additionally ships ``text_encoder.onnx`` +
+        ``tokenizer/`` for in-engine prompt encoding (B7 / A7.1 —
+        ``apps/spec/text_encoding.md``).  Requires a text-conditioned
+        controller (``promptEmbChannels > 0``).
 
     Returns
     -------
@@ -347,7 +377,10 @@ def exportControllerBundle(
         stateNorm, deltaNorm, controlMean, controlStd, outputDir,
         controller=controller,
     )
-    _writeManifest(controller, outputDir)
+    textEncoderSection = _writeTextEncoder(
+        encoderArtifactPath, controller, outputDir, batchSize
+    )
+    _writeManifest(controller, outputDir, textEncoderSection)
     _copyResolvedConfig(resolvedConfigPath, outputDir)
     _writePresets(presets, outputDir)
     LOGGER.info("Controller bundle complete at: %s", outputDir)
@@ -399,14 +432,98 @@ def _writeNormStats(
     LOGGER.info("Norm stats written: %s", normPath)
 
 
-def _writeManifest(controller: MotionController, outputDir: Path) -> None:
+def _writeManifest(
+    controller: MotionController,
+    outputDir: Path,
+    textEncoderSection: dict[str, Any] | None = None,
+) -> None:
     """Write the I/O contract manifest to ``manifest.json``."""
     manifestPath = outputDir / MANIFEST_FILENAME
-    manifest = _buildManifest(controller)
+    manifest = _buildManifest(controller, textEncoderSection)
     manifestPath.write_text(
         json.dumps(manifest.toDict(), indent=2), encoding="utf-8"
     )
     LOGGER.info("Manifest written: %s", manifestPath)
+
+
+def _writeTextEncoder(
+    encoderArtifactPath: Path | None,
+    controller: MotionController,
+    outputDir: Path,
+    batchSize: int,
+) -> dict[str, Any] | None:
+    """Ship the in-engine text encoder in the bundle (B7 / A7.1).
+
+    Exports the pooled encoder graph to ``text_encoder.onnx`` and the
+    verbatim HuggingFace ``vocab.json`` / ``merges.txt`` under
+    ``tokenizer/``, then returns the manifest ``text_encoder`` section
+    (``apps/spec/text_encoding.md`` §1).  Returns ``None`` when no
+    artifact is supplied (A7.0-style bundle, embeddings only).
+
+    Raises
+    ------
+    ValueError
+        If the controller has no prompt channel, the artifact is not a
+        CLIP-type artifact, or the encoder width does not match the
+        controller's ``promptEmbChannels`` (fail-fast, never a silent
+        mismatch).
+    """
+    if encoderArtifactPath is None:
+        return None
+    if controller.config.promptEmbChannels <= 0:
+        raise ValueError(
+            "encoderArtifactPath given but the controller has "
+            "promptEmbChannels == 0 — a text encoder cannot condition "
+            "a promptless controller."
+        )
+    from ainimator.export.onnx import exportPooledTextEncoder
+    from ainimator.text.artifact import loadEncoderArtifact
+
+    encoder, tokenizer = loadEncoderArtifact(
+        encoderArtifactPath, device=torch.device("cpu")
+    )
+    if not hasattr(tokenizer, "saveVocabulary"):
+        raise ValueError(
+            "In-engine text encoding (B7) requires a CLIP-type "
+            f"artifact; got tokenizer {type(tokenizer).__name__} "
+            "without a serialisable vocabulary."
+        )
+    if encoder.outputDim != controller.config.promptEmbChannels:
+        raise ValueError(
+            f"Encoder outputDim ({encoder.outputDim}) != controller "
+            f"promptEmbChannels ({controller.config.promptEmbChannels})."
+        )
+    encoder.eval()
+    maxLength = tokenizer.config.maxLength
+    exportPooledTextEncoder(
+        encoder=encoder,
+        outputPath=outputDir / TEXT_ENCODER_FILENAME,
+        maxLength=maxLength,
+        batchSize=batchSize,
+    )
+    vocabPath, mergesPath = tokenizer.saveVocabulary(
+        outputDir / TOKENIZER_SUBDIR
+    )
+    vocab = json.loads(vocabPath.read_text(encoding="utf-8"))
+    LOGGER.info(
+        "Text encoder shipped: %s + %s",
+        TEXT_ENCODER_FILENAME,
+        TOKENIZER_SUBDIR,
+    )
+    return {
+        "file": TEXT_ENCODER_FILENAME,
+        "tokenizer": {
+            "type": "clip-bpe",
+            "vocab": f"{TOKENIZER_SUBDIR}/{vocabPath.name}",
+            "merges": f"{TOKENIZER_SUBDIR}/{mergesPath.name}",
+            "max_length": maxLength,
+            "bos_id": int(vocab[_BOS_TOKEN]),
+            "eos_id": int(vocab[_EOS_TOKEN]),
+            "pad_id": int(vocab[_EOS_TOKEN]),
+        },
+        "pooling": "masked_mean",
+        "embedding_channels": int(encoder.outputDim),
+    }
 
 
 def _copyResolvedConfig(

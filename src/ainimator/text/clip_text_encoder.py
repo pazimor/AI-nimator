@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Sequence
 
 import torch
@@ -90,6 +91,30 @@ class ClipTokenizer:
             # CLIP pads with the EOS token; fall back to it explicitly.
             padId = self._backend.eos_token_id
         return int(padId)
+
+    def saveVocabulary(self, directory: Path) -> tuple[Path, Path]:
+        """Write ``vocab.json`` + ``merges.txt`` into ``directory``.
+
+        Used by the bundle export (B7) to ship the verbatim
+        HuggingFace vocabulary files the engine tokenizers consume
+        (``apps/spec/text_encoding.md`` §1).
+
+        Parameters
+        ----------
+        directory : Path
+            Destination directory (created if absent).
+
+        Returns
+        -------
+        tuple[Path, Path]
+            Paths of the written ``(vocab.json, merges.txt)``.
+        """
+        directory.mkdir(parents=True, exist_ok=True)
+        written = self._backend.save_vocabulary(str(directory))
+        paths = [Path(p) for p in written]
+        vocabPath = next(p for p in paths if p.name == "vocab.json")
+        mergesPath = next(p for p in paths if p.name == "merges.txt")
+        return vocabPath, mergesPath
 
     def encode(self, texts: Sequence[str] | str) -> EncodedBatch:
         """Tokenise a batch of strings to a fixed-length :class:`EncodedBatch`.

@@ -76,6 +76,44 @@
         "enum": ["interaction", "perception", "reaction", "morphology"]
       },
       "description": "Conditioning groups reserved by the extensibility bus (DETERMINIST 2.2.d) — declared empty until a dataset carries them. The ONNX output signature never changes."
+    },
+    "text_encoder": {
+      "type": "object",
+      "description": "OPTIONAL (B7, bundle A7.1+): in-engine prompt encoding. Absent = embeddings-only bundle (A7.0 behaviour). Spec: apps/spec/text_encoding.md.",
+      "additionalProperties": false,
+      "required": ["file", "tokenizer", "pooling", "embedding_channels"],
+      "properties": {
+        "file": {
+          "const": "text_encoder.onnx",
+          "description": "One-pass pooled encoder graph: input_ids + attention_mask -> prompt_emb."
+        },
+        "tokenizer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type", "vocab", "merges", "max_length",
+            "bos_id", "eos_id", "pad_id"
+          ],
+          "properties": {
+            "type": { "const": "clip-bpe" },
+            "vocab": { "const": "tokenizer/vocab.json" },
+            "merges": { "const": "tokenizer/merges.txt" },
+            "max_length": { "type": "integer", "minimum": 2 },
+            "bos_id": { "type": "integer", "minimum": 0 },
+            "eos_id": { "type": "integer", "minimum": 0 },
+            "pad_id": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "pooling": {
+          "const": "masked_mean",
+          "description": "Pooling baked INTO the ONNX graph — engines never pool."
+        },
+        "embedding_channels": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Output width; must equal prompt_emb_channels."
+        }
+      }
     }
   }
 }

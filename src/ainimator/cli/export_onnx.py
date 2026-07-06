@@ -172,6 +172,19 @@ def _buildParser() -> argparse.ArgumentParser:
     bundleParser.add_argument(
         "--batch-size", type=int, default=1, metavar="N"
     )
+    bundleParser.add_argument(
+        "--encoder-artifact",
+        dest="encoderArtifact",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Frozen CLIP text-encoder artifact directory.  When given, "
+            "the bundle additionally ships text_encoder.onnx + "
+            "tokenizer/ for in-engine prompt encoding (B7 / A7.1).  "
+            "Requires a text-conditioned checkpoint."
+        ),
+    )
     return parser
 
 
@@ -295,6 +308,7 @@ def _exportBundle(args: argparse.Namespace) -> None:
         outputDir=args.output_dir,
         resolvedConfigPath=args.resolved_config,
         batchSize=args.batch_size,
+        encoderArtifactPath=args.encoderArtifact,
     )
     print(f"Controller bundle assembled at {bundleDir}")
 

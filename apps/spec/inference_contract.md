@@ -63,11 +63,35 @@ blending vivent côté moteur (`ROADMAP_PLUGINS.md §3.3`).
    peut diviser directement ; un clamp supplémentaire à l'inférence est
    un no-op autorisé mais inutile. Un bundle avec un std < 1e-5 est
    hors contrat.
+6. **Intégration bone + ré-orthonormalisation (normatif — ajouté
+   2026-07-05, Pazimor)** : la frame bone suivante est
+   `orthonormalize6d(frame_bone(t) + Δbone_brut)`, où
+   `orthonormalize6d` est la projection Gram-Schmidt **identique** à
+   `sixdToRotationMatrix` (`b1 = normalize(a1)`,
+   `b2 = normalize(a2 − (b1·a2)b1)`, 6D projeté = `(b1, b2)`),
+   appliquée par bone **avant** que la frame n'entre dans la fenêtre
+   d'état et avant tout usage aval (FK, retarget). Rationale : le
+   modèle n'a vu que du 6D valide à l'entraînement ; sans projection,
+   l'accumulation des Δ fait dériver l'état hors de la variété des
+   rotations et le rollout long diverge (démembrement — diagnostic
+   2026-07-05, reproduit hors moteur). La projection sur un 6D déjà
+   valide est un no-op numérique (idempotence testée). Les trois
+   runtimes (référence Python `controller_rollout.py`, Unity, Unreal)
+   l'appliquent au même point de la boucle — la parité de valeurs
+   s'entend projection incluse.
 
-## 4. Canal prompt — packaging (arbitrage B0)
+## 4. Canal prompt — packaging (arbitrage B0, étendu B7)
 
 **Décision B0 : embeddings pré-calculés, pas de `text_encoder.onnx`
 dans le bundle v1.**
+
+> **Mise à jour B7 (2026-07-04, Pazimor)** : l'extension anticipée
+> ci-dessous est **activée**. Un bundle exporté avec
+> `--encoder-artifact` embarque `text_encoder.onnx` + `tokenizer/`
+> (bump mineur `A7.0 → A7.1`, section manifest optionnelle
+> `text_encoder`). Design normatif : `apps/spec/text_encoding.md`.
+> Le reste de cette section (null_emb requis, embedding hors boucle
+> frame, presets pré-calculés valides) reste inchangé.
 
 - Le runtime consomme `promptEmb` `(B, D)` — jamais du texte. Le calcul
   de l'embedding est **hors boucle par frame** dans tous les cas

@@ -577,6 +577,99 @@ def exportEncoder(
     return outputPath
 
 
+class _PooledEncoderWrapper(nn.Module):
+    """One-pass text encoder graph for the B7 bundle (spec §1).
+
+    Wraps any ``TextEncoderProtocol`` encoder and applies the masked
+    mean pooling used by the controller training path (same math as
+    ``controller_training_v2._pooledMaskedMeanEmb`` — duplicated here
+    because ``export`` must not import ``training``, G-IMPORTS).
+
+    Inputs: ``input_ids (B, T) int64``, ``attention_mask (B, T)
+    float32`` (1.0 real / 0.0 pad).  Output: ``prompt_emb (B, D)``.
+    """
+
+    def __init__(self, encoder: nn.Module) -> None:
+        super().__init__()
+        self.encoder = encoder
+
+    def forward(
+        self,
+        inputIds: torch.Tensor,
+        attentionMask: torch.Tensor,
+    ) -> torch.Tensor:
+        output = self.encoder(inputIds, attentionMask)
+        realMask = attentionMask.unsqueeze(-1)          # (B, T, 1)
+        sumEmb = (output.hiddenStates * realMask).sum(dim=1)
+        count = realMask.sum(dim=1).clamp(min=1.0)      # (B, 1)
+        return sumEmb / count
+
+
+def exportPooledTextEncoder(
+    encoder: nn.Module,
+    outputPath: Path,
+    maxLength: int,
+    batchSize: int = 1,
+    opsetVersion: int = ONNX_OPSET_VERSION,
+) -> Path:
+    """Export the pooled text-encoder graph for the A7.1 bundle (B7).
+
+    One forward = one prompt: tokenised ids in, pooled ``prompt_emb``
+    out (frozen backbone + projection + masked mean pooling).  The
+    batch axis is dynamic; the sequence axis is FIXED at ``maxLength``
+    — engines always pad to the manifest ``max_length``
+    (``apps/spec/text_encoding.md`` §1).
+
+    Parameters
+    ----------
+    encoder : nn.Module
+        Frozen text encoder satisfying ``TextEncoderProtocol``
+        (eval mode is set; weights unchanged).
+    outputPath : Path
+        Destination ``.onnx`` file path.
+    maxLength : int
+        Fixed token budget — must equal the paired tokenizer's
+        ``maxLength`` serialised in the manifest.
+    batchSize : int
+        Concrete batch size for the tracing example.
+    opsetVersion : int
+        ONNX opset version.
+
+    Returns
+    -------
+    Path
+        The written ``.onnx`` file path (same as ``outputPath``).
+    """
+    outputPath.parent.mkdir(parents=True, exist_ok=True)
+    exportReady = _replaceAllMHA(copy.deepcopy(encoder))
+    wrapper = _PooledEncoderWrapper(exportReady)
+    wrapper.eval()
+
+    inputIds = torch.zeros(batchSize, maxLength, dtype=torch.long)
+    attentionMask = torch.ones(
+        batchSize, maxLength, dtype=torch.float32
+    )
+    dynamicAxes: dict[str, dict[int, str]] = {
+        "input_ids": {0: "batch"},
+        "attention_mask": {0: "batch"},
+        "prompt_emb": {0: "batch"},
+    }
+    _runExport(
+        wrapper=wrapper,
+        exampleInputs=(inputIds, attentionMask),
+        outputPath=outputPath,
+        inputNames=["input_ids", "attention_mask"],
+        outputNames=["prompt_emb"],
+        dynamicAxes=dynamicAxes,
+        opsetVersion=opsetVersion,
+    )
+    _verifyModel(outputPath)
+    logger.info(
+        "Pooled text encoder exported and verified: %s", outputPath
+    )
+    return outputPath
+
+
 def exportDenoiser(
     denoiser: MotionDenoiserV2,
     outputPath: Path,

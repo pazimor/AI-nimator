@@ -19,15 +19,20 @@ define REQUIRE_CHECKPOINT
 	  exit 2; }
 endef
 
+# ENCODER_ARTIFACT (optionnel, B7) : dossier artefact CLIP — embarque
+# text_encoder.onnx + tokenizer/ dans le bundle (prompt libre in-engine).
+#   make plugin-unity CHECKPOINT=... ENCODER_ARTIFACT=output/clip_text_artifact
+ENCODER_FLAG = $(if $(ENCODER_ARTIFACT),--encoder-artifact "$(ENCODER_ARTIFACT)")
+
 plugin-unity:
 	$(REQUIRE_CHECKPOINT)
 	$(PY) -m apps.build.build_plugin --target unity \
-	  --checkpoint "$(CHECKPOINT)" $(BUILD_FLAGS)
+	  --checkpoint "$(CHECKPOINT)" $(ENCODER_FLAG) $(BUILD_FLAGS)
 
 plugin-unreal:
 	$(REQUIRE_CHECKPOINT)
 	$(PY) -m apps.build.build_plugin --target unreal \
-	  --checkpoint "$(CHECKPOINT)" $(BUILD_FLAGS)
+	  --checkpoint "$(CHECKPOINT)" $(ENCODER_FLAG) $(BUILD_FLAGS)
 
 # ---------------------------------------------------------------------
 # Raccourcis Poetry (réexposés, cf. CLAUDE.md > Commands)
